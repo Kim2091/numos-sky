@@ -1,5 +1,7 @@
 # NUMOS
 
+<img width="1280" height="720" alt="image" src="https://github.com/user-attachments/assets/f50aebe1-f2a0-459b-8be9-786827d1c671" />
+
 NUMOS is a physically based sky, atmosphere and volumetric cloud renderer. It is a C++17 library with
 Slang compute shaders, built to be embedded in other renderers. RTX Remix uses it as its sky
 provider.
