@@ -1,0 +1,90 @@
+// Copyright 2026 Kim2091 (Sparkles)
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+ * Cloud NVDF helpers: seed encoding, wrap-aware voxel distances and voxel-to-domain mapping for
+ * the cloud-body SDF bake chain (occupancy -> JFA -> resolve). Only the cloud_nvdf_* passes include
+ * this file.
+ *
+ * See cloud_nvdf.h for the texture axes (u = world X, v = vertical, w = world Z) and sizes.
+ */
+
+#pragma once
+
+#include "numos/lib/cloud_nvdf.h"
+
+// ---------------------------------------------------------------------------
+// Seed encoding for the JFA ping-pong buffers (R32_UINT).
+//
+// A seed is the coordinate of a cloud-body boundary voxel (occupied, with at least one empty
+// 6-neighbour), packed as x | y<<8 | z<<16. With x, z < 256 and y < 64 the packed value is at most
+// 0x00FF3FFF, so 0xFFFFFFFF can mean "no seed yet".
+// ---------------------------------------------------------------------------
+static const uint kCloudNvdfSeedInvalid = 0xFFFFFFFFu;
+
+uint cloudNvdfPackSeed(uint3 vox) {
+  return vox.x | (vox.y << 8u) | (vox.z << 16u);
+}
+
+uint3 cloudNvdfUnpackSeed(uint seed) {
+  return uint3(seed & 0xFFu, (seed >> 8u) & 0xFFu, (seed >> 16u) & 0xFFu);
+}
+
+// ---------------------------------------------------------------------------
+// Wrap-aware distance between two voxel centres, in km.
+//
+// The horizontal axes form a torus (the field tiles at cloudNoiseTileKm), so the per-axis delta
+// wraps: min(|d|, N - |d|). The vertical axis is a clamped slab. Deltas are scaled to km per axis
+// before the norm: voxels are only cubic at the 12 km / 3 km defaults, and the JFA closest-seed test
+// needs the physical metric, or anisotropic tiles would favour seeds along the cheaper axis.
+//
+// tileKm and thicknessKm are arguments so the helper works in any pass without a constant buffer.
+// ---------------------------------------------------------------------------
+float cloudNvdfVoxelDistanceKm(uint3 a, uint3 b, float tileKm, float thicknessKm) {
+  const float kSizeXZ = float(CLOUD_NVDF_SIZE_XZ);
+  float voxXZKm = max(tileKm, 1e-3f) / kSizeXZ;
+  float voxYKm  = max(thicknessKm, 0.05f) / float(CLOUD_NVDF_SIZE_Y);
+
+  float dx = abs(float(a.x) - float(b.x));
+  dx = min(dx, kSizeXZ - dx);
+  float dz = abs(float(a.z) - float(b.z));
+  dz = min(dz, kSizeXZ - dz);
+  float dy = abs(float(a.y) - float(b.y));
+
+  vec3 dKm = vec3(dx * voxXZKm, dy * voxYKm, dz * voxXZKm);
+  return length(dKm);
+}
+
+// Wrap a (possibly negative) horizontal voxel coordinate onto [0, SIZE_XZ).
+int cloudNvdfWrapXZ(int c) {
+  int n = int(CLOUD_NVDF_SIZE_XZ);
+  return ((c % n) + n) % n;
+}
+
+// ---------------------------------------------------------------------------
+// Voxel -> bake-domain mapping.
+//
+// XZ: voxel centres map to the tile-space UV of the placement map and noise volume
+//     (frac(worldKm / cloudNoiseTileKm)). The NVDF is baked plainly tile-periodic; hex de-tiling
+//     and wind translation are applied by the sampler, as for the placement map.
+// Y:  voxel centres map to the slab height fraction [0, 1].
+// ---------------------------------------------------------------------------
+vec2 cloudNvdfVoxelToTileUV(uint3 vox) {
+  return (vec2(vox.xz) + 0.5f) / float(CLOUD_NVDF_SIZE_XZ);
+}
+
+float cloudNvdfVoxelToHeightFraction(uint3 vox) {
+  return (float(vox.y) + 0.5f) / float(CLOUD_NVDF_SIZE_Y);
+}
+
+// The R8 occupancy grid stores the cumulus body field itself as
+// 0.5 + fieldKm / (2 * kCloudNvdfFieldBandKm). Occupied still means > 0.5 for the JFA seeds, and
+// the resolve pass gets a continuous distance near the surface instead of the JFA's voxel-centre
+// staircase, which a deep profile ramp would stretch into visible contour bands.
+static const float kCloudNvdfFieldBandKm = 0.5f;
+float cloudNvdfEncodeFieldKm(float fieldKm) {
+  return saturate(0.5f + fieldKm / (2.0f * kCloudNvdfFieldBandKm));
+}
+float cloudNvdfDecodeFieldKm(float encoded) {
+  return (encoded - 0.5f) * (2.0f * kCloudNvdfFieldBandKm);
+}

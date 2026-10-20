@@ -1,0 +1,423 @@
+// Copyright 2026 Kim2091 (Sparkles)
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+// The sky seen by a ray that left the scene: evalSkyRadiance and what it is built from (moons, the
+// ground below the horizon, the sun and moon disks, the night sky beyond the air). Shaders that only
+// need the shared helpers include atmosphere_common.slangh alone and do not compile any of this.
+
+#include "numos/lib/atmosphere_common.slangh"
+
+#include "numos/lib/night_sky.slangh"
+
+// ============================================================================
+// Moon disk
+// ============================================================================
+// A moon is a sphere lit by the sun (and, faintly, by the Earth), seen through the air in front of
+// it. Its surface follows the Lommel-Seeliger law mu0 / (mu0 + mu), the classical lunar photometric
+// function: no limb darkening at full moon, a soft terminator. Its brightness is normalised so the
+// disk delivers exactly moons[i].illuminance (the measured lunar phase law, opposition surge
+// included) to the observer, whatever size it is drawn at: integrated over the disk the shading
+// below is illuminance x Phi_LS(phase) / Phi_LS(phase) = illuminance.
+//
+// With a surface map (moons[i].textureLayer, the NightSkyMoon atlas) the albedo and the relief vary
+// over the disk. Each band is scaled on the host so its near side averages 1 / kMoonAlbedoRange, so
+// the map moves light around without changing the total. The map is placed by the moon's axis and
+// prime meridian, which carry the real Moon's librations, and filtered to the pixel size.
+
+// Disk-integrated Lommel-Seeliger phase function, normalised to 1 at full moon.
+float lommelSeeligerPhase(float phaseAngle) {
+  const float a = clamp(phaseAngle, 1e-4f, kPi - 1e-3f);
+  return max(1.0f - sin(0.5f * a) * tan(0.5f * a) * log(1.0f / tan(0.25f * a)), 1e-6f);
+}
+
+static const float kMoonAlbedoRange = 3.5f;  // matches renderer.cpp and build_nightsky_assets.py
+static const float kMoonRadiusKm = 1737.4f;
+
+#ifdef NIGHT_SKY_AVAILABLE
+// Bilinear albedo (rgb) and height (a) of band `layer` of the moon atlas at uv, mip `level`, wrapped
+// in longitude, and the height's gradient in texels of that level (along u, along v).
+vec4 moonMapBilinear(uint layer, vec2 uv, uint level, uint bandHeight0, out vec2 heightGradient) {
+  const uint w = max((2u * bandHeight0) >> level, 1u);
+  const int bandHeight = int(max(bandHeight0 >> level, 1u));
+  const vec2 t = uv * vec2(float(w), float(bandHeight)) - 0.5f;
+  const vec2 f = t - floor(t);
+  const int x0 = int(floor(t.x)), y0 = int(floor(t.y));
+  vec4 c[4];
+  [unroll] for (int k = 0; k < 4; ++k) {
+    const int x = (x0 + (k & 1) + int(w)) % int(w);
+    const int y = clamp(y0 + (k >> 1), 0, bandHeight - 1) + int(layer) * bandHeight;
+    c[k] = NightSkyMoon.Load(int3(x, y, int(level)));
+  }
+  heightGradient = vec2(lerp(c[1].a - c[0].a, c[3].a - c[2].a, f.y), lerp(c[2].a - c[0].a, c[3].a - c[1].a, f.x));
+  return lerp(lerp(c[0], c[1], f.x), lerp(c[2], c[3], f.x), f.y);
+}
+#endif
+
+// Radiance of moons[moonIdx] toward viewDir (outside the atmosphere), and the disk's coverage of this
+// direction in [0, 1] (it occludes what lies behind it). sunDirYUp is the true sun direction; the
+// disk is shaded by the moon's own sunlightDirection (a game moon's phase setting can move it).
+vec3 evalMoonDisk(vec3 viewDir, uint moonIdx, AtmosphereArgs args, vec3 sunDirYUp, out float diskCoverage) {
+  diskCoverage = 0.0f;
+  const MoonParams m = args.moons[moonIdx];
+  if (m.enabled < 0.5f) {
+    return vec3(0.0f);
+  }
+  const vec3 moonDir = normalize(m.direction);
+  const float cosAngle = dot(viewDir, moonDir);
+  const float cosRadius = cos(m.angularRadius);
+  const float sinRadius = sin(m.angularRadius);
+  // The rim is anti-aliased over one pixel (args.skyPixelAngle).
+  const float rimWidth = max(args.skyPixelAngle, 0.02f * sinRadius);
+  if (cosAngle < cos(m.angularRadius + rimWidth)) {
+    return vec3(0.0f);
+  }
+
+  // Disk coordinates (unit radius) in a frame whose y axis is the moon's projected north pole.
+  vec3 up = m.northPole - moonDir * dot(m.northPole, moonDir);
+  up = dot(up, up) > 1e-8f ? normalize(up) : normalize(cross(moonDir, vec3(1.0f, 0.0f, 0.0f)));
+  const vec3 right = cross(up, moonDir);
+  const vec3 offset = viewDir - moonDir * cosAngle;
+  vec2 disk = vec2(dot(offset, right), dot(offset, up)) / sinRadius;
+  const float r = length(disk);
+  diskCoverage = saturate(0.5f + (1.0f - r) * sinRadius / rimWidth);
+  if (r > 1.0f) {
+    disk /= r;
+  }
+
+  // The visible hemisphere's normal: x right, y north, z toward the observer.
+  const float z = sqrt(max(1.0f - dot(disk, disk), 0.0f));
+  const vec3 sphereNormal = right * disk.x + up * disk.y - moonDir * z;
+  vec3 normal = sphereNormal;
+  vec3 albedo = vec3(1.0f);
+#ifdef NIGHT_SKY_AVAILABLE
+  if (m.textureLayer >= 0.0f && (args.nightSkyFlags & 4u) != 0u) {
+    // Selenographic latitude and longitude of this point. East turns positively about the axis; the
+    // local frame is left-handed (celestial.h), so its cross products come out reversed.
+    const vec3 pole = normalize(m.northPole);
+    const vec3 east0 = cross(m.primeMeridian, pole);
+    const float lat = asin(clamp(dot(sphereNormal, pole), -1.0f, 1.0f));
+    const float lon = atan2(dot(sphereNormal, east0), dot(sphereNormal, m.primeMeridian));
+    const vec2 uv = vec2(0.5f + lon / (2.0f * kPi), 0.5f - lat / kPi);
+
+    // Mip: the near side's 180 deg of longitude (bandHeight texels) over the disk's pixels.
+    // (Sizes from mip 0 only: GetDimensions of a lower mip reads back wrong through Slang's SPIR-V.)
+    uint w0, h0, mipCount;
+    NightSkyMoon.GetDimensions(0u, w0, h0, mipCount);
+    const uint bandHeight0 = max(w0 / 2u, 1u);
+    const uint levels = firstbithigh(bandHeight0) + 1u;
+    const float diskPixels = 2.0f * sinRadius / max(args.skyPixelAngle, 1e-7f);
+    const float lod = clamp(log2(max(float(bandHeight0) / diskPixels, 1.0f)), 0.0f, float(levels - 1u));
+    const uint l0 = uint(lod), l1 = min(l0 + 1u, levels - 1u);
+    const uint layer = uint(m.textureLayer);
+    vec2 g0, g1;
+    const vec4 s0 = moonMapBilinear(layer, uv, l0, bandHeight0, g0);
+    const vec4 s1 = moonMapBilinear(layer, uv, l1, bandHeight0, g1);
+    albedo = lerp(s0.rgb, s1.rgb, lod - float(l0)) * kMoonAlbedoRange;
+
+    // Relief: height (a x 20 - 10 km) slopes per radian of longitude and of latitude, tilting the
+    // normal away from rising ground.
+    const vec2 perRadian0 = vec2(float(max(w0 >> l0, 1u)) / (2.0f * kPi), float(max(bandHeight0 >> l0, 1u)) / kPi);
+    const vec2 perRadian1 = vec2(float(max(w0 >> l1, 1u)) / (2.0f * kPi), float(max(bandHeight0 >> l1, 1u)) / kPi);
+    const vec2 slope = lerp(g0 * perRadian0, g1 * perRadian1, lod - float(l0)) * (20.0f / kMoonRadiusKm);
+    vec3 eastT = cross(sphereNormal, pole);
+    eastT = dot(eastT, eastT) > 1e-8f ? normalize(eastT) : east0;
+    const vec3 northT = normalize(pole - sphereNormal * dot(pole, sphereNormal) + eastT * 1e-6f);
+    normal = normalize(sphereNormal - eastT * (slope.x / max(cos(lat), 0.05f)) + northT * slope.y);
+  }
+#endif
+  const float mu = max(dot(normal, -moonDir), 1e-3f);
+  const float mu0 = dot(normal, normalize(m.sunlightDirection));
+
+  // Sunlit: L = E x LS(mu0, mu) / (0.5 x Phi_LS(phase) x drawn solid angle), which integrates to E.
+  const float solidAngle = 2.0f * kPi * (1.0f - cosRadius);
+  vec3 radiance = vec3(0.0f);
+  if (mu0 > 0.0f) {
+    radiance = m.illuminance * (mu0 / (mu0 + mu)) / (0.5f * lommelSeeligerPhase(m.phaseAngle) * solidAngle);
+  }
+  // Earthshine: the Earth, seen from the moon close to the observer's direction, lights the whole
+  // disk; LS is 0.5 there and Phi_LS ~ 1, so the disk delivers illuminance x earthshine.
+  radiance += m.illuminance * (m.earthshine / solidAngle);
+  return radiance * albedo;
+}
+
+// ============================================================================
+// The ground below the horizon
+// ============================================================================
+// A sky ray that reaches the planet ends on its surface (the sky-view LUT holds only the air in
+// front of it). The surface is a Lambertian ground of albedo args.groundAlbedo, the albedo the
+// multiscattering LUT assumes. It is lit by the sun, through the atmosphere (with the planet's
+// shadow) and the clouds (the cloud shadow map, with the same strength settings a host applies to
+// its own terrain, so the two meet without a seam), and by the sky: the upper hemisphere's
+// irradiance, clouds included (sampleSkyAmbientForVolume), from a 2-ring x 4-azimuth Gauss-Legendre
+// quadrature that is exact for a sky linear in mu. It is seen through the air between it and the eye.
+// Returns 0 for a ray that stays above the planet. Needs the transmittance LUT and the cloud
+// bindings (ATMOSPHERE_TRANSMITTANCE_LUT_AVAILABLE, ATMOSPHERE_AVAILABLE).
+vec3 evalSkyGroundRadiance(vec3 viewDirYUp, AtmosphereArgs args) {
+#if defined(ATMOSPHERE_TRANSMITTANCE_LUT_AVAILABLE) && defined(ATMOSPHERE_AVAILABLE)
+  // The eye at its physical altitude, the frame the sky-view LUT is baked in. The ground hit uses
+  // the cancellation-free roots (cloudShadowSphereRoots) on the exact eye radius: the generic
+  // ray-sphere test loses kilometres to float32 at planet scale, which an eye metres above the
+  // ground cannot afford.
+  const vec3 planetCenter = getPlanetCenter(args);
+  const float eyeRadius = args.planetRadius + max(args.cameraAltitudeKm, 0.0f);
+  float tGround0, tGround1;
+  if (viewDirYUp.y >= 0.0f
+      || !cloudShadowSphereRoots(eyeRadius, viewDirYUp.y, args.planetRadius, tGround0, tGround1)
+      || tGround1 <= 0.0f) {
+    return vec3(0.0f);
+  }
+  const float tGround = max(tGround0, 0.0f);
+  const vec3 groundPos = viewDirYUp * tGround;
+  const vec3 groundUp = normalize(groundPos - planetCenter);
+  const vec3 eyeUp = normalize(-planetCenter);
+
+  // Air between the eye and the ground: along the reversed ray, ground -> eye = (ground -> space)
+  // / (eye -> space).
+  const vec3 toSpaceFromGround = sampleTransmittanceLut(AtmosphereTransmittanceLut, AtmosphereSkyViewSampler,
+                                                        0.0f, saturate(dot(-viewDirYUp, groundUp)), args);
+  const vec3 toSpaceFromEye = sampleTransmittanceLut(AtmosphereTransmittanceLut, AtmosphereSkyViewSampler,
+                                                     max(args.cameraAltitudeKm, 0.0f),
+                                                     saturate(dot(-viewDirYUp, eyeUp)), args);
+  const vec3 viewTransmittance = saturate(toSpaceFromGround / max(toSpaceFromEye, vec3(1e-6f)));
+
+  // The clouds' shadow at the ground point, in the clouds' frame. The shadow map is baked along the
+  // clouds' key light (cloudKeyLight: the sun, or a moon at night), so it shades that light.
+  float keyLightCloudT = 1.0f;
+  if (args.cloudEnabled > 0.5f && args.cloudCoverageMean >= 0.01f && args.cloudShadowLive != 0u) {
+    const vec3 cloudPlanetCenter = getCloudPlanetCenterWorldKm(args);
+    float tc0, tc1;
+    if (cloudShadowSphereRoots(args.planetRadius + max(args.cameraWorldPosYUpKm.y, 0.0f), viewDirYUp.y,
+                               args.planetRadius, tc0, tc1)
+        && tc1 > 0.0f) {
+      const vec3 cloudGround = args.cameraWorldPosYUpKm + viewDirYUp * max(tc0, 0.0f);
+      const float opticalDepth = cloudShadowMapSunOpticalDepth(AtmosphereCloudShadowMap, AtmosphereCloudNoise3DSampler,
+                                                               cloudGround, cloudPlanetCenter, args);
+      keyLightCloudT = mix(1.0f, exp(-opticalDepth * args.cloudDensity), args.cloudShadowStrength);
+    }
+  }
+
+  // Sun on the ground.
+  const vec3 sunDirYUp = normalize(args.sunDirection);
+  const float cosSun = dot(sunDirYUp, groundUp);
+  vec3 sunIrradiance = vec3(0.0f);
+  if (cosSun > 0.0f) {
+    sunIrradiance = args.sunIlluminance * cosSun
+                  * evalSunShadowingClampedToSurface(groundPos, sunDirYUp, AtmosphereTransmittanceLut,
+                                                     AtmosphereSkyViewSampler, args);
+    if (args.cloudKeyLight == 0u) {
+      sunIrradiance *= keyLightCloudT;
+    }
+  }
+  // Moonlight on the ground, through the same air.
+  [unroll] for (uint mi = 0u; mi < MAX_MOONS; ++mi) {
+    if (((args.moonSkyLightMask >> mi) & 1u) == 0u) {
+      continue;
+    }
+    const vec3 moonDirYUp = normalize(args.moons[mi].direction);
+    const float cosMoon = dot(moonDirYUp, groundUp);
+    if (cosMoon > 0.0f) {
+      sunIrradiance += args.moons[mi].illuminance * cosMoon
+                     * evalSunShadowingClampedToSurface(groundPos, moonDirYUp, AtmosphereTransmittanceLut,
+                                                        AtmosphereSkyViewSampler, args)
+                     * (args.cloudKeyLight == mi + 1u ? keyLightCloudT : 1.0f);
+    }
+  }
+
+  // Sky on the ground: irradiance / pi of the upper hemisphere (relative to the local up).
+  const float kMu0 = 0.2113249f, kMu1 = 0.7886751f;
+  const vec3 tangent = normalize(cross(groundUp, abs(groundUp.y) < 0.99f ? vec3(0.0f, 1.0f, 0.0f) : vec3(1.0f, 0.0f, 0.0f)));
+  const vec3 bitangent = cross(groundUp, tangent);
+  vec3 skyIrradianceOverPi = vec3(0.0f);
+  [unroll]
+  for (int i = 0; i < 4; ++i) {
+    const float phi = (float(i) + 0.5f) * (0.5f * kPi);
+    const vec3 h = tangent * cos(phi) + bitangent * sin(phi);
+    const vec3 d0 = normalize(h * sqrt(1.0f - kMu0 * kMu0) + groundUp * kMu0);
+    const vec3 d1 = normalize(h * sqrt(1.0f - kMu1 * kMu1) + groundUp * kMu1);
+    skyIrradianceOverPi += kMu0 * sampleSkyAmbientForVolume(d0, args, AtmosphereSkyViewLut,
+                                                            AtmosphereCloudSkyTransmittanceLut, AtmosphereSkyViewSampler)
+                         + kMu1 * sampleSkyAmbientForVolume(d1, args, AtmosphereSkyViewLut,
+                                                            AtmosphereCloudSkyTransmittanceLut, AtmosphereSkyViewSampler);
+  }
+  skyIrradianceOverPi *= 0.25f;
+
+  return viewTransmittance * args.groundAlbedo * (sunIrradiance * (1.0f / kPi) + skyIrradianceOverPi);
+#else
+  return vec3(0.0f);
+#endif
+}
+
+// ============================================================================
+// Sun and moon disks
+// ============================================================================
+//
+// Which disks a ray that leaves the scene carries (evalSkyRadiance's skyDisks). The sun and every
+// moon are also emitted as lights (FrameOutputs::lights), so a ray whose surface the host lights by
+// sampling those lights must not find the disks again in the sky, or they count twice. A ray that no
+// light sample can stand in for must carry them.
+//   NUMOS_SKY_DISKS_NONE  diffuse and glossy gathers (the host samples the emitted lights), and camera
+//                         rays of a host that adds the disks itself (numosSkyDisks).
+//   NUMOS_SKY_DISKS_ALL   every other ray: camera rays whose radiance the host's cloud composite
+//                         covers as a whole, and continuations through a delta lobe (mirror
+//                         reflection, refraction through glass or water, a pass-through card).
+//                         Non-primary rays get the disks behind the cloud dome LUT, so the clouds in
+//                         their direction cover them.
+static const uint NUMOS_SKY_DISKS_NONE = 0u;
+static const uint NUMOS_SKY_DISKS_ALL = 1u;
+
+// The disks toward viewDirYUp (above the horizon) through the air in front of them
+// (viewTransmittance), without clouds; and how much of the stars behind them shows (starVisibility,
+// what the moon disks leave uncovered). Capped below fp16's range for hosts that store the sky in
+// half floats.
+vec3 evalSkyDisksYUp(vec3 viewDirYUp, AtmosphereArgs args, vec3 viewTransmittance, out float starVisibility) {
+  vec3 radiance = vec3(0.0f);
+  starVisibility = 1.0f;
+  const vec3 sunDirYUp = normalize(args.sunDirection);
+  [unroll] for (uint i = 0u; i < MAX_MOONS; ++i) {
+    float coverage = 0.0f;
+    const vec3 moonRadiance = evalMoonDisk(viewDirYUp, i, args, sunDirYUp, coverage);
+    radiance += viewTransmittance * moonRadiance * coverage;
+    starVisibility *= 1.0f - coverage;
+  }
+  // The sun's disc: its illuminance spread over its solid angle, limb darkened (linear law, u = 0.6,
+  // normalised to the disc mean), through the air in front of it and behind any moon in front of it.
+  // The sky-view LUT cannot resolve a 0.5 degree disc, so it holds only the aureole around it.
+  const float sunRadius = max(args.sunAngularRadius, 1e-4f);
+  const float cosSun = dot(viewDirYUp, sunDirYUp);
+  const float rimWidth = max(args.skyPixelAngle, 0.02f * sin(sunRadius));
+  if (cosSun > cos(sunRadius + rimWidth)) {
+    const float angle = acos(clamp(cosSun, -1.0f, 1.0f));
+    const float sunCoverage = saturate(0.5f + (sunRadius - angle) / rimWidth);
+    const float r = saturate(angle / sunRadius);
+    const float limb = (1.0f - 0.6f * (1.0f - sqrt(max(1.0f - r * r, 0.0f)))) / (1.0f - 0.2f);
+    const float solidAngle = 2.0f * kPi * (1.0f - cos(sunRadius));
+    radiance += viewTransmittance * args.sunIlluminance * (limb * sunCoverage * starVisibility / solidAngle);
+  }
+  return min(radiance, vec3(6.0e4f));
+}
+
+// The air's transmittance from the camera toward viewDirYUp, and whether the direction is above the
+// horizon (below it the planet hides the disks and the stars).
+bool skyAboveHorizon(vec3 viewDirYUp, AtmosphereArgs args, out vec3 viewTransmittance) {
+  viewTransmittance = vec3(0.0f);
+  const float eyeRadius = args.planetRadius + max(args.cameraAltitudeKm, 0.0f);
+  const float horizonMu = -sqrt(max(1.0f - (args.planetRadius / eyeRadius) * (args.planetRadius / eyeRadius), 0.0f));
+  if (viewDirYUp.y <= horizonMu) {
+    return false;
+  }
+#ifdef ATMOSPHERE_TRANSMITTANCE_LUT_AVAILABLE
+  viewTransmittance = sampleTransmittanceLut(AtmosphereTransmittanceLut, AtmosphereSkyViewSampler,
+                                             max(args.cameraAltitudeKm, 0.0f), viewDirYUp.y, args);
+#else
+  viewTransmittance = getAtmosphericTransmittanceForDir(viewDirYUp, args);
+#endif
+  return true;
+}
+
+// The sun and moon disks along a world direction, through the air but without clouds, for a host
+// that traces its camera rays with NUMOS_SKY_DISKS_NONE: it adds this, times the transmittance of
+// whatever it composites in front of the sky (an alpha-blended card), to the sky radiance it passes
+// to numosApplyCloudComposite, which then covers it by the screen clouds' transmittance.
+vec3 numosSkyDisks(vec3 dirWorld, AtmosphereArgs args, bool isZUp) {
+  const vec3 viewDirYUp = normalize(worldToAtmosphereYUp(dirWorld, isZUp, args.flipUpAxis != 0));
+  vec3 viewTransmittance;
+  if (!skyAboveHorizon(viewDirYUp, args, viewTransmittance)) {
+    return vec3(0.0f);
+  }
+  float starVisibility;
+  return evalSkyDisksYUp(viewDirYUp, args, viewTransmittance, starVisibility);
+}
+
+// Deprecated: returns 0. The disks' aureoles are part of the cloud render's radiance
+// (cloud_march_common.slangh, cloudAureoleRadiance), because they need the cloud's true optical
+// depth. Kept so existing hosts build; drop the call.
+vec3 numosSkyDiskAureole(vec3 dirWorld, AtmosphereArgs args, bool isZUp, float cloudTransmittance) {
+  return vec3(0.0f);
+}
+
+// ============================================================================
+// Sky entry point
+// ============================================================================
+
+// Sky radiance toward a direction: the sky-view LUT (plus stars, moons and the lit ground below
+// the horizon), with clouds from the secondary dome LUT for non-primary rays.
+//
+// Primary rays get no clouds here: the host composites the screen cloud pass over them later
+// (numosApplyCloudComposite), because that pass runs after the scene's depth is known. Other rays
+// (reflections, indirect) read the dome LUT, which is baked before the host traces.
+//
+// skyDisks: which sun and moon disks the ray carries (NUMOS_SKY_DISKS_*, above).
+vec3 evalSkyRadiance(
+  vec3 viewDir,
+  AtmosphereArgs args,
+  uint2 pixelCoord,
+  uint frameIdx,
+  bool isZUp,
+  bool isPrimaryRay,
+  // Scale the result by args.skyIndirectRadianceScale. Only diffuse indirect sky gathers pass true;
+  // primary, reflection and refraction misses pass false so the sky they show matches the visible sky.
+  bool applySkyIndirectRadianceScale,
+  uint skyDisks
+) {
+  // Diagnostic: a flat grey sky, to measure the cost of the miss path.
+  if ((args.debugSkyBisectFlags & 2u) != 0u) {
+    return vec3(0.5f, 0.5f, 0.5f);
+  }
+
+  vec3 viewDirYUp = worldToAtmosphereYUp(viewDir, isZUp, args.flipUpAxis != 0);
+  viewDirYUp = normalize(viewDirYUp);
+
+  vec3 radiance = sampleSkyViewLutForRay(viewDirYUp, AtmosphereSkyViewLut, AtmosphereSkyViewSampler);
+  // Below the horizon: the lit ground behind that air.
+  radiance += evalSkyGroundRadiance(viewDirYUp, args);
+
+
+  // Disks and stars, seen through the air in front of them (the sky-view LUT already holds that air's
+  // own light, moonlit aureole included). A moon disk hides the stars behind it but not the air in
+  // front, whether or not this ray carries the disk's own light (skyDisks). The daytime moon comes
+  // out at about half the blue sky's brightness, as it should. The stars join once the sky is dark
+  // enough (nightSkyFlags bit 3); clouds composite over all of it.
+  vec3 viewTransmittance;
+  const bool aboveHorizon = skyAboveHorizon(viewDirYUp, args, viewTransmittance);
+  {
+    if (aboveHorizon) {
+      float starThroughMoons;
+      const vec3 disks = evalSkyDisksYUp(viewDirYUp, args, viewTransmittance, starThroughMoons);
+      if (skyDisks == NUMOS_SKY_DISKS_ALL) {
+        radiance += disks;
+      }
+#ifdef NIGHT_SKY_AVAILABLE
+      if ((args.nightSkyFlags & 11u) == 11u) {
+        radiance += viewTransmittance * evalNightSkyBeyondAir(viewDirYUp, args, AtmosphereSkyViewSampler)
+                  * starThroughMoons;
+      }
+#endif
+    }
+  }
+
+  // Clouds over everything else. The dome LUT stores (premultiplied rgb, transmittance); cloudLayer
+  // holds opacity in alpha, so it is 1 - transmittance.
+  vec4 cloudLayer;
+  if (args.cloudSecondaryLutEnable != 0u && !isPrimaryRay) {
+    // The dome LUT is baked from the camera; the parallax of a ray starting at a surface point
+    // instead is negligible at cloud distances.
+    vec2 domeUv = cloudDomeDirToUv(viewDirYUp);
+    vec4 lut = sampleCloudDomeLutSmooth(AtmosphereCloudSecondaryLut, AtmosphereSkyViewSampler, domeUv, 0.0f);
+    cloudLayer = vec4(lut.rgb, 1.0f - lut.a);
+  } else {
+    // Primary rays (the host composites the screen clouds later), or the dome LUT is off.
+    cloudLayer = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+  }
+
+  // Premultiplied over, disks behind the clouds included.
+  radiance = radiance * (1.0f - cloudLayer.a) + cloudLayer.rgb;
+
+  radiance = max(radiance, vec3(0.0f));
+  if (applySkyIndirectRadianceScale) {
+    radiance *= max(args.skyIndirectRadianceScale, 0.0f);
+  }
+
+  return radiance;
+}

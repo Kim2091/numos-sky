@@ -1,0 +1,456 @@
+// Copyright 2026 Kim2091 (Sparkles)
+// SPDX-License-Identifier: Apache-2.0
+
+// NUMOS host shader API: what a renderer's own shaders include to use the sky, clouds and
+// aerial perspective NUMOS produced this frame (DESIGN.md: "Host shader API").
+//
+// ---------------------------------------------------------------------------------------------
+// Binding contract
+// ---------------------------------------------------------------------------------------------
+// The sky and cloud-shadow helpers read NUMOS outputs through globals with fixed names, which the
+// host declares at whatever slots it likes and then `#define ATMOSPHERE_AVAILABLE` before
+// including this file (without it they fall back to "no cloud shadow" / "no LUT"):
+//
+//   Texture2D            AtmosphereTransmittanceLut;          // FrameOutputs::transmittanceLut
+//   Texture2D            AtmosphereMultiscatteringLut;        // ::multiscatteringLut
+//   Texture2D            AtmosphereSkyViewLut;                // ::skyViewLut
+//   SamplerState         AtmosphereSkyViewSampler;            // ::skyViewSampler
+//   Texture2D<float4>    AtmosphereCloudSkyTransmittanceLut;  // ::cloudSkyTransmittanceLut (rgb cloud light, a transmittance)
+//   Texture3D<float2>    AtmosphereCloudShadowMap;            // ::cloudShadowMap
+//   SamplerState         AtmosphereCloudNoise3DSampler;       // ::cloudNoiseSampler
+//   Texture2D<float4>    AtmosphereCloudSecondaryLut;         // ::cloudSecondaryLut (all mips)
+//   Texture2DArray       BlueNoise;                           // FrameInputs::blueNoise
+//
+// The night sky (stars, Milky Way, the moon's surface) reads five more, declared with
+// `#define NIGHT_SKY_AVAILABLE` (without it the sky has no stars and a plain moon):
+//
+//   StructuredBuffer<uint>   NightSkyStarCells;     // FrameOutputs::nightSkyStarCells
+//   StructuredBuffer<float4> NightSkyStars;         // ::nightSkyStars
+//   StructuredBuffer<uint>   NightSkyMilkyWay;      // ::nightSkyMilkyWay
+//   Texture2D<float4>        NightSkyStarlightLow;  // ::nightSkyStarlightLow
+//   Texture2D<float4>        NightSkyMoon;          // ::nightSkyMoon
+//
+// plus the frame's AtmosphereArgs (FrameOutputs::args) as a constant buffer, passed to every
+// helper as `args`. The composite helpers below take their resources as parameters instead.
+//
+// ---------------------------------------------------------------------------------------------
+// Entry points
+// ---------------------------------------------------------------------------------------------
+//   evalSkyRadiance(dir, args, pixel, frame, isZUp, isPrimaryRay, applySkyIndirectScale, skyDisks)
+//       Sky radiance for a ray that missed the scene (lib/atmosphere_sky.slangh). Primary rays get
+//       the cloudless sky; clouds arrive in numosApplyCloudComposite. Other rays read clouds from
+//       the secondary dome LUT. skyDisks (NUMOS_SKY_DISKS_*) says whether the ray carries the sun
+//       and moon disks: not where the host lights a surface by sampling FrameOutputs::lights (diffuse
+//       and glossy gathers), yes where no light sample follows the path (camera rays, delta-lobe
+//       continuations: mirrors, glass and water refraction, pass-through cards).
+//   numosSkyDisks(dir, args, isZUp)
+//       The sun and moon disks alone, for camera rays traced with NUMOS_SKY_DISKS_NONE: the host adds
+//       them under the transmittance of whatever it lays in front of the sky (an alpha-blended card)
+//       before numosApplyCloudComposite, which covers them by the screen clouds. That is the disks'
+//       sharp part, the unscattered light; the glow the clouds' droplets diffract around them (the
+//       aureole) is in the cloud render's radiance already (docs/night-sky.md, "Disk aureole").
+//       numosSkyDiskAureole is deprecated and returns 0.
+//   sampleCloudGroundShadow_OptionB(worldPos, sunDir, args, isZUp)
+//       Cloud transmittance toward the sun at a surface point (lib/atmosphere_common.slangh); apply
+//       to every light FrameOutputs marks `cloudShadowed` (multiply its light by T, nothing more).
+//   sampleSkyAmbientForVolume(dir, args, skyViewLut, cloudSkyTransmittanceLut, sampler)
+//       Sky light with clouds (sky through them + their own light) for volumes and particles
+//       (lib/atmosphere_common.slangh).
+//   numosApplyAerialPerspective(...), numosApplyCloudComposite(...)
+//       Screen-space composite of the air and clouds onto the host's lit image (below).
+//   numosAerialPerspectiveAlongRay(...)
+//       Air in-scatter and RGB transmittance from the camera along any direction (far field + fog).
+//   numosAirSegment(...), numosAirMedium(...)
+//       The air as a participating medium for secondary rays: a lit segment, or sigma_s / sigma_t.
+//   numosFroxelCenterWorld(...), numosFroxelViewDirection(...)
+//       Froxel grid geometry, for hosts that write FrameOutputs::apLightInjection.
+//   numosWorldToKm / numosKmToWorld / numosWorldToKmYUp / numosKmYUpToWorld / numosWorldToCloudKm
+//       The host boundary (lib/atmosphere_common.slangh): the one conversion between the host's
+//       units and NUMOS kilometres (args.worldUnitsPerKm = unitsPerMeter x worldScale x 1000). A
+//       host that hands NUMOS a distance in km (numosApplyCloudComposite's foregroundDepthKm) or
+//       reads one back (cloudDepth) converts with these and nothing else.
+//   numosWorldToAirKm / numosAirKmToWorld / numosWorldToAirKmYUp
+//       The aerial perspective's own conversion (args.apWorldUnitsPerKm = unitsPerMeter x
+//       hazeWorldScale x 1000). The composites below apply it themselves; hosts pass world units.
+//
+// Units: every position and distance a helper takes is in the host's world units, render space,
+// unless its name says Km. Radiances are scale-invariant (rtx.atmosphere.worldScale changes where
+// things are, not how bright they are); host lights given as radiance and size need no conversion.
+#pragma once
+
+#include "numos/lib/atmosphere_args.h"
+#include "numos/util/camera.slangh"
+#include "numos/lib/atmosphere_common.slangh"
+#include "numos/lib/atmosphere_sky.slangh"
+#include "numos/lib/aerial_perspective_lights.slangh"
+
+// ============================================================================
+// Aerial perspective (docs/aerial-perspective-v2.md)
+// ============================================================================
+// Resources, all from FrameOutputs:
+//   apNearScatter                near-field cumulative in-scatter (froxel grid, screen-aligned)
+//   apFarScatter/-Transmittance  far-field LUT (camera-centred, every direction)
+//   apFroxelLighting/-Aux        the near field's radiance cache (numosAirSegment); Aux also holds
+//                                the local-light shadowing the per-pixel glow reads
+//   apLights/apLightClusters     the culled local lights and their per-tile lists
+//   linearClampSampler           for all of them
+// The far fog's lighting reads AtmosphereTransmittanceLut / AtmosphereMultiscatteringLut when the
+// host defines ATMOSPHERE_AVAILABLE; without them the far fog only attenuates.
+
+vec3 numosFarFogRadiance(vec3 dirYUp, AtmosphereArgs args)
+{
+#ifdef ATMOSPHERE_AVAILABLE
+  return apFarFogRadiance(dirYUp, args, AtmosphereTransmittanceLut, AtmosphereMultiscatteringLut,
+                          AtmosphereSkyViewSampler);
+#else
+  return vec3(0.0f);
+#endif
+}
+
+// Air in-scatter between the camera and the point `distanceWorld` along `dirWorld`, and the RGB
+// transmittance over the same span. Far field and fog only: unshadowed by the scene, no local
+// lights. For reflections and other rays leaving from near the camera, and for clouds.
+vec3 numosAerialPerspectiveAlongRay(
+  AtmosphereArgs args,
+  vec3 dirWorld,
+  float distanceWorld,
+  Texture3D<float4> apFarScatter,
+  Texture3D<float4> apFarTransmittance,
+  SamplerState apSampler,
+  out vec3 transmittance)
+{
+  transmittance = vec3(1.0f);
+  if (args.apFarSlices == 0u)
+  {
+    return vec3(0.0f);
+  }
+  const vec3 dirYUp = normalize(worldToAtmosphereYUp(dirWorld, args.isZUp != 0u, args.flipUpAxis != 0u));
+  vec3 farT;
+  const vec3 farS = evalAerialPerspectiveFar(dirYUp, numosWorldToAirKm(distanceWorld, args), args,
+                                             apFarScatter, apFarTransmittance, apSampler, farT);
+  const float fogT = exp(-apFogOpticalDepth(dirYUp, 0.0f, distanceWorld, args));
+  transmittance = farT * fogT;
+  return numosFarFogRadiance(dirYUp, args) * (1.0f - fogT) + fogT * farS;
+}
+
+// Composite of the air in front of a primary surface or, on a miss, in front of the sky.
+// Call it AFTER numosApplyCloudComposite: the near field's air and local-light glow lie in front of
+// the clouds, and the miss branch treats the incoming radiance (sky plus clouds, whose own air
+// starts at the camera) as the whole column it replaces the first `range` of.
+//
+//   forward distance <= range : near field alone (in-scatter from the grid, transmittance exact).
+//   past the range            : near field to the range, then the fog and the far field beyond it.
+//   miss                      : the sky already holds the unshadowed column, so the near field
+//                               replaces its first `range` of it: shadowed air and lamp glow then
+//                               continue across a silhouette into the sky.
+//
+// Local-light glow is evaluated per pixel over the near range (apLocalLightAirlight) and added on
+// top in every case; only its shadowing comes from the froxel grid.
+//
+// A surface behind cloud: `cloudOverPixel` is what numosApplyCloudComposite laid over this pixel
+// (its out parameter: radiance, opacity). The cloud render already carries the air between the
+// camera and the cloud, so that part is treated like the miss case (the near field replaces its
+// first `range`), and the air beyond the range reaches only the uncovered (1 - opacity) share of
+// the surface. vec4(0) when the host has no clouds.
+//
+// The path from the camera is assumed to be air. A host whose camera is inside another medium (under
+// water) must not call this for that view: the water's own extinction and in-scatter are the host's,
+// and the air the ray meets past the water surface leaves it refracted at a point this composite
+// does not know (docs/aerial-perspective-v2.md, 4.4).
+//
+// `viewDistance` is camera-to-surface in world units (PSR: camera-to-mirror). `volumeAttenuation` is
+// the host's own volumetrics transmittance in front of the handoff (1 without), `radianceThroughput`
+// the primary path's throughput.
+void numosApplyAerialPerspective(
+  Camera camera,
+  AtmosphereArgs args,
+  bool hostSkyOverride,
+  Texture3D<float4> apNearScatter,
+  Texture3D<float4> apFarScatter,
+  Texture3D<float4> apFarTransmittance,
+  Texture3D<float4> apFroxelAux,
+  StructuredBuffer<AerialPerspectiveLight> apLights,
+  StructuredBuffer<uint> apLightClusters,
+  SamplerState apSampler,
+  uint2 pixelCoordinate,
+  bool primaryMiss,
+  float viewDistance,
+  vec3 volumeAttenuation,
+  vec3 radianceThroughput,
+  vec4 cloudOverPixel,
+  inout vec3 radianceOutput)
+{
+  if (args.apFroxelSizeX == 0u || hostSkyOverride)
+  {
+    return;
+  }
+
+  const vec2 screenUV = cameraPixelCoordinateToScreenUV(camera, ivec2(pixelCoordinate));
+  const CameraDirections ray = cameraScreenUVToDirection(camera, screenUV, false);
+  const float forwardPerDistance = max(abs(ray.viewDirection.z), 1e-6f);
+  const vec3 dirYUp = normalize(worldToAtmosphereYUp(ray.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0u));
+  const vec3 inScatterWeight = volumeAttenuation * radianceThroughput;
+
+  const float forward = primaryMiss ? 1e30f : viewDistance * forwardPerDistance;
+  const float rangeDistance = args.apFroxelRange / forwardPerDistance;
+  const vec3 nearS = apSampleNear(apNearScatter, apSampler, screenUV, forward, args).rgb
+    + apLocalLightAirlight(apLights, apLightClusters, apFroxelAux, apSampler, args, screenUV, ray.worldDirection,
+                           forwardPerDistance, args.apStartDistance,
+                           primaryMiss ? rangeDistance : min(viewDistance, rangeDistance));
+
+  if (!primaryMiss && forward <= args.apFroxelRange)
+  {
+    radianceOutput = radianceOutput * apNearTransmittance(dirYUp, viewDistance, args) + nearS * inScatterWeight;
+    return;
+  }
+
+  const vec3 nearT = apNearTransmittance(dirYUp, rangeDistance, args);
+  vec3 farTRange;
+  const vec3 farSRange = evalAerialPerspectiveFar(dirYUp, numosWorldToAirKm(rangeDistance, args), args,
+                                                  apFarScatter, apFarTransmittance, apSampler, farTRange);
+  const float fogT = exp(-apFogOpticalDepth(dirYUp, rangeDistance, primaryMiss ? 1e30f : viewDistance, args));
+  const vec3 fogS = numosFarFogRadiance(dirYUp, args) * (1.0f - fogT);
+
+  if (primaryMiss)
+  {
+    // Clamped: the sky may be darker than the far field's column where evalSkyRadiance fades the
+    // atmosphere out at night.
+    // The cloud (cloudOverPixel) carries its own air and the fog in front of it (the cloud
+    // composite); only the sky's share, 1 - opacity, sees the fog beyond the near field.
+    const float missCloudOpacity = saturate(cloudOverPixel.a);
+    const vec3 sky = radianceOutput - cloudOverPixel.rgb;
+    const vec3 invRange = 1.0f / max(farTRange, vec3(1e-4f));
+    const vec3 skyBeyond = max(sky - (1.0f - missCloudOpacity) * farSRange * radianceThroughput, vec3(0.0f)) * invRange;
+    const vec3 cloudBeyondMiss = max(cloudOverPixel.rgb - missCloudOpacity * farSRange * radianceThroughput, vec3(0.0f))
+                               * invRange;
+    radianceOutput = (nearS + nearT * fogS * (1.0f - missCloudOpacity)) * inScatterWeight
+                   + nearT * (fogT * skyBeyond + cloudBeyondMiss);
+    return;
+  }
+
+  vec3 farT;
+  const vec3 farS = evalAerialPerspectiveFar(dirYUp, numosWorldToAirKm(viewDistance, args), args,
+                                             apFarScatter, apFarTransmittance, apSampler, farT);
+  const vec3 invFarTRange = 1.0f / max(farTRange, vec3(1e-4f));
+  const vec3 airS = max(farS - farSRange, vec3(0.0f)) * invFarTRange;
+  const vec3 airT = saturate(farT * invFarTRange);
+  // The cloud over the surface is lit and hazed by its own march from the camera out: like the sky
+  // on a miss, it gives up its first `range` of air to the near field, and it hides the air behind
+  // it from the surface's share only.
+  const float cloudOpacity = saturate(cloudOverPixel.a);
+  const vec3 surface = radianceOutput - cloudOverPixel.rgb;
+  const vec3 cloudBeyond = max(cloudOverPixel.rgb - cloudOpacity * farSRange * radianceThroughput, vec3(0.0f))
+                         * invFarTRange;
+  // The fog beyond the near field (fogS, fogT) reaches the surface's share only: the cloud composite
+  // already applied the fog between the near field and the cloud, and the fog behind the cloud is
+  // hidden by it.
+  radianceOutput = surface * (nearT * fogT * airT) + nearT * cloudBeyond
+                 + (nearS + nearT * (1.0f - cloudOpacity) * (fogS + fogT * airS)) * inScatterWeight;
+}
+
+// Medium coefficients at a world position, per world unit: for hosts with their own integrator.
+struct NumosAirMedium
+{
+  vec3 scattering;
+  vec3 extinction;
+};
+
+NumosAirMedium numosAirMedium(vec3 worldPos, AtmosphereArgs args)
+{
+  const ApMediumSample m = apSampleMedium(worldPos, args);
+  const float kmPerWorld = numosWorldToAirKm(1.0f, args);
+  NumosAirMedium result;
+  result.scattering = (m.atmosphere.scattering + m.fogScattering) * kmPerWorld;
+  result.extinction = (m.atmosphere.extinction + m.fogExtinction) * kmPerWorld;
+  return result;
+}
+
+// In-scatter toward the segment's origin and RGB transmittance of an arbitrary segment, for
+// secondary rays. Points inside the froxel grid take its lighting (scene-shadowed sun and sky, local
+// lights; the local lights carry the camera's phase, exact only for nearly isotropic media); points
+// outside it are lit unshadowed. `jitter` in [0, 1) offsets the `steps` samples.
+vec3 numosAirSegment(
+  Camera camera,
+  AtmosphereArgs args,
+  vec3 originWorld,
+  vec3 dirWorld,
+  float lengthWorld,
+  uint steps,
+  float jitter,
+  Texture3D<float4> apFroxelLighting,
+  Texture3D<float4> apFroxelAux,
+  SamplerState apSampler,
+  Texture2D<float4> transmittanceLut,
+  Texture2D<float4> multiscatteringLut,
+  Texture3D<float2> cloudShadowMap,
+  SamplerState cloudSampler,
+  out vec3 transmittance)
+{
+  transmittance = vec3(1.0f);
+  vec3 inScatter = vec3(0.0f);
+  if (args.apFroxelSizeX == 0u || !(lengthWorld > 0.0f))
+  {
+    return inScatter;
+  }
+  const vec3 dirYUp = normalize(worldToAtmosphereYUp(dirWorld, args.isZUp != 0u, args.flipUpAxis != 0u));
+  const uint count = clamp(steps, 1u, 64u);
+  const float step = lengthWorld / float(count);
+  for (uint i = 0u; i < count; ++i)
+  {
+    const vec3 p = originWorld + dirWorld * ((float(i) + jitter) * step);
+    vec4 lighting = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    float skyVisibility = 1.0f;
+    vec3 uvw;
+    if (apWorldToCurrentFroxelUvw(p, camera, args, uvw))
+    {
+      lighting = apFroxelLighting.SampleLevel(apSampler, uvw, 0);
+      skyVisibility = apFroxelAux.SampleLevel(apSampler, uvw, 0).r;
+    }
+    const float cloudT = apCloudSunTransmittance(p, args, cloudShadowMap, cloudSampler);
+    apIntegrateSegment(p, dirYUp, step, true, lighting.a, skyVisibility, cloudT,
+                       lighting.rgb * args.apLocalLightIntensity, args,
+                       transmittanceLut, multiscatteringLut, apSampler, inScatter, transmittance);
+  }
+  return inScatter;
+}
+
+// Froxel geometry for the local-light injection volume: per froxel, write the incident local-light
+// radiance at its centre, weighted by the phase toward the camera along numosFroxelViewDirection,
+// per unit scattering coefficient. NUMOS reads it the next frame through its own reprojection.
+vec3 numosFroxelCenterWorld(uint3 froxel, Camera camera, AtmosphereArgs args)
+{
+  return apFroxelCenterWorld(froxel, camera, args);
+}
+
+vec3 numosFroxelViewDirection(uint3 froxel, Camera camera, AtmosphereArgs args)
+{
+  const vec2 uv = (vec2(froxel.xy) + 0.5f) / vec2(args.apFroxelSizeX, args.apFroxelSizeY);
+  return normalize(apFroxelRayVector(uv, camera));
+}
+
+// ============================================================================
+// Cloud composite
+// ============================================================================
+// Port of cloudDepthVisibility / applyCloudComposite from the Remix integration's composite pass.
+
+// How much of the marched cloud sits between the camera and a surface at surfaceKm, from the depth
+// companion's entry and transmittance-weighted mean. entryKm < 0: no cloud on this ray.
+float numosCloudDepthVisibility(float entryKm, float meanKm, float surfaceKm, float cloudAlpha)
+{
+  if (entryKm < 0.0f)
+  {
+    return 0.0f;
+  }
+
+  const float depthKm = surfaceKm - entryKm;
+  if (depthKm <= 0.0f)
+  {
+    return 0.0f;  // surface nearer than any cloud on this ray
+  }
+
+  // meanKm is a transmittance-weighted centroid, not a midpoint: for a uniform medium the span is
+  //   tau = -ln(1 - alpha), S = mu * g(alpha), g = tau*alpha / (alpha - tau(1-alpha)),
+  // with g from 2 (thin) to ~7 (alpha 0.999).
+  const float muKm = max(meanKm - entryKm, 1e-4f);
+
+  if (cloudAlpha < 1e-4f)
+  {
+    return saturate(depthKm / (2.0f * muKm));
+  }
+
+  const float tau = -log(max(1.0f - cloudAlpha, 1e-6f));
+  // Series below tau ~ 0.3, where the exact denominator loses its significant bits.
+  const float g = (tau < 0.3f)
+    ? 2.0f * (1.0f + tau * (1.0f / 6.0f))
+    : tau * cloudAlpha / max(cloudAlpha - tau * (1.0f - cloudAlpha), 1e-6f);
+  const float spanKm = muKm * g;
+
+  if (depthKm >= spanKm)
+  {
+    return 1.0f;  // all of the cloud is in front of the surface
+  }
+
+  const float frontAlpha = 1.0f - exp(-tau * depthKm / spanKm);
+  return saturate(frontAlpha / cloudAlpha);
+}
+
+// Composites this frame's cloud render (FrameOutputs::cloudRender/cloudDepth) over the host's image:
+// premultiplied-over on the opaque result, depth-aware on a separate foreground layer and on
+// alpha-blended surfaces, with the far-field air's in-scatter in front of the cloud.
+//   performedPSR: reflected rays already received their clouds while path tracing.
+//   alphaBlendOutput is premultiplied by the alpha surface's coverage (1 - backgroundAlpha).
+//   alphaBlendHitDistance is in world units; foregroundDepthKm is NUMOS km (convert a world-unit
+//   depth with numosWorldToKm), 0 = no foreground layer.
+void numosApplyCloudComposite(
+  Camera camera,
+  AtmosphereArgs args,
+  Texture2D<float4> cloudRender,
+  Texture2D<float4> cloudDepth,
+  Texture3D<float4> apFarScatter,
+  Texture3D<float4> apFarTransmittance,
+  SamplerState apSampler,
+  uint2 pixelCoordinate,
+  bool primaryMiss,
+  float viewDistance,
+  float backgroundAlpha,
+  vec3 radianceThroughput,
+  inout vec3 radianceOutput,
+  inout vec3 alphaBlendOutput,
+  bool alphaBlendSurfaceValid,
+  float alphaBlendHitDistance,
+  inout vec3 foregroundRadiance,
+  float foregroundDepthKm,
+  bool performedPSR,
+  out vec4 cloudOverPixel)
+{
+  cloudOverPixel = vec4(0.0f);
+  if (args.cloudRenderRTEnable == 0u)
+  {
+    return;
+  }
+
+  const vec2 depthKm = cloudDepth.Load(int3(pixelCoordinate, 0)).xy;
+  const float entryKm = depthKm.x;
+  const float meanKm = depthKm.y;
+  const vec4 cloudSample = cloudRender.Load(int3(pixelCoordinate, 0));
+  vec4 cloud = vec4(cloudSample.rgb, 1.0f - cloudSample.a);
+  float opaqueVisibility = performedPSR ? 0.0f : 1.0f;
+
+  // The march already carries the aerial perspective in front of the cloud (cloudAerialPerspective),
+  // but only the atmosphere's. The height fog between the near field's edge and the cloud (the near
+  // field itself is numosApplyAerialPerspective's) is applied here, extinction and in-scatter, and
+  // numosApplyAerialPerspective leaves the cloud's share alone.
+  if (args.fogExtinctionPerKm > 0.0f && meanKm > 0.0f && cloud.a > 0.0f)
+  {
+    const vec2 cloudScreenUV = cameraPixelCoordinateToScreenUV(camera, ivec2(pixelCoordinate));
+    const CameraDirections cloudRay = cameraScreenUVToDirection(camera, cloudScreenUV, false);
+    const vec3 cloudDirYUp = normalize(worldToAtmosphereYUp(cloudRay.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0u));
+    const float meanWorld = numosKmToWorld(meanKm, args);
+    const float nearEdgeWorld = min(args.apFroxelRange / max(abs(cloudRay.viewDirection.z), 1e-6f), meanWorld);
+    const float fogTFront = exp(-apFogOpticalDepth(cloudDirYUp, nearEdgeWorld, meanWorld, args));
+    cloud.rgb = cloud.rgb * fogTFront + numosFarFogRadiance(cloudDirYUp, args) * ((1.0f - fogTFront) * cloud.a);
+  }
+
+  // Premultiplied over, with the same foreground throughput as the sky it replaces.
+  radianceOutput = radianceOutput * (1.0f - cloud.a * opaqueVisibility)
+                 + cloud.rgb * opaqueVisibility * radianceThroughput;
+  cloudOverPixel = vec4(cloud.rgb * opaqueVisibility * radianceThroughput, cloud.a * opaqueVisibility);
+
+  if (foregroundDepthKm > 0.0f && entryKm >= 0.0f && !performedPSR) {
+    const float visibility = numosCloudDepthVisibility(entryKm, meanKm, foregroundDepthKm, cloud.a);
+    foregroundRadiance = foregroundRadiance * (1.0f - cloud.a * visibility)
+      + cloud.rgb * visibility * saturate(vec3(1.0f) - radianceThroughput);
+  }
+
+  // Alpha-blended surfaces, gated by their own hit distance; in-scatter carries the surface's
+  // coverage factor so a mostly transparent surface does not receive the cloud twice.
+  if (alphaBlendSurfaceValid && entryKm >= 0.0f && !performedPSR)
+  {
+    const float alphaSurfaceKm = numosWorldToKm(alphaBlendHitDistance, args);
+    const float alphaVisibility = numosCloudDepthVisibility(entryKm, meanKm, alphaSurfaceKm, cloud.a);
+
+    const float alphaTransmittance = 1.0f - cloud.a * alphaVisibility;
+    const vec3  alphaInScatter     = cloud.rgb * alphaVisibility * (1.0f - backgroundAlpha);
+    alphaBlendOutput = alphaBlendOutput * alphaTransmittance + alphaInScatter;
+  }
+}

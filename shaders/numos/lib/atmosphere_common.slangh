@@ -1,0 +1,1552 @@
+// Copyright 2026 Kim2091 (Sparkles)
+// Portions Copyright (c) 2025-2026 CattaRappa (sambow23), softsoundd, Owen Krisch, BrunchyChineapple, Jerran Schmidt
+// SPDX-License-Identifier: Apache-2.0 AND MIT
+// The portions are under the MIT licence (licenses/LICENSE-MIT-contributors.txt);
+// see THIRD_PARTY_NOTICES.md.
+
+#pragma once
+
+// Shared atmosphere code: the medium, the frames and unit conversions, the LUT parameterizations and
+// lookups, and the sky radiance march.
+//
+// References:
+//   - Hillaire, S. "A Scalable and Production Ready Sky and Atmosphere Rendering Technique." EGSR 2020.
+//     Used for: the transmittance, multiple scattering and sky-view LUTs, Table 1 coefficients.
+//   - Hillaire, S. "Physically Based Sky, Atmosphere and Cloud Rendering in
+//     Frostbite." SIGGRAPH 2016 Courses.
+//     https://www.ea.com/frostbite/news/physically-based-sky-atmosphere-and-cloud-rendering
+//     Used for: ozone (section 3.4), energy-conserving in-scattering integration
+//     (section 5.6.3, Eq. 17), cloud lighting.
+//   - Schneider, A.; Vos, N. "The Real-time Volumetric Cloudscapes of
+//     Horizon Zero Dawn." SIGGRAPH 2015 Advances in Real-Time Rendering.
+//     https://www.guerrilla-games.com/read/the-real-time-volumetric-cloudscapes-of-horizon-zero-dawn
+//     Used for: noise-driven cloud density and the single-scatter sun-ray lighting of the cloud march.
+//   - Schneider, A. "Nubis Cubed: Methods (and Madness) to Model and Render
+//     Immersive Real-Time Voxel-Based Clouds." SIGGRAPH 2023 Advances in
+//     Real-Time Rendering.
+//     https://advances.realtimerendering.com/s2023/Nubis%20Cubed%20(Advances%202023).pdf
+//     Used for: the voxel cloud model and its lighting.
+//   - Jensen, H.W.; Durand, F.; Stark, M.M.; Premozse, S.; Dorsey, J.;
+//     Shirley, P. "A Physically-Based Night Sky Model."
+//     SIGGRAPH 2001 Proceedings. https://graphics.stanford.edu/papers/nightsky/
+//     Used for: the night sky as separate physical sources (moonlight, starlight, airglow,
+//     zodiacal light) through the same atmosphere as daylight.
+//   - Leinert, Ch. et al. "The 1997 reference of diffuse night sky brightness." A&AS 127:1-99,
+//     1998. Used for: the zodiacal light table, airglow and night-sky brightness levels.
+//   - Young, A.T. "Photometric error analysis. VI. Confirmation of Reiger's theory of
+//     scintillation." Astronomical Journal 72:747, 1967. Used for: star scintillation vs air mass.
+//   - Henyey, L.G.; Greenstein, J.L. "Diffuse radiation in the galaxy."
+//     Astrophysical Journal 93:70-83, 1941. DOI 10.1086/144246.
+//     Used for: all anisotropic phase functions (Mie, clouds, volumetrics).
+//   - Kasten, F.; Young, A.T. "Revised optical air mass tables and
+//     approximation formula." Applied Optics 28(22):4735-4738, 1989.
+//     DOI 10.1364/AO.28.004735. Used for: analytical sun transmittance.
+//
+// Portions of this file (the "following Blender's approach" analytical
+// transmittance branch and computeGroundReflectionAnalytical) are
+// adapted from Blender's intern/sky/source/sky_multiple_scattering.cpp
+// (MIT, Fernando García Liñán + Blender Authors). See
+// multiscattering_lut.comp.slang for the full upstream MIT notice.
+
+#include "numos/util/shader_types.slangh"
+#include "numos/util/math.slangh"
+#include "numos/lib/atmosphere_args.h"
+
+static const float kAtmosphereEpsilon = 1e-3f;
+static const float kPi = 3.14159265358979323846f;
+// Isotropic phase function p_u, used for every scattering order beyond the first
+// (Hillaire 2020, section 5.5.1).
+static const float kIsotropicPhase = 1.0f / (4.0f * kPi);
+
+float rayleighPhase(float cosTheta) {
+  float factor = 3.0f / (16.0f * kPi);
+  return factor * (1.0f + cosTheta * cosTheta);
+}
+
+// Henyey-Greenstein phase function, for aerosols.
+float hgPhase(float cosTheta, float g) {
+  // At g = 1 the function is zero everywhere but the exact forward direction.
+  g = min(g, 0.999f);
+
+  float g2 = g * g;
+  float numerator = 1.0f - g2;
+  float denominator = 4.0f * kPi * pow(1.0f + g2 - 2.0f * g * cosTheta, 1.5f);
+  // Only a guard against an exact zero: a larger floor clips the forward peak into a plateau
+  // (1e-3 turns everything within ~1.8 degrees of the sun at g = 0.97 into a glowing disc).
+  return numerator / max(denominator, 1e-12f);
+}
+
+// Normalized density [0, 1] of an exponential profile; altitude in km.
+float exponentialDensity(float altitude, float scaleHeight) {
+  return exp(-max(0.0f, altitude) / scaleHeight);
+}
+
+float rayleighDensity(float altitude, AtmosphereArgs args) {
+  return exponentialDensity(altitude, args.rayleighScaleHeight);
+}
+
+float mieDensity(float altitude, AtmosphereArgs args) {
+  return exponentialDensity(altitude, args.mieScaleHeight);
+}
+
+// Ozone density (Hillaire 2020, section 4): a tent of total width 2 x ozoneLayerWidth centred on
+// ozoneLayerAltitude, d_o(h) = max(0, 1 - |h - 25| / 15) for Earth. The vertical ozone column is
+// then exactly ozoneLayerWidth km, which is what the Table 1 coefficients assume.
+float ozoneDensity(float altitude, AtmosphereArgs args) {
+  const float halfWidth = max(args.ozoneLayerWidth, kAtmosphereEpsilon);
+  return max(0.0f, 1.0f - abs(altitude - args.ozoneLayerAltitude) / halfWidth);
+}
+
+// Medium coefficients at an altitude. Every march and bake takes them from here, so scattering and
+// extinction are composed the same way everywhere.
+struct AtmosphereMedium {
+  vec3 rayleighScattering;
+  vec3 mieScattering;
+  vec3 scattering;   // Rayleigh + Mie, the sigma_s of the paper's Equation 3
+  vec3 extinction;   // sigma_t = sigma_s + sigma_a, including Mie and ozone absorption
+};
+
+AtmosphereMedium sampleAtmosphereMedium(float altitude, AtmosphereArgs args) {
+  const float densityR = rayleighDensity(altitude, args);
+  const float densityM = mieDensity(altitude, args);
+  const float densityO3 = ozoneDensity(altitude, args);
+
+  AtmosphereMedium medium;
+  medium.rayleighScattering = args.rayleighScattering * densityR;
+  medium.mieScattering = args.mieScattering * densityM;
+  medium.scattering = medium.rayleighScattering + medium.mieScattering;
+  // Rayleigh is treated as pure scattering; Mie and ozone contribute the absorption (paper Table 1).
+  medium.extinction = medium.scattering
+                    + args.mieAbsorption * densityM
+                    + args.ozoneAbsorption * densityO3;
+
+  return medium;
+}
+
+// World space -> the atmosphere's Y-up frame.
+//
+// isZUp moves the game's up axis (Z) into Y. flipUpAxis then negates it, for worlds whose up axis
+// points the other way; without it their sky renders upside down. The isZUp swap transposes two
+// axes, so it is a mirror (determinant -1): elevation is preserved, azimuth handedness is not.
+vec3 worldToAtmosphereYUp(vec3 v, bool isZUp, bool flipUpAxis) {
+  const vec3 yUp = isZUp ? vec3(v.x, v.z, v.y) : v;
+  return flipUpAxis ? vec3(yUp.x, -yUp.y, yUp.z) : yUp;
+}
+
+// Inverse of worldToAtmosphereYUp. Both steps are their own inverses but do not commute, so the up
+// flip is undone first. The CPU twin is the toWorld lambda in Renderer::Impl::syncDistantLights.
+vec3 atmosphereYUpToWorld(vec3 v, bool isZUp, bool flipUpAxis) {
+  const vec3 unflipped = flipUpAxis ? vec3(v.x, -v.y, v.z) : v;
+  return isZUp ? vec3(unflipped.x, unflipped.z, unflipped.y) : unflipped;
+}
+
+// ============================================================================
+// The host boundary
+// ============================================================================
+// The host's world (render space: the engine's axes and units) and NUMOS's own frame (Y-up
+// kilometres) differ by one similarity transform: the axis permutation above, a translation, and a
+// uniform scale, args.worldUnitsPerKm (host units per NUMOS kilometre). Every length and position
+// that crosses between the two, in either direction, goes through these functions, so no two paths
+// can disagree about the size of the world.
+
+float numosWorldToKm(float lengthWorld, AtmosphereArgs args) {
+  return lengthWorld / max(args.worldUnitsPerKm, 1e-6f);
+}
+
+float numosKmToWorld(float lengthKm, AtmosphereArgs args) {
+  return lengthKm * args.worldUnitsPerKm;
+}
+
+// A displacement in world units -> the same displacement in NUMOS Y-up km, and back.
+vec3 numosWorldToKmYUp(vec3 offsetWorld, AtmosphereArgs args) {
+  return worldToAtmosphereYUp(offsetWorld, args.isZUp != 0u, args.flipUpAxis != 0u)
+       * (1.0f / max(args.worldUnitsPerKm, 1e-6f));
+}
+
+vec3 numosKmYUpToWorld(vec3 offsetKm, AtmosphereArgs args) {
+  return atmosphereYUpToWorld(offsetKm, args.isZUp != 0u, args.flipUpAxis != 0u) * args.worldUnitsPerKm;
+}
+
+// A render-space position -> the cloud frame: the frame args.cameraWorldPosYUpKm, the cloud fields,
+// the cloud shadow maps and args.lightningStrikePosKm live in. Measured from the rendered camera
+// (args.cameraPosition), so the host's world origin, the ground datum, the cloud field's vertical
+// offset and the camera-world override carry over exactly as they do for the camera itself.
+vec3 numosWorldToCloudKm(vec3 worldPos, AtmosphereArgs args) {
+  return args.cameraWorldPosYUpKm + numosWorldToKmYUp(worldPos - args.cameraPosition, args);
+}
+
+// The aerial perspective's frame: the same axes, in haze kilometres (args.apWorldUnitsPerKm, host
+// units per haze km, from rtx.atmosphere.hazeWorldScale). The near field, the far field and the
+// height fog convert through these; the clouds and their shadow maps stay on worldUnitsPerKm.
+float numosWorldToAirKm(float lengthWorld, AtmosphereArgs args) {
+  return lengthWorld / max(args.apWorldUnitsPerKm, 1e-6f);
+}
+
+float numosAirKmToWorld(float lengthKm, AtmosphereArgs args) {
+  return lengthKm * args.apWorldUnitsPerKm;
+}
+
+vec3 numosWorldToAirKmYUp(vec3 offsetWorld, AtmosphereArgs args) {
+  return worldToAtmosphereYUp(offsetWorld, args.isZUp != 0u, args.flipUpAxis != 0u)
+       * (1.0f / max(args.apWorldUnitsPerKm, 1e-6f));
+}
+
+// Ray-sphere intersection: near and far distances t0 <= t1. False on a miss.
+bool intersectSphere(vec3 origin, vec3 direction, vec3 center, float radius, out float t0, out float t1) {
+  vec3 oc = origin - center;
+  float a = dot(direction, direction);
+  float b = 2.0f * dot(oc, direction);
+  float c = dot(oc, oc) - radius * radius;
+  float discriminant = b * b - 4.0f * a * c;
+
+  // A small tolerance keeps grazing rays from missing through rounding.
+  const float kDiscriminantEpsilon = 1e-6f;
+  if (discriminant < -kDiscriminantEpsilon) {
+    t0 = t1 = -1.0f;
+    return false;
+  }
+
+  discriminant = max(0.0f, discriminant);
+
+  float sqrtDiscriminant = sqrt(discriminant);
+  float inv2A = 0.5f / max(a, 1e-7f);
+
+  // The cancellation-free form: take the root without cancellation, get the other from c / (a t).
+  if (b > 0.0f) {
+    t0 = (-b - sqrtDiscriminant) * inv2A;
+    t1 = (abs(t0) > 1e-6f) ? (c / (a * t0)) : ((-b + sqrtDiscriminant) * inv2A);
+  } else {
+    t1 = (-b + sqrtDiscriminant) * inv2A;
+    t0 = (abs(t1) > 1e-6f) ? (c / (a * t1)) : ((-b - sqrtDiscriminant) * inv2A);
+  }
+
+  if (t0 > t1) {
+    float temp = t0;
+    t0 = t1;
+    t1 = temp;
+  }
+  
+  return true;
+}
+
+// Nearest non-negative intersection distance, or -1 when the sphere is behind the ray or missed.
+float intersectSphereNearest(vec3 origin, vec3 direction, vec3 center, float radius) {
+  float t0, t1;
+  if (!intersectSphere(origin, direction, center, radius, t0, t1)) {
+    return -1.0f;
+  }
+
+  if (t1 < 0.0f) {
+    return -1.0f;
+  }
+
+  return t0 < 0.0f ? t1 : t0;
+}
+
+// The sky measures altitude from the ground datum (NUMOS kilometres).
+float getEyeRadius(AtmosphereArgs args) {
+  return args.planetRadius + args.cameraAltitudeKm;
+}
+
+vec3 getPlanetCenter(AtmosphereArgs args) {
+  return vec3(0.0f, -getEyeRadius(args), 0.0f);
+}
+
+// The aerial perspective measures altitude from the same datum in haze kilometres, with its eye at
+// args.apCameraAltitudeKm.
+vec3 getAirPlanetCenter(AtmosphereArgs args) {
+  return vec3(0.0f, -(args.planetRadius + args.apCameraAltitudeKm), 0.0f);
+}
+
+// A camera-relative point of the aerial perspective's frame -> the point at the same altitude and
+// the same direction from the planet's centre in the sky's frame, for the helpers that measure from
+// getPlanetCenter (evalSunShadowing and its kin).
+vec3 numosAirToSkyFrame(vec3 posAirKm, AtmosphereArgs args) {
+  return posAirKm + vec3(0.0f, args.apCameraAltitudeKm - args.cameraAltitudeKm, 0.0f);
+}
+
+// Cloud shell intersections and density share the same frame, translated by the cloud field's
+// vertical offset.
+vec3 getCloudPlanetCenter(AtmosphereArgs args) {
+  return vec3(0.0f, -(args.planetRadius + args.cameraWorldPosYUpKm.y), 0.0f);
+}
+
+vec3 getCloudPlanetCenterWorldKm(AtmosphereArgs args) {
+  return args.cameraWorldPosYUpKm + getCloudPlanetCenter(args);
+}
+
+// The planet's shadow on the air: the Vis term of Hillaire 2020, Eq. 4. It is what puts the Earth's
+// shadow (the dark band under the Belt of Venus) into the twilight sky.
+float evalPlanetShadow(vec3 samplePos, vec3 sunDir, AtmosphereArgs args) {
+  // Nudge the test sphere inward so a sample sitting exactly on the ground is not self shadowed by
+  // floating point error.
+  const float shadowRadius = args.planetRadius * (1.0f - 1e-5f);
+  return intersectSphereNearest(samplePos, sunDir, getPlanetCenter(args), shadowRadius) >= 0.0f
+    ? 0.0f
+    : 1.0f;
+}
+
+// Bruneton's half-texel remap: the LUT's first and last texel centres land exactly on the ends of the
+// parameter range, so lookups carry no half-texel bias.
+float unitRangeToTextureCoord(float x, uint textureSize) {
+  const float size = float(max(textureSize, 1u));
+  return 0.5f / size + saturate(x) * (1.0f - 1.0f / size);
+}
+
+float textureCoordToUnitRange(float u, uint textureSize) {
+  const float size = float(max(textureSize, 1u));
+  return saturate((u - 0.5f / size) / (1.0f - 1.0f / size));
+}
+
+// Transmittance LUT texel -> (view zenith cosine, altitude in km). The parameterization of Bruneton
+// and Neyret 2008, section 4, as Hillaire 2020 uses it (section 5.2).
+void uvToTransmittanceLutParams(vec2 uv, AtmosphereArgs args, out float viewZenithCosAngle, out float altitude) {
+  const float xMu = textureCoordToUnitRange(uv.x, args.transmittanceLutWidth);
+  const float xR = textureCoordToUnitRange(uv.y, args.transmittanceLutHeight);
+
+  // Distance to the horizon, from which the altitude follows.
+  float H = sqrt(max(0.0f, args.atmosphereRadius * args.atmosphereRadius - args.planetRadius * args.planetRadius));
+  float rho = H * xR;
+  altitude = sqrt(rho * rho + args.planetRadius * args.planetRadius) - args.planetRadius;
+
+  // Distance to the atmosphere's top boundary, and the view zenith angle that produces it.
+  float r = altitude + args.planetRadius;
+  float dMin = args.atmosphereRadius - r;
+  float dMax = rho + H;
+  float d = dMin + xMu * (dMax - dMin);
+
+  if (d == 0.0f) {
+    viewZenithCosAngle = 1.0f;
+  } else {
+    viewZenithCosAngle = (H * H - rho * rho - d * d) / (2.0f * r * d);
+    viewZenithCosAngle = clamp(viewZenithCosAngle, -1.0f, 1.0f);
+  }
+}
+
+// Exact inverse of uvToTransmittanceLutParams, half-texel remap included. The bake and the lookup
+// depend on the two staying inverses.
+vec2 transmittanceLutParamsToUv(float altitude, float viewZenithCosAngle, AtmosphereArgs args) {
+  float H = sqrt(max(0.0f, args.atmosphereRadius * args.atmosphereRadius - args.planetRadius * args.planetRadius));
+  float rho = sqrt(max(0.0f, altitude * altitude + 2.0f * args.planetRadius * altitude));
+
+  float r = altitude + args.planetRadius;
+  float mu = clamp(viewZenithCosAngle, -1.0f, 1.0f);
+  float d = max(0.0f, (-r * mu + sqrt(max(0.0f, r * r * (mu * mu - 1.0f) + args.atmosphereRadius * args.atmosphereRadius))));
+
+  float dMin = max(0.0f, args.atmosphereRadius - r);
+  float dMax = rho + H;
+
+  float xMu = (d - dMin) / max(dMax - dMin, 1e-6f);
+  float xR = rho / max(H, 1e-6f);
+
+  return vec2(
+    unitRangeToTextureCoord(xMu, args.transmittanceLutWidth),
+    unitRangeToTextureCoord(xR, args.transmittanceLutHeight));
+}
+
+// Transmittance from an altitude along a view zenith angle to the top of the atmosphere.
+//
+// The planet is ignored: rays through the ground are baked with the density clamped at ground
+// level instead of a hard zero, so bilinear filtering near the horizon does not bleed zeros into
+// valid texels. For the sun's actual visibility use evalSunShadowing, which adds evalPlanetShadow.
+vec3 sampleTransmittanceLut(Texture2D transmittanceLut, SamplerState lutSampler, float altitude, float viewZenithCosAngle, AtmosphereArgs args) {
+  vec2 uv = transmittanceLutParamsToUv(altitude, viewZenithCosAngle, args);
+  return max(transmittanceLut.SampleLevel(lutSampler, uv, 0).rgb, vec3(0.0f));
+}
+
+// Psi_ms of Hillaire 2020, Eq. 10: the transfer function (sr^-1) from a directional light's
+// illuminance to all scattering orders of two and above, over sun zenith cosine and altitude
+// (section 5.5.2). Neither the illuminance nor the local sigma_s is baked in; callers apply each
+// once (see the multiscatter blend in evalAtmosphereRadiance).
+//
+// The texture is two size x size halves stacked vertically:
+//   top: Psi_ms, linear, over sun zenith cosine mu in [-1, 1] (the paper's layout);
+//   bottom (twilight): log2 Psi_ms over mu in [kMultiscatteringTwilightMuMin, ...MuMax].
+// Below the horizon Psi_ms falls by ~10^2.6 per 0.1 of mu (1.5e-3 at mu = 0, 3.5e-8 at -0.2 on the
+// ground): deep in fp16 subnormals and far too steep for linear filtering over the top half's
+// texels, yet that is where the sky between nautical and astronomical twilight gets its multiple
+// scattering. In log2 the bilinear tap is a geometric interpolation, exact for an exponential, at
+// six times the mu resolution. MuMax is a texel centre of the top half, so the halves meet without a
+// seam.
+static const float kMultiscatteringTwilightMuMax = -1.0f / 31.0f;  // top-half column 15 of 32
+static const float kMultiscatteringTwilightMuMin = -0.35f;          // Psi_ms is gone below
+static const float kMultiscatteringTwilightFloor = 1e-30f;
+
+vec3 sampleMultiscatteringLut(Texture2D multiscatteringLut, SamplerState lutSampler, float altitude, float sunZenithCosAngle, AtmosphereArgs args) {
+  // X axis: sun zenith angle cosine; Y axis: altitude [0, atmosphereThickness] -> [0, 1] per half.
+  const float altitudeCoord = unitRangeToTextureCoord(
+    saturate(altitude / max(args.atmosphereThickness, kAtmosphereEpsilon)), args.multiscatteringLutSize);
+  if (sunZenithCosAngle < kMultiscatteringTwilightMuMax) {
+    const float x = saturate((sunZenithCosAngle - kMultiscatteringTwilightMuMin)
+                             / (kMultiscatteringTwilightMuMax - kMultiscatteringTwilightMuMin));
+    const vec2 uv = vec2(unitRangeToTextureCoord(x, args.multiscatteringLutSize), 0.5f + 0.5f * altitudeCoord);
+    return exp2(multiscatteringLut.SampleLevel(lutSampler, uv, 0).rgb);
+  }
+  const float u = unitRangeToTextureCoord(
+    (clamp(sunZenithCosAngle, -1.0f, 1.0f) + 1.0f) * 0.5f, args.multiscatteringLutSize);
+  return max(multiscatteringLut.SampleLevel(lutSampler, vec2(u, 0.5f * altitudeCoord), 0).rgb, vec3(0.0f));
+}
+
+// Transmittance from a point in the atmosphere to the sun, planet shadow included: the S term of
+// Hillaire 2020, Eq. 4. March samples use this rather than a bare sampleTransmittanceLut.
+vec3 evalSunShadowing(vec3 samplePos, vec3 sunDir, Texture2D transmittanceLut,
+                      SamplerState lutSampler, AtmosphereArgs args) {
+  if (evalPlanetShadow(samplePos, sunDir, args) <= 0.0f) {
+    return vec3(0.0f);
+  }
+
+  const vec3 toSample = samplePos - getPlanetCenter(args);
+  const float radius = max(length(toSample), kAtmosphereEpsilon);
+  const float sunZenithCosAngle = dot(toSample / radius, sunDir);
+
+  return sampleTransmittanceLut(
+    transmittanceLut, lutSampler, max(radius - args.planetRadius, 0.0f), sunZenithCosAngle, args);
+}
+
+// evalSunShadowing for a march sample that may lie below the planet's surface: such a sample is
+// shaded as the ground point directly above it.
+//
+// With the eye at or just above the datum, a ray below the horizon can be underground from its first
+// steps. Those samples stand in for the game's distant terrain, which the atmosphere knows nothing
+// about, so they are lit as ground-level air. A plain evalSunShadowing would call them shadowed, and
+// the lower half of the sky would turn into one flat dark disc of multiscatter fill.
+//
+// Samples at or above the surface are unchanged, so the planet's shadow still rises at sunset.
+vec3 evalSunShadowingClampedToSurface(vec3 samplePos, vec3 sunDir, Texture2D transmittanceLut,
+                                      SamplerState lutSampler, AtmosphereArgs args) {
+  const vec3 planetCenter = getPlanetCenter(args);
+  const vec3 toSample = samplePos - planetCenter;
+  const float radius = length(toSample);
+
+  const vec3 clampedPos = (radius < args.planetRadius)
+    ? planetCenter + toSample * (args.planetRadius / max(radius, kAtmosphereEpsilon))
+    : samplePos;
+
+  return evalSunShadowing(clampedPos, sunDir, transmittanceLut, lutSampler, args);
+}
+
+// Spreads the march samples along a span with a power curve: short steps near the origin, where the
+// air is densest, longer ones further out. Toward the horizon the chord is hundreds of km, and 32
+// uniform steps would sample the 1.2 km Mie layer once, at a position that drifts with elevation and
+// bands the sky-view LUT. Squaring puts the first of 32 steps under a kilometre at the horizon.
+static const float kAtmosphereStepDistributionExponent = 2.0f;
+
+float atmosphereStepFraction(float x) {
+  return pow(saturate(x), kAtmosphereStepDistributionExponent);
+}
+
+// In-scattered radiance along a ray from rayOrigin (the eye, at getEyeRadius from the planet's
+// centre) to the top of the atmosphere or the ground: single scattering of the sun and the moons,
+// multiple scattering and the night glow. The sky-view LUT bake calls it.
+vec3 evalAtmosphereRadiance(
+  vec3 rayOrigin,
+  vec3 rayDir,
+  vec3 sunDir,
+  AtmosphereArgs args,
+  Texture2D<float4> transmittanceLut,
+  SamplerState transmittanceLutSampler,
+  Texture2D<float4> multiscatteringLut,
+  int numSamples = 32
+) {
+  const vec3 planetCenter = getPlanetCenter(args);
+  float t0, t1;
+
+  float distToCenter = length(rayOrigin - planetCenter);
+  bool insideAtmosphere = distToCenter < args.atmosphereRadius;
+
+  if (!intersectSphere(rayOrigin, rayDir, planetCenter, args.atmosphereRadius, t0, t1)) {
+    return vec3(0.0f);
+  }
+
+  if (insideAtmosphere) {
+    t0 = 0.0f;
+  }
+
+  float tPlanet0, tPlanet1;
+  bool hitsPlanet = intersectSphere(rayOrigin, rayDir, planetCenter, args.planetRadius, tPlanet0, tPlanet1);
+
+  t0 = max(0.0f, t0);
+  // A ray that reaches the planet stops at its surface: this is the air in front of the ground.
+  // evalSkyRadiance adds the lit ground itself (evalSkyGroundRadiance), seen through that air.
+  const bool entersGround = hitsPlanet && tPlanet1 > 0.0f
+    && dot(rayDir, rayOrigin - planetCenter) < 0.0f;
+  if (entersGround) {
+    t1 = min(t1, max(tPlanet0, 0.0f));
+  }
+  
+  if (t1 <= t0) {
+    return vec3(0.0f);
+  }
+  
+  // Power-distributed segments (atmosphereStepFraction).
+  const int actualSamples = clamp(numSamples, 1, 64);
+  const float span = t1 - t0;
+  const float invSamples = 1.0f / float(actualSamples);
+
+  vec3 L = vec3(0.0f);
+  vec3 transmittance = vec3(1.0f);
+
+  float cosTheta = dot(rayDir, sunDir);
+  float phaseR = rayleighPhase(cosTheta);
+  float phaseM = hgPhase(cosTheta, args.mieAnisotropy);
+  
+  // Moonlight: each moon flagged in moonSkyLightMask is a second light through the same air, with
+  // the same transmittance (and planet shadow) and multiscattering as the sun, so a moonlit sky is a
+  // dim sky in the moon's colours. Its phase terms depend only on the ray, so they are hoisted.
+  vec3 moonDirs[MAX_MOONS];
+  float moonPhaseR[MAX_MOONS];
+  float moonPhaseM[MAX_MOONS];
+  [unroll] for (uint mi = 0u; mi < MAX_MOONS; ++mi) {
+    moonDirs[mi] = normalize(args.moons[mi].direction);
+    const float moonCosTheta = dot(rayDir, moonDirs[mi]);
+    moonPhaseR[mi] = rayleighPhase(moonCosTheta);
+    moonPhaseM[mi] = hgPhase(moonCosTheta, args.mieAnisotropy);
+  }
+
+  float segmentStart = 0.0f;
+  for (int i = 0; i < actualSamples; ++i) {
+    const float segmentEnd = atmosphereStepFraction(float(i + 1) * invSamples);
+    const float dt = (segmentEnd - segmentStart) * span;
+    const float t = t0 + (segmentStart + (segmentEnd - segmentStart) * 0.5f) * span;
+    segmentStart = segmentEnd;
+
+    if (dt <= 0.0f) {
+      continue;
+    }
+
+    vec3 samplePos = rayOrigin + rayDir * t;
+    float altitude = length(samplePos - planetCenter) - args.planetRadius;
+
+    altitude = clamp(altitude, 0.0f, args.atmosphereThickness);
+
+    const AtmosphereMedium medium = sampleAtmosphereMedium(altitude, args);
+    vec3 scatteringR = medium.rayleighScattering;
+    vec3 scatteringM = medium.mieScattering;
+    vec3 scattering = medium.scattering;
+    vec3 extinction = medium.extinction;
+
+    // Sun visibility: transmittance times planet shadow, with below-surface samples lifted to the
+    // ground (evalSunShadowingClampedToSurface).
+    vec3 up = normalize(samplePos - planetCenter);
+    float sunZenithCosAngle = dot(up, normalize(sunDir));
+    vec3 sunTransmittance = evalSunShadowingClampedToSurface(samplePos, normalize(sunDir), transmittanceLut, transmittanceLutSampler, args);
+
+    // Multiple scattering: the analytical fill blended toward the LUT (Hillaire's physical model)
+    // by multiScatterPhysicalStrength.
+    vec3 msAnalytical = getAnalyticalMultiscattering(altitude, sunZenithCosAngle, args);
+    vec3 msLut        = sampleMultiscatteringLut(multiscatteringLut, transmittanceLutSampler, altitude, sunZenithCosAngle, args);
+
+    vec3 singleScatter = args.sunIlluminance * sunTransmittance *
+                         (scatteringR * phaseR + scatteringM * phaseM);
+    // Both multiscatter terms are transfers without the illuminance, which is applied here, once.
+    vec3 contribAnalytical = args.sunIlluminance * msAnalytical * scattering;
+    vec3 contribLut        = args.sunIlluminance * scattering * msLut;
+    vec3 multiScatterContrib = lerp(contribAnalytical, contribLut,
+                                     args.multiScatterPhysicalStrength);
+    vec3 scatteredLight = singleScatter + multiScatterContrib;
+
+    [unroll] for (uint mi = 0u; mi < MAX_MOONS; ++mi) {
+      if (((args.moonSkyLightMask >> mi) & 1u) == 0u) {
+        continue;
+      }
+      const vec3 moonTransmittance = evalSunShadowingClampedToSurface(samplePos, moonDirs[mi], transmittanceLut,
+                                                                      transmittanceLutSampler, args);
+      const vec3 moonMs = sampleMultiscatteringLut(multiscatteringLut, transmittanceLutSampler, altitude,
+                                                   dot(up, moonDirs[mi]), args);
+      scatteredLight += args.moons[mi].illuminance
+                      * (moonTransmittance * (scatteringR * moonPhaseR[mi] + scatteringM * moonPhaseM[mi])
+                         + scattering * moonMs);
+    }
+
+    // The night sky's own glow lighting the air (night_sky.slangh): the airglow layer, the zodiacal
+    // light and the starlight above, reaching this sample through about two air masses.
+    if ((args.nightSkyFlags & 8u) != 0u) {
+      scatteredLight += scattering * args.nightGlowInScatter
+                      * sampleTransmittanceLut(transmittanceLut, transmittanceLutSampler, altitude, 0.5f, args);
+    }
+
+    // Energy-conserving segment integral (Hillaire 2016, section 5.6.3, Eq. 17):
+    // integral of exp(-sigma_t x) S dx over the segment = (S - S exp(-sigma_t d)) / sigma_t.
+    vec3 sampleTransmittance = exp(-extinction * dt);
+    sampleTransmittance = clamp(sampleTransmittance, vec3(0.0f), vec3(1.0f));
+    scatteredLight = max(scatteredLight, vec3(0.0f));
+
+    vec3 clampedExtinction = max(extinction, vec3(1e-7f));
+
+    vec3 integScatt = (scatteredLight - scatteredLight * sampleTransmittance) / clampedExtinction;
+
+    // A NaN or Inf sample is dropped rather than turning the pixel black.
+    vec3 contribution = transmittance * integScatt;
+    if (any(isnan(contribution)) || any(isinf(contribution))) {
+      continue;
+    }
+
+    L += contribution;
+    transmittance *= sampleTransmittance;
+  }
+
+  L = max(L, vec3(0.0f));
+  if (any(isnan(L)) || any(isinf(L))) {
+    L = vec3(0.0f);
+  }
+
+  return L;
+}
+
+// ============================================================================
+// Cloud geometry helpers
+// ============================================================================
+// Slab and dome intersection, height fractions and the dome LUT's direction mapping, shared by the
+// screen cloud pass and the secondary dome LUT bake. Cloud distances and radii are NUMOS km, like
+// the atmosphere's; the cloud field's vertical offset never changes the atmosphere's eye radius.
+
+// Height fraction in the cloud slab: 0 at the base (slabAltitudeKm above the datum), 1 at the top,
+// saturated outside. samplePos and planetCenterWorldKm must both be world-anchored cloud-frame
+// positions (see getCloudPlanetCenterWorldKm): the density fields are world-anchored, and a centre
+// in any other frame puts the slab on a different sphere from the density, an error that grows
+// with the square of the distance from the origin.
+float computeCloudHeightFractionC(vec3 samplePos, vec3 planetCenterWorldKm, float planetRadiusKm,
+                                  float slabAltitudeKm, float slabThicknessKm) {
+  float altitudeAboveSea = length(samplePos - planetCenterWorldKm) - planetRadiusKm;
+  return saturate((altitudeAboveSea - slabAltitudeKm) / max(slabThicknessKm, 0.001f));
+}
+
+float computeCloudHeightFraction(vec3 samplePos, AtmosphereArgs args,
+                                  float slabAltitudeKm, float slabThicknessKm) {
+  return computeCloudHeightFractionC(samplePos, getCloudPlanetCenterWorldKm(args), args.planetRadius,
+                                     slabAltitudeKm, slabThicknessKm);
+}
+
+float computeCloudHeightFraction(vec3 samplePos, AtmosphereArgs args) {
+  return computeCloudHeightFraction(samplePos, args, args.cloudAltitude, args.cloudThickness);
+}
+
+// =============================================================================
+// Cloud dome LUT direction mapping
+//
+// The secondary cloud LUT covers the full sphere, keyed (azimuth, signed elevation) with
+// elevation = l * l * sign(l) * (pi / 2), l = 2v - 1: the same encoding as the sky-view LUT, which
+// puts most rows near the horizon, where the slab is seen edge-on and carries the most detail per
+// texel. The writer (cloud_secondary_lut.comp.slang) and the reader (evalSkyRadiance) both call
+// these two helpers. They live here because the reader does not include the march library.
+// =============================================================================
+vec3 cloudDomeUvToDir(vec2 uv) {
+  float azimuth = uv.x * 2.0f * kPi;
+  float l = uv.y * 2.0f - 1.0f;
+  float elevation = l * l * sign(l) * (0.5f * kPi);
+  float cosEl = cos(elevation);
+  return vec3(sin(azimuth) * cosEl, sin(elevation), cos(azimuth) * cosEl);
+}
+
+vec2 cloudDomeDirToUv(vec3 dirYUp) {
+  float elevation = asin(clamp(dirYUp.y, -1.0f, 1.0f));
+  // Inverse of cloudDomeUvToDir's l * l * sign(l).
+  float l = sqrt(abs(elevation) / (0.5f * kPi)) * sign(elevation);
+  float v = (l + 1.0f) * 0.5f;
+  // Azimuth 0 = +Z, increasing toward +X. atan2 gives u in [-0.5, 0.5); frac wraps it to [0, 1)
+  // so the result does not depend on the sampler's address mode (the mip generation clamps).
+  float u = frac(atan2(dirYUp.x, dirYUp.z) / (2.0f * kPi));
+  return vec2(u, v);
+}
+
+// Samples a LUT whose U is azimuth with the azimuth wrapped. Its first and last columns are
+// neighbours, but the sky-view sampler clamps, so bilinear filtering alone leaves a seam along
+// u = 0/1. Within half a texel of the wrap this blends the two edge columns itself.
+vec4 sampleAzimuthWrappedLut(Texture2D<float4> lut, SamplerState s, vec2 uv, float mip) {
+  uint width, height, levels;
+  lut.GetDimensions(0u, width, height, levels);
+  const float columns = max(float(width >> uint(mip)), 1.0f);
+  const float halfTexel = 0.5f / columns;
+  if (uv.x >= halfTexel && uv.x <= 1.0f - halfTexel) {
+    return lut.SampleLevel(s, uv, mip);
+  }
+  // Position between the last column's centre (t = 0) and the first's (t = 1).
+  const float t = frac(uv.x * columns - 0.5f + columns);
+  const vec4 last  = lut.SampleLevel(s, vec2(1.0f - halfTexel, uv.y), mip);
+  const vec4 first = lut.SampleLevel(s, vec2(halfTexel, uv.y), mip);
+  return lerp(last, first, t);
+}
+
+// The cloud dome LUT (cloudDomeDirToUv's mapping).
+vec4 sampleCloudDomeLut(Texture2D<float4> lut, SamplerState s, vec2 uv, float mip) {
+  return sampleAzimuthWrappedLut(lut, s, uv, mip);
+}
+
+// The cloud dome LUT reconstructed with a cubic B-spline. A dome texel spans about a degree, many
+// pixels of a reflection, and bilinear magnification of the near-binary coverage draws each texel
+// as a hard-edged square. The B-spline is C2, at the cost of a slightly wider blur. Four bilinear
+// taps with the weights folded into the tap positions, each azimuth-wrapped.
+vec4 sampleCloudDomeLutSmooth(Texture2D<float4> lut, SamplerState s, vec2 uv, float mip) {
+  uint width, height, levels;
+  lut.GetDimensions(0u, width, height, levels);
+  const vec2 size = max(vec2(float(width >> uint(mip)), float(height >> uint(mip))), vec2(1.0f));
+  const vec2 st = uv * size - 0.5f;
+  const vec2 i = floor(st);
+  const vec2 f = st - i;
+  const vec2 f2 = f * f;
+  const vec2 f3 = f2 * f;
+  const vec2 w0 = (1.0f / 6.0f) * (1.0f - 3.0f * f + 3.0f * f2 - f3);
+  const vec2 w1 = (1.0f / 6.0f) * (4.0f - 6.0f * f2 + 3.0f * f3);
+  const vec2 w2 = (1.0f / 6.0f) * (1.0f + 3.0f * f + 3.0f * f2 - 3.0f * f3);
+  const vec2 w3 = (1.0f / 6.0f) * f3;
+  const vec2 g0 = w0 + w1;
+  const vec2 g1 = w2 + w3;
+  const vec2 p0 = (i - 0.5f + w1 / g0) / size;  // texel centres sit at (k + 0.5) / size
+  const vec2 p1 = (i + 1.5f + w3 / g1) / size;
+  const float v0 = saturate(p0.y);
+  const float v1 = saturate(p1.y);
+  return g0.y * (g0.x * sampleAzimuthWrappedLut(lut, s, vec2(frac(p0.x), v0), mip)
+               + g1.x * sampleAzimuthWrappedLut(lut, s, vec2(frac(p1.x), v0), mip))
+       + g1.y * (g0.x * sampleAzimuthWrappedLut(lut, s, vec2(frac(p0.x), v1), mip)
+               + g1.x * sampleAzimuthWrappedLut(lut, s, vec2(frac(p1.x), v1), mip));
+}
+
+bool intersectCloudLayer(vec3 rayDir, AtmosphereArgs args, out float t, out vec3 hitPos) {
+  t = -1.0f;
+  hitPos = vec3(0.0f);
+
+  if (rayDir.y <= 0.001f) return false;
+
+  vec3 planetCenter = getCloudPlanetCenter(args);
+  float cloudSphereRadius = args.planetRadius + args.cloudAltitude;
+
+  float t0, t1;
+  if (!intersectSphere(vec3(0.0f), rayDir, planetCenter, cloudSphereRadius, t0, t1)) {
+    return false;
+  }
+
+  // From inside the cloud sphere the far root is the hit.
+  float hitT = t1 > 0.0f ? t1 : t0;
+  if (hitT <= 0.0f) return false;
+
+  t = hitT;
+  hitPos = rayDir * hitT;
+  return true;
+}
+
+// Mean cloud transmittance toward the sun where no shadow map is read: the share of clear sky,
+// 1 - coverage, scaled by cloudShadowStrength (the same mean the aerial perspective uses beyond the
+// map, apCloudShadowMean). getTransmittanceToSun applies it for callers without a position, and the
+// volume sun light uses it when map shadows are off.
+float evalCloudGroundShadow(vec3 sunDir, AtmosphereArgs args) {
+#ifndef ATMOSPHERE_AVAILABLE
+  // LUT bakes include this file without the cloud bindings; the LUTs hold pure atmosphere.
+  return 1.0f;
+#else
+  if (args.cloudEnabled < 0.5f || args.cloudCoverageMean < 0.01f || sunDir.y <= 0.0f) {
+    return 1.0f;
+  }
+  return lerp(1.0f, 1.0f - saturate(args.cloudCoverageMean), saturate(args.cloudShadowStrength));
+#endif
+}
+
+// Analytical atmospheric transmittance from the ground along a Y-up direction: the Kasten-Young
+// (1989) air mass above the horizon and an exponential continuation below it. The cloud and moon
+// lighting use it; the sky itself uses the transmittance LUT. At the horizon blue transmittance is
+// ~4e-5 (Hillaire 2016, Fig. 23), which is what keeps sunset clouds from glowing.
+//
+// dirYUp must be normalized. No cloud shadow: getTransmittanceToSun adds it for ground lighting,
+// while cloud self-lighting and moon paths use this directly so they do not count the cloud twice.
+vec3 getAtmosphericTransmittanceForDir(vec3 dirYUp, AtmosphereArgs args) {
+  float H = args.rayleighScaleHeight;
+  float zenithCosAngle = dirYUp.y;
+
+  float airMass;
+  if (zenithCosAngle > 0.01f) {
+    float zenithRad = acos(clamp(zenithCosAngle, -1.0f, 1.0f));
+    float zenithDeg = degrees(zenithRad);
+    airMass = 1.0f / (zenithCosAngle + 0.15f * pow(93.885f - zenithDeg, -1.253f));
+  } else {
+    const float kHorizonAirMass = 40.0f;
+    float belowHorizonFactor = exp(-zenithCosAngle * 10.0f);
+    airMass = kHorizonAirMass * belowHorizonFactor;
+  }
+  airMass = min(airMass, 200.0f);
+
+  // Slant optical depth per species = scale height x air mass (ground density is 1), with the same
+  // Rayleigh + Mie + ozone composition as the transmittance LUT. The grey Mie term is what dims a
+  // low sun and keeps the clouds' sunlight in step with the LUT-lit sky.
+  float rayleighOpticalDepthToSun = H * airMass;
+  float mieOpticalDepthToSun      = args.mieScaleHeight * airMass;
+
+  // The tent profile is exactly ozoneLayerWidth km of vertical column. Ozone sits high, so it follows
+  // the Chapman air mass 1 / sqrt(cos^2 z + 2h / R), which saturates near 11 at the horizon, instead
+  // of the near-ground air mass that runs to 200: a low sun reddens without the beam vanishing.
+  float ozoneAirMass = 1.0f / sqrt(max(zenithCosAngle * zenithCosAngle
+                                     + 2.0f * args.ozoneLayerAltitude / max(args.planetRadius, 1.0f),
+                                       1e-6f));
+  float ozoneOpticalDepthToSun = max(args.ozoneLayerWidth, 0.0f) * ozoneAirMass;
+
+  vec3 transmittance = exp(-args.rayleighScattering * rayleighOpticalDepthToSun
+                            - (args.mieScattering + args.mieAbsorption) * mieOpticalDepthToSun
+                            - args.ozoneAbsorption * ozoneOpticalDepthToSun);
+
+  // Below the horizon the light fades to effectively nothing by about -15 degrees.
+  if (zenithCosAngle < 0.0f) {
+    float angleBelow = -zenithCosAngle;
+    transmittance *= exp(-angleBelow * 15.0f);
+  }
+
+  return transmittance;
+}
+
+// Transmittance to the sun for ground-level points: the analytical atmosphere term times the mean
+// cloud shadow (evalCloudGroundShadow). Callers that apply a per-point shadow from
+// sampleCloudGroundShadow_OptionB pass skipCloudShadow so the clouds are not counted twice. Callers
+// with no real position (the sun disk, the analytical ground reflection) keep the mean shadow.
+vec3 getTransmittanceToSun(vec3 worldPos, AtmosphereArgs args,
+                            bool isZUp = false, bool skipCloudShadow = false) {
+  vec3 transmittance = getAtmosphericTransmittanceForDir(args.sunDirection, args);
+  if (!skipCloudShadow) {
+    transmittance *= evalCloudGroundShadow(normalize(args.sunDirection), args);
+  }
+  return transmittance;
+}
+
+// Sky radiance arriving from a direction, clouds included: the clear sky seen through the clouds
+// plus the light the clouds themselves send this way,
+//   skyRadiance * cloudTransmittance + cloudRadiance,
+// the same premultiplied composite evalSkyRadiance applies to secondary rays. skyRadiance comes
+// from the sky-view LUT; (cloudRadiance, cloudTransmittance) from the cloud sky-light LUT
+// (cloud_sky_transmittance_lut.comp.slang: rgb premultiplied cloud radiance, a transmittance), a
+// prefiltered reduction of the secondary cloud dome LUT, i.e. of the actual marched cloud field.
+// Both are baked from the camera position per frame. cloudSkyAmbientCloudOcclusionStrength scales
+// the whole cloud contribution: 1 = physical, 0 = clear sky as if there were no clouds.
+//
+// The LUTs and the sampler (linear, clamp) are parameters, so this compiles wherever
+// atmosphere_common.slangh is included. dirYUp must be normalized and Y-up; directions below the
+// horizon return 0.
+vec3 sampleSkyAmbientForVolume(vec3 dirYUp,
+                               AtmosphereArgs args,
+                               Texture2D<float4> skyViewLut,
+                               Texture2D<float4> cloudSkyTransmittanceLut,
+                               SamplerState lutSampler) {
+  if (dirYUp.y < 0.0f) {
+    return vec3(0.0f);
+  }
+
+  // The sky-view LUT's encoding (sky_view_lut.comp.slang, sampleSkyViewLutForRay).
+  float elevation = asin(saturate(dirYUp.y));
+  float azimuth = atan2(dirYUp.z, dirYUp.x);
+  if (azimuth < 0.0f) azimuth += 2.0f * kPi;
+  float elevSign = sign(elevation);
+  float elevV = elevSign * sqrt(abs(elevation) / (kPi * 0.5f)) * 0.5f + 0.5f;
+  vec2 uv = vec2(azimuth / (2.0f * kPi), elevV);
+
+  vec3 skyRadiance = sampleAzimuthWrappedLut(skyViewLut, lutSampler, uv, 0.0f).rgb;
+
+  // The cloud LUT is coarse (a few cells per hemisphere): keep the bilinear tap off its
+  // below-horizon rows, which hold "no cloud", or the cloud term would halve toward the horizon;
+  // sampleCloudDomeLut wraps azimuth across the seam the clamp sampler cannot.
+  uint cloudLutWidth, cloudLutHeight, cloudLutLevels;
+  cloudSkyTransmittanceLut.GetDimensions(0u, cloudLutWidth, cloudLutHeight, cloudLutLevels);
+  const vec2 cloudUv = vec2(uv.x, max(uv.y, 0.5f + 0.5f / float(max(cloudLutHeight, 1u))));
+  const vec4 cloud = sampleCloudDomeLut(cloudSkyTransmittanceLut, lutSampler, cloudUv, 0.0f);
+
+  const float strength = args.cloudSkyAmbientCloudOcclusionStrength;
+  return skyRadiance * lerp(1.0f, cloud.a, strength) + cloud.rgb * strength;
+}
+
+// The clear sky's radiance for a ray that missed the scene, from the full-sphere sky-view LUT
+// (sky_view_lut.comp.slang). Unlike sampleSkyAmbientForVolume it covers the lower hemisphere too
+// and has no clouds. dirYUp must be normalized and Y-up.
+vec3 sampleSkyViewLutForRay(vec3 dirYUp,
+                            Texture2D<float4> skyViewLut,
+                            SamplerState lutSampler) {
+  // The bake's parameterization: azimuth in U, and elevation encoded as sqrt(|el| / (pi / 2)),
+  // which puts most texels near the horizon where the colour changes fastest.
+  float elevation = asin(clamp(dirYUp.y, -1.0f, 1.0f));
+  float azimuth = atan2(dirYUp.z, dirYUp.x);
+  if (azimuth < 0.0f) azimuth += 2.0f * kPi;
+  float elevSign = sign(elevation);
+  float elevV = elevSign * sqrt(abs(elevation) / (kPi * 0.5f)) * 0.5f + 0.5f;
+  vec2 uv = vec2(azimuth / (2.0f * kPi), elevV);
+
+  return sampleAzimuthWrappedLut(skyViewLut, lutSampler, uv, 0.0f).rgb;
+}
+
+// 1. Analytical Ground Reflection (Replaces LUT-based version)
+vec3 computeGroundReflectionAnalytical(float altitude, float sunZenithCosAngle, AtmosphereArgs args) {
+  // Ground parameters
+  const vec3 GROUND_ALBEDO = vec3(args.groundAlbedo);
+  const float PHASE_ISOTROPIC = 1.0f / (4.0f * kPi);
+
+  // A. Sun -> Ground Transmittance
+  // We can reuse the high-quality analytical transmittance function
+  // Ground is at altitude 0
+  vec3 T_sun_to_ground = getTransmittanceToSun(vec3(0.0f), args, false);
+
+  // B. Ground -> Sample Transmittance
+  // Calculate optical depth analytically for the vertical-ish path from ground to sample
+  // OpticalDepth(h1, h2) = H * (exp(-h1/H) - exp(-h2/H))
+  // Here h1 = 0, h2 = altitude
+  
+  float H_R = args.rayleighScaleHeight;
+  float H_M = args.mieScaleHeight;
+  
+  float od_R = H_R * (1.0f - exp(-altitude / H_R));
+  float od_M = H_M * (1.0f - exp(-altitude / H_M));
+  
+  // Approximate ozone absorption (uniform distribution approximation for this short path)
+  float od_O3 = args.ozoneLayerWidth * 0.1f * (altitude / args.atmosphereThickness);
+
+  vec3 extinction = args.rayleighScattering * od_R + 
+                    args.mieScattering * od_M + 
+                    args.ozoneAbsorption * od_O3;
+                    
+  vec3 T_ground_to_sample = exp(-max(extinction, vec3(0.0f)));
+
+  // C. Geometric Factor (Solid Angle of Planet)
+  // How much of the sphere around the sample is covered by the planet?
+  float d = args.planetRadius + altitude;
+  float ratio = args.planetRadius / d;
+  float omega = 2.0f * kPi * (1.0f - sqrt(max(0.0f, 1.0f - ratio * ratio)));
+
+  // Combine: Albedo * Phase * SolidAngle * PathTransmittance
+  float cosTheta = max(sunZenithCosAngle, 0.0f); // Sun must be above horizon for ground bounce
+
+  // A transfer factor without the sun's illuminance; evalAtmosphereRadiance applies it once.
+  return T_sun_to_ground * (GROUND_ALBEDO / kPi) * omega * PHASE_ISOTROPIC * T_ground_to_sample * cosTheta;
+}
+
+// Analytical multiple scattering in the air: a fit, not an integral.
+vec3 computeAirMultiscatteringAnalytical(float altitude, float sunZenithCosAngle, AtmosphereArgs args) {
+  // Mostly Rayleigh: Mie scatters forward and adds little to the diffuse fill.
+  vec3 totalScattering = args.rayleighScattering + args.mieScattering * 0.1f;
+
+  // Strong at the bottom of the atmosphere, weak at the top.
+  float avgScaleHeight = (args.rayleighScaleHeight + args.mieScaleHeight) * 0.5f;
+  float densityFade = exp(-altitude / avgScaleHeight);
+
+  // A sigmoid for how much of the atmosphere is lit at this sun angle.
+  float sunFactor = 1.0f / (1.0f + 5.0f * exp(-17.92f * sunZenithCosAngle));
+
+  // Scaled to the magnitude of a Monte Carlo reference.
+  const float MS_STRENGTH = 0.5f;
+
+  // A transfer factor without the sun's illuminance; evalAtmosphereRadiance applies it once.
+  return totalScattering * densityFade * sunFactor * MS_STRENGTH;
+}
+
+// The analytical multiple scattering fill: ground bounce plus the air term.
+vec3 getAnalyticalMultiscattering(float altitude, float sunZenithCosAngle, AtmosphereArgs args) {
+  vec3 groundReflect = computeGroundReflectionAnalytical(altitude, sunZenithCosAngle, args);
+  vec3 airScatter = computeAirMultiscatteringAnalytical(altitude, sunZenithCosAngle, args);
+  
+  return groundReflect + airScatter;
+}
+
+// Blue-noise jitter from the shared 128 x 128 x 64 BlueNoise array; both components are the same
+// sample.
+float2 fastJitter(uint2 pixelCoord, uint frameIdx) {
+#ifndef ATMOSPHERE_AVAILABLE
+  return float2(0.5f, 0.5f);
+#else
+  uint3 coord = uint3(pixelCoord & 127u, frameIdx & 63u);
+  float sample = BlueNoise.Load(int4(int3(coord), 0)).r;
+  return float2(sample, sample);
+#endif
+}
+
+// Procedural noise, shared by the cloud fields (cloudControlField2D), the cloud noise bakes
+// (worleyNoise3D*, perlinNoise3D*) and the sky shaders (fbmNoise2D). Integer-lattice hashes, which
+// avoid the patterns of sin-based hashes.
+float hash31(vec3 p) {
+  uvec3 q = uvec3(int(p.x * 1597.0f), int(p.y * 2549.0f), int(p.z * 3571.0f));
+  uint n = (q.x ^ q.y ^ q.z) * 2654435761u;
+  n = (n >> 16u) ^ n;
+  return float(n) / 4294967296.0f;
+}
+
+// 2D Worley feature point: a position in [0, 1)^2 inside cell cellId. The hash31 pipeline with a
+// second round for the second component. (The 3D helper below uses a sin-frac hash, which is fine
+// for one-time bakes but shows a slight directional bias when sampled at runtime.)
+vec2 worleyFeaturePoint2D(vec2 cellId, float seed) {
+  uvec3 q = uvec3(int(cellId.x * 1597.0f), int(cellId.y * 2549.0f), int(seed * 3571.0f));
+  uint n  = (q.x ^ q.y ^ q.z) * 2654435761u;
+  uint na = (n >> 16u) ^ n;
+  uint nb = na * 2654435761u + 1013904223u;
+  nb      = (nb >> 16u) ^ nb;
+  return vec2(float(na) / 4294967296.0f,
+              float(nb) / 4294967296.0f);
+}
+
+// 2D Worley F1: distance to the nearest feature point in the 3 x 3 cell neighbourhood, about [0, 1].
+// Different seeds give independent lattices. The extrema sit at jittered positions rather than cell
+// centres, so the field has no regular grid of maxima. Nine hashes.
+float worleyNoise2D(vec2 p, float seed) {
+  // The x100 scale and per-seed origin match smoothNoise2D, so a given noise-scale setting gives a
+  // comparable feature size with either.
+  vec2 sp = p * 100.0f + vec2(seed * 13.7f, seed * 7.3f);
+  vec2 pi = floor(sp);
+  vec2 pf = sp - pi;
+
+  float minDistSq = 4.0f;  // above any squared distance inside the 3 x 3 window
+
+  [unroll] for (int dy = -1; dy <= 1; ++dy) {
+    [unroll] for (int dx = -1; dx <= 1; ++dx) {
+      vec2 offset = vec2(float(dx), float(dy));
+      vec2 fp     = worleyFeaturePoint2D(pi + offset, seed);
+      vec2 d      = (offset + fp) - pf;
+      minDistSq   = min(minDistSq, dot(d, d));
+    }
+  }
+  return saturate(sqrt(minDistSq));
+}
+
+// Control field for the local cloud type and coverage, [0, 1]: high in cluster cores, low in the
+// gaps between clusters. It is 1 - F1 of 2D Worley noise, whose mean over a cell is about 0.5, so the
+// callers' mean + (noise - 0.5) x spread stays centred.
+float cloudControlField2D(vec2 p, float seed) {
+  return saturate(1.0f - worleyNoise2D(p, seed));
+}
+
+// 3D Perlin gradient noise, for the cloud noise bakes only; the per-frame passes sample the baked
+// volumes.
+
+// Perlin's 12 cube-edge gradients, (+-1, +-1, 0) and permutations: equal length and no axis bias.
+vec3 perlinGradient3D(vec3 ip) {
+  uint h = uint(hash31(ip) * 12.0f);
+  if      (h == 0u)  return vec3( 1.0f,  1.0f,  0.0f);
+  else if (h == 1u)  return vec3(-1.0f,  1.0f,  0.0f);
+  else if (h == 2u)  return vec3( 1.0f, -1.0f,  0.0f);
+  else if (h == 3u)  return vec3(-1.0f, -1.0f,  0.0f);
+  else if (h == 4u)  return vec3( 1.0f,  0.0f,  1.0f);
+  else if (h == 5u)  return vec3(-1.0f,  0.0f,  1.0f);
+  else if (h == 6u)  return vec3( 1.0f,  0.0f, -1.0f);
+  else if (h == 7u)  return vec3(-1.0f,  0.0f, -1.0f);
+  else if (h == 8u)  return vec3( 0.0f,  1.0f,  1.0f);
+  else if (h == 9u)  return vec3( 0.0f, -1.0f,  1.0f);
+  else if (h == 10u) return vec3( 0.0f,  1.0f, -1.0f);
+  else               return vec3( 0.0f, -1.0f, -1.0f); // h == 11u
+}
+
+// Periodic 3D Perlin noise: the corner lattice positions are wrapped to `period` before hashing, so
+// p and p + period give the same value and the baked volume tiles without a seam. `period` must be a
+// positive integer vector.
+float perlinNoise3DPeriodic(vec3 p, vec3 period) {
+  vec3 pi = floor(p);
+  vec3 pf = p - pi;
+  vec3 f  = pf * pf * (3.0f - 2.0f * pf);
+
+  // Only the hash input wraps; the offsets stay in the unit cube, so the interpolation is continuous.
+  vec3 c000 = mod(pi + vec3(0, 0, 0), period);
+  vec3 c100 = mod(pi + vec3(1, 0, 0), period);
+  vec3 c010 = mod(pi + vec3(0, 1, 0), period);
+  vec3 c110 = mod(pi + vec3(1, 1, 0), period);
+  vec3 c001 = mod(pi + vec3(0, 0, 1), period);
+  vec3 c101 = mod(pi + vec3(1, 0, 1), period);
+  vec3 c011 = mod(pi + vec3(0, 1, 1), period);
+  vec3 c111 = mod(pi + vec3(1, 1, 1), period);
+
+  float n000 = dot(perlinGradient3D(c000), pf - vec3(0, 0, 0));
+  float n100 = dot(perlinGradient3D(c100), pf - vec3(1, 0, 0));
+  float n010 = dot(perlinGradient3D(c010), pf - vec3(0, 1, 0));
+  float n110 = dot(perlinGradient3D(c110), pf - vec3(1, 1, 0));
+  float n001 = dot(perlinGradient3D(c001), pf - vec3(0, 0, 1));
+  float n101 = dot(perlinGradient3D(c101), pf - vec3(1, 0, 1));
+  float n011 = dot(perlinGradient3D(c011), pf - vec3(0, 1, 1));
+  float n111 = dot(perlinGradient3D(c111), pf - vec3(1, 1, 1));
+
+  float nx00 = mix(n000, n100, f.x);
+  float nx10 = mix(n010, n110, f.x);
+  float nx01 = mix(n001, n101, f.x);
+  float nx11 = mix(n011, n111, f.x);
+
+  float nxy0 = mix(nx00, nx10, f.y);
+  float nxy1 = mix(nx01, nx11, f.y);
+
+  return mix(nxy0, nxy1, f.z);
+}
+
+// Periodic 3D Perlin FBM (lacunarity 2, gain 0.5, at most 6 octaves). The period doubles with the
+// frequency, so every octave tiles at basePeriod, which must be the bake's input range at the first
+// octave.
+float fbmNoise3DPeriodic(vec3 p, int octaves, float seed, vec3 basePeriod) {
+  float value     = 0.0f;
+  float amplitude = 0.5f;
+  vec3  period    = basePeriod;
+
+  for (int i = 0; i < octaves && i < 6; i++) {
+    float seedOffset = seed + float(i) * 17.31f;
+    vec3  octaveOff  = vec3(seedOffset * 1.7f, seedOffset * 2.3f, seedOffset * 3.1f);
+    value     += amplitude * perlinNoise3DPeriodic(p + octaveOff, period);
+    p         *= 2.0f;
+    period    *= 2.0f;
+    amplitude *= 0.5f;
+  }
+  return value;
+}
+
+// =============================================================================
+// Periodic 3D Worley noise, for the bakes: it carves cauliflower cells out of the smooth base shape
+// (Schneider 2015). Bake-time only, so the 27-cell loop costs nothing per frame.
+// =============================================================================
+
+// Feature point in [0, 1)^3 for an integer cell. A sin-frac hash, good enough for a bake.
+vec3 worleyFeaturePoint3D(vec3 cellId, float seed) {
+  vec3 h = vec3(
+    dot(cellId, vec3(127.1f, 311.7f, 74.7f)),
+    dot(cellId, vec3(269.5f, 183.3f, 246.1f)),
+    dot(cellId, vec3(113.5f, 271.9f, 124.6f)));
+  return frac(sin(h + seed) * 43758.5453f);
+}
+
+// Periodic 3D Worley F1, about [0, 1]: 0 at a feature point, ~1 on a cell boundary. `period` must be
+// a positive integer vector, as for perlinNoise3DPeriodic.
+float worleyNoise3DPeriodic(vec3 p, vec3 period, float seed) {
+  vec3 pi = floor(p);
+  vec3 pf = p - pi;
+  float minDistSq = 4.0f;  // above any squared distance inside the 27-cell window
+
+  [unroll] for (int dz = -1; dz <= 1; ++dz) {
+    [unroll] for (int dy = -1; dy <= 1; ++dy) {
+      [unroll] for (int dx = -1; dx <= 1; ++dx) {
+        vec3 offset = vec3(float(dx), float(dy), float(dz));
+        vec3 neighborCell = mod(pi + offset, period);
+        vec3 fp = worleyFeaturePoint3D(neighborCell, seed);
+        vec3 d  = (offset + fp) - pf;
+        float distSq = dot(d, d);
+        minDistSq = min(minDistSq, distSq);
+      }
+    }
+  }
+  return saturate(sqrt(minDistSq));
+}
+
+// Periodic 3D Worley FBM, the octave loop of fbmNoise3DPeriodic. About [0, 1], high on cell
+// boundaries: subtracted from the base shape it erodes the cell edges.
+float worleyFbm3DPeriodic(vec3 p, int octaves, float seed, vec3 basePeriod) {
+  float value     = 0.0f;
+  float amplitude = 0.5f;
+  vec3  period    = basePeriod;
+
+  for (int i = 0; i < octaves && i < 4; i++) {
+    float seedOffset = seed + float(i) * 19.07f;
+    value     += amplitude * worleyNoise3DPeriodic(p, period, seedOffset);
+    p         *= 2.0f;
+    period    *= 2.0f;
+    amplitude *= 0.5f;
+  }
+  return value;
+}
+
+// Stochastic tiling of the cloud noise (hex de-tiling, Heitz and Neyret 2018), world-anchored.
+
+// Hash of a lattice cell. Each coordinate gets its own multiplier, so mirrored cell IDs do not share
+// an offset.
+float cloudLatticeHash(vec2 cell, float seed) {
+  uint n = uint(int(cell.x)) * 0x9e3779b9u
+         + uint(int(cell.y)) * 0x85ebca6bu + uint(seed * 3571.0f) * 0xc2b2ae35u;
+  n ^= n >> 16u;
+  n *= 0x7feb352du;
+  n ^= n >> 15u;
+  n *= 0x846ca68bu;
+  n ^= n >> 16u;
+  return float(n >> 8u) * (1.0f / 16777216.0f);
+}
+
+// 2D gradient noise on the unit lattice, about [-0.9, 0.9] with a standard deviation of ~0.2. The
+// quintic fade makes it twice differentiable, so it has no creases.
+float cloudGradientNoise2D(vec2 p, float seed) {
+  const vec2 cell = floor(p);
+  const vec2 f = p - cell;
+  const vec2 u = f * f * f * (f * (f * 6.0f - 15.0f) + 10.0f);
+  float corners[4];
+  [unroll] for (int i = 0; i < 4; ++i) {
+    const vec2 o = vec2(float(i & 1), float(i >> 1));
+    const float angle = cloudLatticeHash(cell + o, seed) * (2.0f * kPi);
+    corners[i] = dot(vec2(cos(angle), sin(angle)), f - o);
+  }
+  return lerp(lerp(corners[0], corners[1], u.x), lerp(corners[2], corners[3], u.x), u.y);
+}
+
+// Smooth control field, [0, 1], for the cloud type. cloudControlField2D is 1 - F1 of Worley noise,
+// which creases along every Voronoi edge, and those creases show as straight lines kilometres long
+// where the type changes the clouds. This field is two octaves of gradient noise, the second
+// rotated, scaled to the Worley field's mean (0.57) and spread (0.19 standard deviation) so a
+// layer's mean type and its variation stay the same. Same feature size: `p` is in the same units as
+// cloudControlField2D's.
+float cloudControlFieldSmooth2D(vec2 p, float seed) {
+  const vec2 q = p * 100.0f;
+  const vec2 r = vec2(0.8f * q.x - 0.6f * q.y, 0.6f * q.x + 0.8f * q.y);
+  const float g = cloudGradientNoise2D(q, seed) + 0.5f * cloudGradientNoise2D(r * 2.0f + vec2(17.3f, 5.9f), seed + 1.7f);
+  return saturate(0.57f + g * 0.79f);
+}
+
+vec2 cloudTileUv(vec2 tileUv, vec2 vertex) {
+  uint orientation = uint(cloudLatticeHash(vertex, 37.1f) * 8.0f);
+  // Square symmetries preserve distances and periodic wrap continuity.
+  if ((orientation & 1u) != 0u) {
+    tileUv = tileUv.yx;
+  }
+  if ((orientation & 2u) != 0u) {
+    tileUv.x = -tileUv.x;
+  }
+  if ((orientation & 4u) != 0u) {
+    tileUv.y = -tileUv.y;
+  }
+  return frac(tileUv + vec2(cloudLatticeHash(vertex, 7.31f), cloudLatticeHash(vertex, 19.77f)));
+}
+
+struct CloudHexTile {
+  float w1, w2, w3;
+  vec2 uv1, uv2, uv3;
+  float boundaryKm;
+};
+
+CloudHexTile computeCloudHexTile(vec2 hzKm, AtmosphereArgs args) {
+  // Randomize before a full source tile repeats within a dominant patch.
+  const float kHexLatticeTiles = 0.8f;
+  float latticeKm = max(args.cloudNoiseTileKm * kHexLatticeTiles, 1e-3f);
+  vec2 uv = hzKm / latticeKm;
+
+  // Skew the plane so integer cells form an equilateral-triangle lattice
+  // (Heitz 2018's gridToSkewedGrid, written out without a matrix).
+  vec2 skewed = vec2(uv.x - 0.57735027f * uv.y, uv.y * 1.15470054f);
+  vec2 baseId = floor(skewed);
+  vec2 fr = fract(skewed);
+
+  vec3 w;
+  vec2 v1, v2, v3;
+  float lower = 1.0f - fr.x - fr.y;
+  if (lower > 0.0f) {
+    w  = vec3(lower, fr.y, fr.x);
+    v1 = baseId;
+    v2 = baseId + vec2(0.0f, 1.0f);
+    v3 = baseId + vec2(1.0f, 0.0f);
+  } else {
+    w  = vec3(-lower, 1.0f - fr.y, 1.0f - fr.x);
+    v1 = baseId + vec2(1.0f, 1.0f);
+    v2 = baseId + vec2(1.0f, 0.0f);
+    v3 = baseId + vec2(0.0f, 1.0f);
+  }
+
+  float boundaryKm = min(w.x, min(w.y, w.z)) * latticeKm * 0.8660254f;
+
+  // Narrow blends preserve individual silhouettes without a discontinuous tap cutoff.
+  w = w * w;
+  w = w * w;
+  w /= (w.x + w.y + w.z);
+
+  // Put the dominant vertex in slot 1 (the fast path's single tap); the order of the other two does
+  // not matter.
+  if (w.y > w.x) { float t = w.x; w.x = w.y; w.y = t; vec2 tv = v1; v1 = v2; v2 = tv; }
+  if (w.z > w.x) { float t = w.x; w.x = w.z; w.z = t; vec2 tv = v1; v1 = v3; v3 = tv; }
+
+  CloudHexTile hex;
+  hex.w1 = w.x; hex.w2 = w.y; hex.w3 = w.z;
+  vec2 tileUv = frac(hzKm / max(args.cloudNoiseTileKm, 1e-3f));
+  hex.uv1 = cloudTileUv(tileUv, v1);
+  hex.uv2 = cloudTileUv(tileUv, v2);
+  hex.uv3 = cloudTileUv(tileUv, v3);
+  // A new tap may enter across a triangle edge; its distance is not sampled yet.
+  hex.boundaryKm = max(boundaryKm, 0.0f);
+  return hex;
+}
+
+// ===========================================================================
+// Per-column cloud model
+//
+// Each cloud gets its own vertical extent instead of every cloud sharing the slab's base and top:
+//   * The 2D placement map (cloud_placement_map_baker.comp.slang) holds a cluster field F (where
+//     clouds are), a top-height jitter J and a base lift B, tiled at cloudNoiseTileKm. Only the NVDF
+//     occupancy bake reads it.
+//   * Per column, presence is a coverage remap of F (0 = no cloud, 1 = solid core), and the local
+//     base and top follow from B, presence and J. Edges feather out because their tops sink to
+//     their bases.
+//   * Height profiles and lighting proxies key on the height within the column ([base, top] ->
+//     [0, 1]), so each cloud has a complete base-to-dome shape at its own altitude. The 3D noise adds
+//     texture and erosion but does not decide placement, so columns stay vertically coherent.
+// ===========================================================================
+
+// A column's cloud: presence replaces the weather coverage in the noise threshold, so each cloud
+// carves its own feather band. baseFrac and topFrac are fractions of the slab.
+struct CloudColumn {
+  float presence;  // [0,1]: 0 no cloud in this column, 1 solid core
+  float baseFrac;  // column cloud-base as a slab height fraction
+  float topFrac;   // column cloud-top as a slab height fraction
+};
+
+CloudColumn computeCloudColumn(vec4 placement, float coverageLocal,
+                               AtmosphereArgs args) {
+  CloudColumn col;
+  // Coverage remap (Schneider): F crosses the 1 - coverage waterline and feathers to full presence
+  // over the band. At coverage 1 almost every column has cloud; at 0.3 only cluster cores do.
+  float band = max(args.cloudColumnFeather, 0.02f);
+  col.presence = saturate((placement.r - (1.0f - coverageLocal)) / band);
+
+  col.baseFrac = saturate(placement.b * args.cloudColumnBaseVariation);
+
+  // The top grows with presence, shaped by the top exponent and jittered per cluster so clouds of
+  // equal presence still differ in height.
+  float topJitter = mix(1.0f - saturate(args.cloudColumnTopVariation), 1.0f,
+                        saturate(placement.g));
+  col.topFrac = col.baseFrac
+              + (1.0f - col.baseFrac)
+              * pow(col.presence, max(args.cloudColumnTopShape, 0.05f))
+              * topJitter;
+  return col;
+}
+
+// ===========================================================================
+// Closed decks. Past ~70 % coverage the column model saturates: every column has full presence and
+// the body becomes one flat grey slab. Real stratocumulus and storm decks keep their structure when
+// closed: dark thick cells, thin bright seams between them, the odd gap, and an underside that hangs
+// down in rolls (stratocumulus) or lumps and pouches (cumulonimbus).
+//
+// As the deck closes the bake hands over to a deck model in which coverage decides how thick the
+// cloud is rather than where it is:
+//   * cells: two octaves of a periodic 2D Worley edge measure (F2 - F1: 0 on a cell boundary, high at
+//     its centre), modulated by the placement map's cluster field so whole regions run thicker or
+//     thinner. A column's thinness is 1 at a seam and low in a cell core.
+//   * the base lifts and the top sinks with thinness, so a seam is a thin sheet a few hundred metres
+//     deep between thick cells; where a seam crosses a thin region below ~98 % coverage it opens into
+//     a gap.
+//   * the underside hangs in rounded lobes (cloudDeckLobes, three octaves) up to reliefKm deep:
+//     ~120 m rolls for stratiform types, ~700 m pouches for cumulonimbus (type 1).
+//   * the top keeps the cumulus billow displacement.
+// Every profile is smooth (smoothstep ramps, summed bumps), never a linear ramp of a distance or a
+// nearest-point Worley: those leave V creases, which at grazing angles read as rows of teeth.
+// The bake reads the type from AtmosphereArgs.cloudTypeMean, which the host sets to a quantized
+// value for the bake (cloudNvdfDeckType, renderer.cpp) and keys the re-bake on.
+// The deck amount is a smoothstep of the bake's nominal coverage, 0 below kCloudDeckCoverageStart,
+// so the default (and every coverage up to that) bakes exactly the column model. Bake-time only:
+// the march, shadow map and optical-depth volumes read the same SDF.
+// ===========================================================================
+static const float kCloudDeckCoverageStart = 0.7f;
+static const float kCloudDeckCoverageFull  = 0.9f;
+
+float cloudDeckAmount(float coverage) {
+  return smoothstep(kCloudDeckCoverageStart, kCloudDeckCoverageFull, coverage);
+}
+
+// Light under a closed deck, for the march's light from below (evalNubisCubedSampleCore): x = the
+// share of the sky light the ground and the haze under the deck still get, y = the sun's diffuse
+// share through the deck, added to the clear-sky share evalCloudGroundShadow already gives. The deck
+// passes T = 1 / (1 + 0.75 (1 - g) tau) of the light (two-stream diffusion, as the march's own sky
+// terms) over its column optical depth tau (density x depth x ~0.6 for the water profile and the
+// cells). (1, 0) below kCloudDeckCoverageStart, so broken cloud is unaffected.
+vec2 cloudDeckLightKeep(AtmosphereArgs args) {
+  const float coverage = args.cloudEnabled > 0.5f ? saturate(args.cloudCoverageMean) : 0.0f;
+  const float closed = cloudDeckAmount(coverage) * coverage;
+  const float tau = args.cloudDensity * args.cloudThickness * 0.6f;
+  const float t = 1.0f / (1.0f + 0.75f * (1.0f - saturate(args.cloudPhaseG1)) * tau);
+  return vec2(1.0f - closed * (1.0f - t), closed * t);
+}
+
+// cloudDeckLightKeep's sky share for the air at altitude `altKm` (above the planet): all of it under
+// the deck, rising through the deck to none lost above it. For the multiply scattered light of the
+// haze and the fog (aerial_perspective.slangh, cloudAirLightKeep).
+float cloudDeckSkyKeepAt(float altKm, AtmosphereArgs args) {
+  const float keep = cloudDeckLightKeep(args).x;
+  return lerp(keep, 1.0f, saturate((altKm - args.cloudAltitude) / max(args.cloudThickness, 1e-3f)));
+}
+
+// Periodic 2D Worley at lattice point p (cells per period `period`): (F1, F2), the distances to the
+// nearest and second-nearest feature points, in cells.
+vec2 cloudDeckWorley2D(vec2 p, float period, float seed) {
+  const vec2 cell = floor(p);
+  const vec2 f = p - cell;
+  float f1 = 8.0f;
+  float f2 = 8.0f;
+  [unroll] for (int y = -1; y <= 1; ++y) {
+    [unroll] for (int x = -1; x <= 1; ++x) {
+      const vec2 n = vec2(float(x), float(y));
+      vec2 w = cell + n;
+      w -= period * floor(w / period);
+      const vec2 fp = vec2(cloudLatticeHash(w, seed), cloudLatticeHash(w, seed + 31.7f));
+      const vec2 d = n + fp - f;
+      const float dd = dot(d, d);
+      if (dd < f1) { f2 = f1; f1 = dd; } else if (dd < f2) { f2 = dd; }
+    }
+  }
+  return vec2(sqrt(f1), sqrt(f2));
+}
+
+// Edge measure F2 - F1, ~[0, 0.8]: 0 on a cell boundary, largest at the cell's feature point.
+float cloudDeckCellEdge(vec2 p, float period, float seed) {
+  const vec2 f = cloudDeckWorley2D(p, period, seed);
+  return f.y - f.x;
+}
+
+// One octave of hanging lobes, [0, 1): a rounded bump (1 - (d / r)^2)^2, r = 0.8 cells, under every
+// jittered feature point, summed over the neighbours (the nearest alone, as in Worley F1, creases on
+// every cell boundary) and softly saturated. The underside stays smooth even at grazing angles.
+float cloudDeckLobes(vec2 p, float period, float seed) {
+  const vec2 cell = floor(p);
+  const vec2 f = p - cell;
+  float sum = 0.0f;
+  [unroll] for (int y = -1; y <= 1; ++y) {
+    [unroll] for (int x = -1; x <= 1; ++x) {
+      const vec2 n = vec2(float(x), float(y));
+      vec2 w = cell + n;
+      w -= period * floor(w / period);
+      const vec2 fp = vec2(cloudLatticeHash(w, seed), cloudLatticeHash(w, seed + 31.7f));
+      const vec2 d = (n + fp - f) / 0.8f;
+      const float b = saturate(1.0f - dot(d, d));
+      sum += b * b;
+    }
+  }
+  return 1.0f - exp(-2.0f * sum);
+}
+
+// The deck's body field (km, positive inside). `topDisplacementKm` is the cumulus billow
+// displacement at this point, kept on the deck top.
+float cloudDeckBodyFieldKm(vec2 tileUV, float hf, vec4 placement, float coverage,
+                           AtmosphereArgs args, float topDisplacementKm) {
+  const float tileKm = max(args.cloudNoiseTileKm, 1e-3f);
+  const float slabKm = max(args.cloudThickness, 1e-3f);
+  const float type = saturate(args.cloudTypeMean);
+  const float zKm = hf * slabKm;
+
+  // Cells: ~1.6 km stratocumulus cells, growing to ~3 km storm cells, plus an octave at half size.
+  const float cellKm = lerp(1.6f, 3.0f, type);
+  const float cyclesA = max(1.0f, round(tileKm / cellKm));
+  const float cyclesB = cyclesA * 2.0f;
+  // smoothstep, not a linear ramp: the edge measure is a V across each cell boundary, and a linear
+  // ramp keeps that V as a crease in the base and the top, which reads as rows of teeth at grazing
+  // angles.
+  const float edgeA = smoothstep(0.0f, 0.4f, cloudDeckCellEdge(tileUV * cyclesA, cyclesA, 211.3f));
+  const float edgeB = smoothstep(0.0f, 0.4f, cloudDeckCellEdge(tileUV * cyclesB, cyclesB, 247.9f));
+  const float core = edgeA * 0.7f + edgeB * 0.3f;
+  // Regions: the cluster field thickens and thins whole groups of cells.
+  const float region = saturate(placement.r * 1.4f - 0.2f);
+  const float thin = 1.0f - core * lerp(0.7f, 1.0f, region);  // never clipped: no crease
+
+  // Seams: a sheet seamKm deep (a few hundred metres), its base lifted seamLiftKm; gaps open below
+  // ~98 % coverage where a seam meets a thin region, up to half the slab (at most 750 m) deep at
+  // 92 %, so a storm deck stays closed. Base and top follow a smoothstep of the thinness, so they
+  // meet the seams in rounded troughs.
+  const float seamKm = min(0.2f * slabKm, lerp(0.25f, 0.6f, type));
+  const float seamLiftKm = min(0.3f * slabKm, 0.35f);
+  const float lift = thin * thin * (3.0f - 2.0f * thin);
+  const float gapKm = min(0.5f * slabKm, 0.75f) * saturate((0.98f - coverage) / 0.1f)
+                    * saturate(1.3f - region * 1.6f);
+  // The seams' troughs reach at most kCloudDeckSeamDropKm down from the top. A stratocumulus deck
+  // (~1.5 km) is cut down to its thin seams; a 6 km storm deck stays one thick deck with a rolling
+  // top instead of separate cells with chasms between them that the sky would light from the side.
+  const float kCloudDeckSeamDropKm = 1.2f;
+  const float dropKm = min(max(slabKm - seamLiftKm - seamKm, 0.0f), kCloudDeckSeamDropKm) + gapKm;
+
+  // Underside lobes: a height field of rounded lobes (cloudDeckLobes) hanging down to the slab base
+  // from a base raised by the relief, three octaves summed so big pouches carry smaller ones. Lobe
+  // size follows the type: ~0.6 km rolls for stratocumulus, ~1.1 km pouches for storms. A height
+  // field in 2D, not a 3D noise, so the underside cannot form downward spikes.
+  const float reliefKm = min(0.25f * slabKm, lerp(0.12f, 0.7f, type * type));
+  const float lumpKm = lerp(0.6f, 1.1f, type);
+  float lumps = 0.0f;
+  float amplitude = 1.0f;
+  float norm = 0.0f;
+  float cycles = max(1.0f, round(tileKm / lumpKm));
+  [unroll]
+  for (int i = 0; i < 3; ++i) {
+    lumps += amplitude * cloudDeckLobes(tileUV * cycles, cycles, 311.7f + 23.1f * float(i));
+    norm += amplitude;
+    amplitude *= 0.45f;
+    cycles *= 2.0f;
+  }
+  lumps /= norm;
+  // Lobes hang from the cell cores; seams stay smooth sheets.
+  const float hangKm = reliefKm * lumps * (1.0f - 0.6f * thin);
+
+  const float baseKm = zKm - (seamLiftKm * lift + reliefKm - hangKm);
+  // The base is a height field: its vertical distance overstates the true distance where it slopes
+  // (the lobe sides); 0.6 keeps the empty-space step conservative.
+  const float topKm = (slabKm - dropKm * lift) - zKm + topDisplacementKm;
+  return min(baseKm * 0.6f, topKm);
+}
+
+// Cumulus body field for the NVDF occupancy bake. Signed, in km, positive inside.
+// The column model alone extrudes the placement map's 2D silhouette into towers with smooth walls.
+// Here the sides and top are displaced by four octaves of inverted Worley noise (rounded lumps from
+// cloudBodyBillowSizeKm down to 1/8 of it), growing with height, while the base is a flat cut:
+// cauliflower towers on flat bases, the structure a cumulus has from ~150 m up.
+//   tileUV, hf - the bake's periodic tile coordinate and slab height fraction.
+float cloudCumulusBodyFieldKm(vec2 tileUV, float hf, vec4 placement, float coverage,
+                              AtmosphereArgs args) {
+  CloudColumn col = computeCloudColumn(placement, coverage, args);
+  const float tileKm  = max(args.cloudNoiseTileKm, 1e-3f);
+  const float slabKm  = max(args.cloudThickness, 1e-3f);
+
+  // Horizontal: distance past the cluster waterline. The cluster field rises 0 -> 1 over about
+  // half a cell, so one unit of it spans ~0.5 * cloudCellSizeKm.
+  const float sideKm = (placement.r - (1.0f - coverage)) * 0.5f * max(args.cloudCellSizeKm, 0.1f);
+  // Vertical: flat base, domed top (the column model lowers the top toward the cluster edge).
+  const float baseKm = (hf - col.baseFrac) * slabKm;
+  const float topKm  = (col.topFrac - hf) * slabKm;
+
+  const float t = saturate((hf - col.baseFrac) / max(col.topFrac - col.baseFrac, 1e-3f));
+  const float sizeKm = max(args.cloudBodyBillowSizeKm, 0.05f);
+  float cycles = max(1.0f, round(tileKm / sizeKm));
+  vec3 p = vec3(tileUV.x, hf * slabKm / tileKm, tileUV.y);
+  float billow = 0.0f;
+  float amplitude = 1.0f;
+  float norm = 0.0f;
+  [unroll]
+  for (int i = 0; i < 4; ++i) {
+    // 0.5 - F1: positive in a rounded lump around each feature point, negative in the creases.
+    billow += amplitude * (0.5f - worleyNoise3DPeriodic(p * cycles, vec3(cycles), 41.3f + 17.9f * float(i)));
+    norm += amplitude;
+    amplitude *= args.cloudBodyBillowGain;
+    cycles *= 2.0f;
+  }
+  billow /= norm;
+  // Storm types keep their lumps down to the base and on it; with the fair-weather quarter-strength
+  // sides and flat cut, a storm's merged clusters would be slabs with sheer smooth walls. Types below
+  // 0.85 are not affected.
+  const float rough = smoothstep(0.85f, 1.0f, saturate(args.cloudTypeMean));
+  const float growth = lerp(lerp(0.25f, 0.7f, rough), 1.0f, smoothstep(0.0f, 0.4f, t));
+  const float displacementKm = args.cloudBodyBillowStrength * sizeKm * billow * growth;
+  const float baseLumpKm = 0.35f * rough * args.cloudBodyBillowStrength * sizeKm * billow;
+
+  const float cumulusKm = min(baseKm + baseLumpKm, min(sideKm, topKm) + displacementKm);
+  const float deck = cloudDeckAmount(coverage);
+  if (deck <= 0.0f) {
+    return cumulusKm;
+  }
+  return lerp(cumulusKm, cloudDeckBodyFieldKm(tileUV, hf, placement, coverage, args, displacementKm), deck);
+}
+
+// Horizontal resolution of the cloud voxel grids. The CPU twin, Renderer::Impl::kCloudVoxelGridX / Z
+// (src/renderer_impl.h), keys the grid cache; the two must match.
+static const float kCloudVoxelGridResolutionXZ = 256.0f;
+
+// ===========================================================================
+// Cloud shadows on surfaces. Both functions return the sun's transmittance through the clouds
+// (1 = unoccluded, 0 = fully shadowed).
+// ===========================================================================
+
+#include "numos/lib/cloud_shadow_map.slangh"
+
+// Cloud transmittance toward the sun at a surface point, from the cloud sun-space shadow map
+// (lib/cloud_shadow_map.slangh): the same optical depth the clouds' own sun light sees, so a cloud
+// and its shadow agree and the shadow does not repeat with the noise tile. `worldPos` is a render-
+// space position in engine units; numosWorldToCloudKm carries it into the cloud frame (the axes
+// come from args, which also hold the engine's up axis; `isZUp` is kept for host compatibility and
+// must equal args.isZUp). cloudShadowStrength fades it toward 1; nothing else scales it. 1 with
+// clouds off or the map not baked.
+float sampleCloudGroundShadowFromMap(vec3 worldPos, vec3 sunDir, AtmosphereArgs args, bool isZUp,
+                                     Texture3D<float2> shadowMap, SamplerState linearSampler) {
+  if (args.cloudEnabled < 0.5f || args.cloudCoverageMean < 0.01f || args.cloudShadowLive == 0u) {
+    return 1.0f;
+  }
+  const vec3 worldPosKm = numosWorldToCloudKm(worldPos, args);
+  const float opticalDepth = cloudShadowMapSunOpticalDepth(shadowMap, linearSampler, worldPosKm,
+                                                           getCloudPlanetCenterWorldKm(args), args);
+  const float transmittance = exp(-opticalDepth * args.cloudDensity);
+  return mix(1.0f, transmittance, args.cloudShadowStrength);
+}
+
+// sampleCloudGroundShadowFromMap on the AtmosphereCloudShadowMap global through
+// AtmosphereCloudNoise3DSampler, which passes that define ATMOSPHERE_AVAILABLE bind.
+float sampleCloudGroundShadow_OptionB(vec3 worldPos, vec3 sunDir, AtmosphereArgs args, bool isZUp) {
+#ifndef ATMOSPHERE_AVAILABLE
+  return 1.0f;
+#else
+  return sampleCloudGroundShadowFromMap(worldPos, sunDir, args, isZUp, AtmosphereCloudShadowMap,
+                                        AtmosphereCloudNoise3DSampler);
+#endif
+}
+
+// The aerial perspective lives in aerial_perspective.slangh (docs/aerial-perspective-v2.md).

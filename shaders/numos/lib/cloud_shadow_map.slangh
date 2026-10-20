@@ -1,0 +1,227 @@
+// Copyright 2026 Kim2091 (Sparkles)
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+// Cloud sun-space shadow map: the cloud optical depth toward the sun, baked once for a sun
+// direction and read with one texture tap wherever the clouds need it.
+//
+// Layout. An orthographic map perpendicular to the sun. Each texel is one straight sun ray; along
+// it the texture's third axis holds the cumulative optical depth (km x body density) from where the
+// ray leaves the cloud shell toward the sun, at kCloudShadowMapSlices evenly spaced depths through
+// the shell. The optical depth from any point to the sun is one trilinear tap at that point's depth
+// along its own ray, and the optical depth away from the sun is the ray's total minus that.
+// Channels: x = the body density the light marches use, y = the widened "soft" body the higher
+// sun octaves are shadowed on (cloudSoftBodyDensity).
+//
+// kCloudShadowMapCascades nested windows, each kCloudShadowMapSize^2 texels, stored in
+// kCloudShadowMapSlots slots stacked along the texture's depth axis (kCloudShadowMapSlices layers
+// each; reads clamp inside a slot). The spare slot is where a cascade is re-baked, a few rows per
+// frame, while lookups keep reading its old slot; each cascade therefore has its own baked
+// direction and window (AtmosphereArgs.cloudShadow*), and they can differ slightly.
+//
+// The horizon map is the same thing for the horizontal direction toward the sun's azimuth (one
+// channel, body density): the cloud the sunward and anti-sunward horizon light crosses. Its U axis
+// and U windows are the sun map's; its V axis is straight up.
+//
+// Frame. The map lives in the cloud frame (world position minus the wind offset), in which the
+// body field does not move: wind needs no re-bake, and texels stay on the same cloud between
+// bakes. Plane axes: S toward the sun, U horizontal and perpendicular to S, V = U x S (up-ish).
+// Ray depth is measured from each point's own geometry (shell exits along +S and -S), so a
+// lookup needs no per-texel depth range.
+
+static const uint kCloudShadowMapSize = 256u;
+static const uint kCloudShadowMapSlices = 32u;
+static const uint kCloudShadowMapCascades = 4u;
+static const uint kCloudShadowMapSlots = kCloudShadowMapCascades + 1u;
+// The shrinks the vertical optical-depth volume is baked at, one per channel (cloud_vertical_od.comp).
+// They span the dominant hex tile's blend-zone shrink (up to 1 km); a tile shrunk further fades out
+// by twice the last level.
+static const vec4 kCloudVerticalShrinkLevelsKm = vec4(0.0f, 0.25f, 0.5f, 1.0f);
+
+struct CloudShadowBasis {
+  vec3 S;  // toward the sun
+  vec3 U;  // horizontal, perpendicular to S
+  vec3 V;  // U x S
+};
+
+CloudShadowBasis cloudShadowBasis(vec3 sunDirYUp) {
+  CloudShadowBasis b;
+  b.S = normalize(sunDirYUp);
+  const float horizontalLength = length(b.S.xz);
+  const vec2 azimuth = horizontalLength > 1e-4f ? b.S.xz / horizontalLength : vec2(1.0f, 0.0f);
+  b.U = vec3(-azimuth.y, 0.0f, azimuth.x);
+  b.V = cross(b.U, b.S);
+  return b;
+}
+
+// Roots of |Q + t S - C| = r for a point at distance rho from the sphere centre whose direction
+// makes cosine mu with the outward radial: t^2 + 2 b t + c = 0 with b = rho mu and
+// c = (rho - r)(rho + r). Written in the cancellation-free form, since b^2 alone is ~4e7 km^2 for
+// a planet-sized sphere. Returns false if the line misses the sphere.
+bool cloudShadowSphereRoots(float rho, float mu, float r, out float t0, out float t1) {
+  const float b = rho * mu;
+  const float c = (rho - r) * (rho + r);
+  const float disc = b * b - c;
+  t0 = 0.0f;
+  t1 = 0.0f;
+  if (disc < 0.0f) {
+    return false;
+  }
+  const float q = -(b + (b >= 0.0f ? 1.0f : -1.0f) * sqrt(disc));
+  const float ta = q;
+  const float tb = abs(q) > 1e-12f ? c / q : 0.0f;
+  t0 = min(ta, tb);
+  t1 = max(ta, tb);
+  return true;
+}
+
+// Depth fraction of a point along its own sun ray through the shell: 0 where the ray leaves the
+// shell toward the sun, 1 where it leaves on the far side. `dSunKm` / `dAntiKm` are the shell exit
+// distances along +S / -S (cloudShellExitKm).
+float cloudShadowDepthFraction(float dSunKm, float dAntiKm) {
+  return saturate(dSunKm / max(dSunKm + dAntiKm, 1e-4f));
+}
+
+// Texture coordinate of a tap. `uv` in [0,1]^2 inside the window, `w` the depth fraction.
+vec3 cloudShadowMapCoord(vec2 uv, float w, uint slot) {
+  const float halfTexel = 0.5f / float(kCloudShadowMapSize);
+  uv = clamp(uv, vec2(halfTexel), vec2(1.0f - halfTexel));
+  const float layer = float(slot * kCloudShadowMapSlices) + saturate(w) * float(kCloudShadowMapSlices - 1u)
+                    + 0.5f;
+  return vec3(uv, layer / float(kCloudShadowMapSlices * kCloudShadowMapSlots));
+}
+
+// Map `map` (0 = sun, 1 = horizon), cascade `k`: the direction it was baked for and its slot.
+vec3 cloudShadowCascadeDir(AtmosphereArgs args, uint map, uint k) {
+  return vec3(args.cloudShadowDirX[map][k], args.cloudShadowDirY[map][k], args.cloudShadowDirZ[map][k]);
+}
+
+uint cloudShadowCascadeSlot(AtmosphereArgs args, uint map, uint k) {
+  return (args.cloudShadowSlots >> (16u * map + 4u * k)) & 7u;
+}
+
+// Window coordinates of a point in up to two cascades of a map, with blend weights: the finest
+// cascade containing the point, blended into the next one over the outer 10% of its window.
+// Outside every window both weights are 0 (no cloud).
+struct CloudShadowLookup {
+  vec2  uv0, uv1;
+  uint  slot0, slot1;
+  float weight0, weight1;
+};
+
+CloudShadowLookup cloudShadowLookup(vec3 posWorldKm, uint map, AtmosphereArgs args) {
+  const vec3 cloudPos = posWorldKm - vec3(args.cloudWindOffset.x, 0.0f, args.cloudWindOffset.y);
+  CloudShadowLookup l;
+  l.uv0 = vec2(0.5f); l.uv1 = vec2(0.5f);
+  l.slot0 = 0u; l.slot1 = 0u;
+  l.weight0 = 0.0f; l.weight1 = 0.0f;
+  float remaining = 1.0f;
+  [unroll]
+  for (uint k = 0u; k < kCloudShadowMapCascades; ++k) {
+    if (remaining > 0.0f) {
+      const CloudShadowBasis basis = cloudShadowBasis(cloudShadowCascadeDir(args, map, k));
+      const vec2 d = vec2((dot(cloudPos, basis.U) - args.cloudShadowCenterU[map][k]) / args.cloudShadowHalfU[map][k],
+                          (dot(cloudPos, basis.V) - args.cloudShadowCenterV[map][k]) / args.cloudShadowHalfV[map][k]);
+      const float edge = max(abs(d.x), abs(d.y));
+      if (edge < 1.0f) {
+        const float weight = remaining * (k + 1u < kCloudShadowMapCascades
+                                            ? saturate((1.0f - edge) * 10.0f) : 1.0f);
+        if (l.weight0 == 0.0f) {
+          l.uv0 = d * 0.5f + 0.5f; l.slot0 = cloudShadowCascadeSlot(args, map, k); l.weight0 = weight;
+        } else {
+          l.uv1 = d * 0.5f + 0.5f; l.slot1 = cloudShadowCascadeSlot(args, map, k); l.weight1 = weight;
+        }
+        remaining -= weight;
+      }
+    }
+  }
+  return l;
+}
+
+// Cumulative optical depth at depth fraction `w` for a prepared lookup.
+vec2 cloudShadowMapRead(Texture3D<float2> map, SamplerState linearSampler, CloudShadowLookup l,
+                        float w) {
+  vec2 result = vec2(0.0f);
+  if (l.weight0 > 0.0f) {
+    result += l.weight0 * map.SampleLevel(linearSampler, cloudShadowMapCoord(l.uv0, w, l.slot0), 0);
+  }
+  if (l.weight1 > 0.0f) {
+    result += l.weight1 * map.SampleLevel(linearSampler, cloudShadowMapCoord(l.uv1, w, l.slot1), 0);
+  }
+  return result;
+}
+
+float cloudHorizonMapRead(Texture3D<float> map, SamplerState linearSampler, CloudShadowLookup l,
+                          float w) {
+  float result = 0.0f;
+  if (l.weight0 > 0.0f) {
+    result += l.weight0 * map.SampleLevel(linearSampler, cloudShadowMapCoord(l.uv0, w, l.slot0), 0);
+  }
+  if (l.weight1 > 0.0f) {
+    result += l.weight1 * map.SampleLevel(linearSampler, cloudShadowMapCoord(l.uv1, w, l.slot1), 0);
+  }
+  return result;
+}
+
+// Beer form (cloud_shadow_map.comp's Beer output): optical depth at depth fraction `w` of one texel,
+// the ray's total spread evenly between its front and back depths.
+vec2 cloudBeerTexelOpticalDepth(vec4 texel, float w) {
+  return texel.zw * saturate((w - texel.x) / max(texel.y - texel.x, 1e-4f));
+}
+
+// One slot, bilinear over the four nearest texels, each evaluated at `w` before blending: a filtered
+// front depth would put the front of a silhouette texel halfway to its empty neighbour's.
+vec2 cloudBeerMapSlotRead(Texture3D<float4> map, vec2 uv, uint slot, float w) {
+  const vec2 p = uv * float(kCloudShadowMapSize) - 0.5f;
+  const vec2 f = frac(p);
+  const int2 i0 = int2(floor(p));
+  const int last = int(kCloudShadowMapSize) - 1;
+  const int2 a = clamp(i0, int2(0), int2(last));
+  const int2 b = clamp(i0 + 1, int2(0), int2(last));
+  const vec2 v00 = cloudBeerTexelOpticalDepth(map.Load(int4(a.x, a.y, int(slot), 0)), w);
+  const vec2 v10 = cloudBeerTexelOpticalDepth(map.Load(int4(b.x, a.y, int(slot), 0)), w);
+  const vec2 v01 = cloudBeerTexelOpticalDepth(map.Load(int4(a.x, b.y, int(slot), 0)), w);
+  const vec2 v11 = cloudBeerTexelOpticalDepth(map.Load(int4(b.x, b.y, int(slot), 0)), w);
+  return lerp(lerp(v00, v10, f.x), lerp(v01, v11, f.x), f.y);
+}
+
+vec2 cloudBeerMapRead(Texture3D<float4> map, CloudShadowLookup l, float w) {
+  vec2 result = vec2(0.0f);
+  if (l.weight0 > 0.0f) {
+    result += l.weight0 * cloudBeerMapSlotRead(map, l.uv0, l.slot0, w);
+  }
+  if (l.weight1 > 0.0f) {
+    result += l.weight1 * cloudBeerMapSlotRead(map, l.uv1, l.slot1, w);
+  }
+  return result;
+}
+
+// Optical depth (km x density; x = body, y = soft body) from `posWorldKm` toward the sun, at depth
+// fraction `w` of its sun ray (w = 1: the whole ray, for a point below the shell).
+vec2 sampleCloudShadowMap(Texture3D<float2> map, SamplerState linearSampler, vec3 posWorldKm,
+                          float w, AtmosphereArgs args) {
+  return cloudShadowMapRead(map, linearSampler, cloudShadowLookup(posWorldKm, 0u, args), w);
+}
+
+// Cloud optical depth (km x body density) toward the sun from any point (world Y-up km): the whole
+// sun ray below the shell, the part still ahead inside it, none above it.
+float cloudShadowMapSunOpticalDepth(Texture3D<float2> map, SamplerState linearSampler, vec3 posKm,
+                                    vec3 planetCenterWorldKm, AtmosphereArgs args) {
+  const float baseRadiusKm = args.planetRadius + args.cloudAltitude;
+  const float topRadiusKm = baseRadiusKm + args.cloudThickness;
+  const vec3 rel = posKm - planetCenterWorldKm;
+  const float rho = length(rel);
+  if (rho >= topRadiusKm) {
+    return 0.0f;
+  }
+  float w = 1.0f;
+  if (rho > baseRadiusKm) {
+    const float mu = dot(normalize(cloudShadowCascadeDir(args, 0u, 0u)), rel / rho);
+    float t0, t1, b0, b1;
+    cloudShadowSphereRoots(rho, mu, topRadiusKm, t0, t1);
+    const float dAnti = cloudShadowSphereRoots(rho, mu, baseRadiusKm, b0, b1) && b1 <= 0.0f ? -b1 : -t0;
+    w = cloudShadowDepthFraction(max(t1, 0.0f), max(dAnti, 0.0f));
+  }
+  return sampleCloudShadowMap(map, linearSampler, posKm, w, args).x;
+}

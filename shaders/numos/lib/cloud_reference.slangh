@@ -1,0 +1,271 @@
+// Copyright 2026 Kim2091 (Sparkles)
+// SPDX-License-Identifier: Apache-2.0
+
+// Reference cloud path tracer. Ground truth for the real-time march: the same density field, sun,
+// sky and ground terms, with light transport solved by Monte Carlo instead of approximated. One
+// path per pixel per frame; the viewer's accumulation averages them.
+//
+// Free flights use delta tracking against the majorant cloudDensity (density never exceeds 1) and
+// skip empty space with the sampler's conservative distance.
+//
+// Phase: Jendersie & d'Eon 2023, "An Approximate Mie Scattering Function for Fog and Cloud
+// Rendering" (HG + Draine mix) for 20 um droplets, delta-scaled. The HG lobe is the diffraction
+// peak (g ~ 0.995, within about a degree of straight ahead), which at this scale cannot be told
+// apart from no scattering, so it is removed from the extinction (sigma * wD) and the phase is the
+// Draine lobe alone. Otherwise sun next-event estimation through the peak is all fireflies. The
+// lobe is sampled exactly, so throughput stays 1 (cloud water does not absorb).
+//
+// The sun is added by next-event estimation with ratio-tracked transmittance, using the sun
+// radiance that reaches the scatter point through the atmosphere (evalCloudSunRadiance). Paths that
+// leave the cloud take the sky-view LUT upward and the march's ground-and-haze term downward, the
+// same environment that lights the real-time model. The view transmittance is ratio tracked; air
+// uses the real-time aerial transmittance at the first scatter.
+//
+// Debug only, selected by cloudProfilingMode 9. A frame is slow (hundreds of scatters per path in
+// a thick core), so render at reduced resolution.
+
+#pragma once
+
+static const uint  kRefMaxScatters = 1024u;
+static const float kRefMaxFlightKm = 60.0f;
+
+static uint g_refRng;
+
+uint refHash(uint v) {
+  const uint state = v * 747796405u + 2891336453u;
+  const uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+
+float refRandom() {
+  g_refRng = g_refRng * 747796405u + 2891336453u;
+  uint w = ((g_refRng >> ((g_refRng >> 28u) + 4u)) ^ g_refRng) * 277803737u;
+  w = (w >> 22u) ^ w;
+  return float(w >> 8u) * (1.0f / 16777216.0f);
+}
+
+// ---- Phase: Jendersie & d'Eon 2023 fit for droplet diameter d = 20 um ----
+static const float kRefDropletUm = 20.0f;
+
+struct RefPhase { float gHG; float gD; float alpha; float wD; };
+
+RefPhase refPhaseParams() {
+  const float d = kRefDropletUm;
+  RefPhase p;
+  p.gHG   = exp(-0.0990567f / (d - 1.67154f));
+  p.gD    = exp(-2.20679f / (d + 3.91029f) - 0.428934f);
+  p.alpha = exp(3.62489f - 8.29288f / (d + 5.52825f));
+  p.wD    = exp(-0.599085f / (d - 0.641583f) - 0.665888f);
+  return p;
+}
+
+float refHG(float u, float g) {
+  const float g2 = g * g;
+  return (1.0f - g2) / (4.0f * kPi * pow(max(1.0f + g2 - 2.0f * g * u, 1e-6f), 1.5f));
+}
+
+float refDraine(float u, float g, float alpha) {
+  return refHG(u, g) * (1.0f + alpha * u * u) / (1.0f + alpha * (1.0f + 2.0f * g * g) / 3.0f);
+}
+
+float refPhase(float u, RefPhase p) {
+  return refDraine(u, p.gD, p.alpha);
+}
+
+float refSampleHGCos(float g, float xi) {
+  if (abs(g) < 1e-3f) {
+    return 1.0f - 2.0f * xi;
+  }
+  const float s = (1.0f - g * g) / (1.0f - g + 2.0f * g * xi);
+  return clamp((1.0f + g * g - s * s) / (2.0f * g), -1.0f, 1.0f);
+}
+
+// Cosine of the scattering angle, sampled exactly from refPhase: Draine by rejection against its HG
+// envelope ((1 + a u^2) peaks at u = +-1).
+float refSamplePhaseCos(RefPhase p) {
+  const float envelope = (1.0f + p.alpha);
+  for (int i = 0; i < 64; ++i) {
+    const float u = refSampleHGCos(p.gD, refRandom());
+    if (refRandom() * envelope <= 1.0f + p.alpha * u * u) {
+      return u;
+    }
+  }
+  return refSampleHGCos(p.gD, refRandom());
+}
+
+vec3 refRotate(vec3 dir, float cosTheta) {
+  const float sinTheta = sqrt(max(1.0f - cosTheta * cosTheta, 0.0f));
+  const float phi = 2.0f * kPi * refRandom();
+  const vec3 t = abs(dir.y) < 0.999f ? normalize(cross(dir, vec3(0.0f, 1.0f, 0.0f)))
+                                     : normalize(cross(dir, vec3(1.0f, 0.0f, 0.0f)));
+  const vec3 b = cross(dir, t);
+  return normalize(dir * cosTheta + (t * cos(phi) + b * sin(phi)) * sinTheta);
+}
+
+// ---- Density ----
+float refDensity(vec3 p, CloudShadeContext ctx, AtmosphereArgs args, out float emptyKm) {
+  emptyKm = 0.0f;
+  const float alt = length(p - ctx.planetCenterWorldKm) - ctx.planetRadiusKm - args.cloudAltitude;
+  if (alt < 0.0f || alt > args.cloudThickness) {
+    return 0.0f;
+  }
+  const vec2 controls = sampleCloudBakeControls(p.xz, args);
+  float stepKm;
+  const float d = sampleCloudDensityNubis3(p, alt / args.cloudThickness, controls.x, controls.y, 1.0f,
+                                           length(p - args.cameraWorldPosYUpKm), 0.0f, args,
+                                           AtmosphereCloudNvdfSdf, AtmosphereCloudDetailNoise3D,
+                                           AtmosphereCloudNoise3DSampler, /*coarseOd=*/false,
+                                           stepKm);
+  emptyKm = d <= 0.0f ? max(stepKm, 0.0f) : 0.0f;
+  return saturate(d);
+}
+
+float refShellExitKm(vec3 p, vec3 dir, CloudShadeContext ctx, AtmosphereArgs args) {
+  const vec3 rel = p - ctx.planetCenterWorldKm;
+  const float r = length(rel);
+  const float alt = clamp(r - ctx.planetRadiusKm - args.cloudAltitude, 0.0f, args.cloudThickness);
+  return min(cloudShellExitKm(alt, dot(dir, rel / r), ctx.planetRadiusKm, args.cloudAltitude,
+                              args.cloudThickness), kRefMaxFlightKm);
+}
+
+// Delta tracking from p along dir over [0, tMax]. Returns the collision distance, or -1 if the
+// flight leaves the interval.
+float refFreeFlight(vec3 p, vec3 dir, float tMax, CloudShadeContext ctx, AtmosphereArgs args) {
+  const float sigmaMax = max(args.cloudDensity * refPhaseParams().wD, 1e-3f);
+  float t = 0.0f;
+  float emptyKm;
+  refDensity(p, ctx, args, emptyKm);
+  for (int i = 0; i < 4096; ++i) {
+    if (emptyKm > 0.0f) {
+      // Provably empty for emptyKm: no collision can happen there, and the flight is memoryless,
+      // so it restarts past it.
+      t += emptyKm;
+      if (t >= tMax) {
+        return -1.0f;
+      }
+      refDensity(p + dir * t, ctx, args, emptyKm);
+      continue;
+    }
+    t += -log(max(1.0f - refRandom(), 1e-7f)) / sigmaMax;
+    if (t >= tMax) {
+      return -1.0f;
+    }
+    if (refRandom() < refDensity(p + dir * t, ctx, args, emptyKm)) {
+      return t;
+    }
+  }
+  return -1.0f;
+}
+
+// Ratio tracking (Novak et al. 2014) over [0, tMax]: the same tentative collisions as delta
+// tracking, but each multiplies the transmittance by the null-collision probability instead of
+// ending the flight on a coin toss. Same expectation, far less variance than a 0/1 visibility.
+// Roulette once T is small keeps thick cores from walking to the far side for nothing.
+float refTransmittance(vec3 p, vec3 dir, float tMax, CloudShadeContext ctx, AtmosphereArgs args) {
+  const float sigmaMax = max(args.cloudDensity * refPhaseParams().wD, 1e-3f);
+  float T = 1.0f;
+  float t = 0.0f;
+  float emptyKm;
+  refDensity(p, ctx, args, emptyKm);
+  for (int i = 0; i < 4096; ++i) {
+    if (emptyKm > 0.0f) {
+      t += emptyKm;
+      if (t >= tMax) {
+        return T;
+      }
+      refDensity(p + dir * t, ctx, args, emptyKm);
+      continue;
+    }
+    t += -log(max(1.0f - refRandom(), 1e-7f)) / sigmaMax;
+    if (t >= tMax) {
+      return T;
+    }
+    T *= 1.0f - refDensity(p + dir * t, ctx, args, emptyKm);
+    if (T < 0.1f) {
+      if (refRandom() >= T * 5.0f) {
+        return 0.0f;
+      }
+      T = 0.2f;
+    }
+  }
+  return T;  // step cap (long grazing rays): as refFreeFlight, treat the rest as empty
+}
+
+vec3 refEnvironment(vec3 dir, CloudShadeContext ctx, AtmosphereArgs args) {
+  if (dir.y >= 0.0f) {
+    return sampleSkyViewLutForRay(dir, AtmosphereSkyViewLut, AtmosphereSkyViewSampler);
+  }
+  const vec3 groundSun = evalCloudSunRadiance(args.cameraWorldPosYUpKm, ctx, args);
+  const vec3 ground = args.groundAlbedo
+                    * (groundSun * (saturate(ctx.sunDirYUp.y) * evalCloudGroundShadow(ctx.sunDirYUp, args) / kPi)
+                       + ctx.skyRadianceDown);
+  return ground + 0.1f * 0.5f * (ctx.skyHorizonSunward + ctx.skyHorizonAntiSunward);
+}
+
+// Radiance scattered toward the eye along the view ray, and the ray's transmittance. The first
+// collision is delta tracked (it starts the path); the transmittance is ratio tracked separately,
+// so cloud edges converge as a smooth alpha instead of a 0/1 coin toss per pixel.
+vec4 refTracePixel(vec3 viewDirYUp, float tSurfaceKm, uint2 pixelCoord, CloudShadeContext ctx,
+                   AtmosphereArgs args) {
+  // Seed through a full hash. A linear seed gives some pixels correlated sequences every frame,
+  // which converge to fixed dark dots.
+  g_refRng = refHash(pixelCoord.x + refHash(pixelCoord.y + refHash(args.cloudRenderFrameIdx)));
+  refRandom();
+  const RefPhase phase = refPhaseParams();
+
+  // Primary ray: the slab span(s) in front of any surface.
+  float tHit = -1.0f;
+  float viewT = 1.0f;
+  [unroll]
+  for (int piece = 0; piece < 2; ++piece) {
+    float tEntry, tExit;
+    if (!cloudSlabSpan(viewDirYUp, ctx.planetCenterKm, ctx.planetRadiusKm, args.cloudAltitude,
+                       args.cloudThickness, piece, tEntry, tExit)) {
+      continue;
+    }
+    tEntry = max(tEntry, 0.0f);
+    tExit = min(min(tExit, tSurfaceKm), tEntry + kRefMaxFlightKm);
+    if (tExit > tEntry) {
+      const vec3 start = args.cameraWorldPosYUpKm + viewDirYUp * tEntry;
+      viewT *= refTransmittance(start, viewDirYUp, tExit - tEntry, ctx, args);
+    }
+    if (tHit < 0.0f && tExit > tEntry) {
+      const vec3 start = args.cameraWorldPosYUpKm + viewDirYUp * tEntry;
+      const float t = refFreeFlight(start, viewDirYUp, tExit - tEntry, ctx, args);
+      if (t >= 0.0f) {
+        tHit = tEntry + t;
+      }
+    }
+  }
+  if (tHit < 0.0f) {
+    return vec4(0.0f, 0.0f, 0.0f, viewT);
+  }
+
+  vec3 airT;
+  cloudAerialPerspective(tHit, ctx, args, airT);
+
+  vec3 p = args.cameraWorldPosYUpKm + viewDirYUp * tHit;
+  vec3 dir = viewDirYUp;
+  vec3 radiance = vec3(0.0f);
+  for (uint n = 0u; n < kRefMaxScatters; ++n) {
+    // Sun: next-event estimation.
+    const vec3 sun = evalCloudSunRadiance(p, ctx, args);
+    if (CLOUD_LIGHT_DEBUG != 2 && any(sun > vec3(0.0f))) {
+      const float tSun = refShellExitKm(p, ctx.sunDirYUp, ctx, args);
+      radiance += sun * (refPhase(dot(dir, ctx.sunDirYUp), phase)
+                         * refTransmittance(p, ctx.sunDirYUp, tSun, ctx, args));
+    }
+    // Scatter, then fly to the next collision or out of the cloud.
+    dir = refRotate(dir, refSamplePhaseCos(phase));
+    const float tOut = refShellExitKm(p, dir, ctx, args);
+    const float t = refFreeFlight(p, dir, tOut, ctx, args);
+    if (t < 0.0f) {
+      if (CLOUD_LIGHT_DEBUG != 1) {
+        radiance += refEnvironment(dir, ctx, args);
+      }
+      break;
+    }
+    p += dir * t;
+  }
+  return vec4(radiance * airT * args.cloudColor, viewT);
+}

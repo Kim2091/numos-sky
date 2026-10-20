@@ -1,0 +1,151 @@
+// Modifications Copyright 2026 Kim2091 (Sparkles), licensed under Apache-2.0.
+/*
+* Copyright (c) 2023-2024, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+static const float pi = 3.1415926535897932384626433832795f;
+static const float twoPi = 2.0f * pi;
+static const float fourPi = 4.0f * pi;
+static const float goldenRatio = 1.61803398875f;
+static const float silverRatio = 0.61803398875f;
+
+static const float float16Max = 65504.f;
+static const float floatMax = 3.402823466e+38f;
+
+static const int int16Max = 32767;
+static const int intMax = 2147483647;
+static const uint uintMax = 4294967295;
+
+// Clamps a value to the range [0, 1]
+#define GENERIC_SATURATE(type)       \
+type saturate(type x)                \
+{                                    \
+  return clamp(x, type(0), type(1)); \
+}
+
+GENERIC_SATURATE(float16_t)
+GENERIC_SATURATE(float)
+GENERIC_SATURATE(f16vec3)
+GENERIC_SATURATE(vec3)
+
+// Squares a value
+#define GENERIC_SQUARE(type) \
+type square(type x)          \
+{                            \
+  return x * x;              \
+}
+
+GENERIC_SQUARE(float16_t)
+GENERIC_SQUARE(float)
+GENERIC_SQUARE(f16vec3)
+GENERIC_SQUARE(vec3)
+
+// Cubes a value
+#define GENERIC_CUBE(type) \
+type cube(type x)          \
+{                          \
+  return square(x) * x;    \
+}
+
+GENERIC_CUBE(float16_t)
+GENERIC_CUBE(float)
+
+
+
+
+
+// Performs a division operation which clamps the result based on a specified maximum value to guard against overflows to infinity.
+// May still result in NaNs if divison by zero occurs, use saferPositiveDivide to guard against division by zero if desired.
+// Requirements:
+// Numerator must be greater than or equal to 0.
+// Denominator must be greater than 0.
+#define GENERIC_CLAMPED_MAXIMUM_POSITIVE_DIVIDE(type, clampType) \
+type clampedMaximumPositiveDivide(                               \
+  type numerator, type denominator, clampType maximum)           \
+{                                                                \
+  /* Note: Relying on proper infinity behavior with the minimum function such that overflowing divisions */ \
+  /* will properly be clamped to the maximum value. This should be gauranteed, but in case it is not on  */ \
+  /* some implementations, the old approach of min(numerator, denominator * maximum) / denominator can   */ \
+  /* be used to avoid the overflow in most typical cases (though it still has the possibility to).       */ \
+  return min(numerator, denominator * maximum) / denominator;    \
+}
+
+GENERIC_CLAMPED_MAXIMUM_POSITIVE_DIVIDE(float16_t, float16_t)
+GENERIC_CLAMPED_MAXIMUM_POSITIVE_DIVIDE(float, float)
+GENERIC_CLAMPED_MAXIMUM_POSITIVE_DIVIDE(f16vec3, float16_t)
+GENERIC_CLAMPED_MAXIMUM_POSITIVE_DIVIDE(vec3, float)
+
+// Performs a "safer" division operation than the safe division function by guarding
+// against both divisions by zero via a specified epsilon and most overflows to infinity
+// via a clamped maximum division.
+// Requirements:
+// Numerator and denominator must be greater than or equal to 0.
+#define GENERIC_SAFER_POSITIVE_DIVIDE(type, clampType)                      \
+type saferPositiveDivide(                                                   \
+  type numerator, type denominator, clampType epsilon, clampType maximum)   \
+{                                                                           \
+  const type safeDenominator = max(denominator, epsilon);                   \
+                                                                            \
+  return clampedMaximumPositiveDivide(numerator, safeDenominator, maximum); \
+}
+
+GENERIC_SAFER_POSITIVE_DIVIDE(float16_t, float16_t)
+GENERIC_SAFER_POSITIVE_DIVIDE(float, float)
+GENERIC_SAFER_POSITIVE_DIVIDE(f16vec3, float16_t)
+GENERIC_SAFER_POSITIVE_DIVIDE(vec3, float)
+
+
+
+
+
+
+
+
+
+
+bool isQuatRightHanded(float16_t q)
+{
+  return float16BitsToUint16(q) & 0x8000;
+}
+
+bool isQuatRightHanded(float q)
+{
+  return asuint(q) & 0x80000000;
+}
+
+// Set to 1 to compile the previous bent-normal implementation.
+#ifndef USE_LEGACY_BENT_NORMAL
+#define USE_LEGACY_BENT_NORMAL 0
+#endif
+
+// Because quaternion == -quaternion, we can use the sign bit of the w
+// component of the quaternion to encode the handedness of the original TBN matrix.
+bool isQuatRightHanded(f16vec4 q)
+{
+  return isQuatRightHanded(q.w);
+}
+
+bool isQuatRightHanded(vec4 q)
+{
+  return isQuatRightHanded(q.w);
+}
+

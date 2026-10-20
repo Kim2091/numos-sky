@@ -1,0 +1,425 @@
+// Copyright 2026 Kim2091 (Sparkles)
+// SPDX-License-Identifier: Apache-2.0
+
+
+
+/*
+ * Cloud density samplers built on the NVDF signed distance field (Nubis Cubed, Schneider 2023,
+ * "Sampling Density"):
+ *
+ *   sdf'    = nvdfTap(pos) - coverageOffset          (coverage is a level-set shift)
+ *   if (sdf' >= 0) -> empty air, early out
+ *   profile = saturate(-sdf' / profileDepth)         (gradient from outside to inside)
+ *   density = valueErosion(profile, detail noise)
+ *
+ * The same sampler serves the view march and the shadow and optical-depth bakes, so the rendered
+ * clouds and their shadows describe the same iso-surface. The file also holds the stratiform
+ * body of cloud layer 2 and the control-field sampler the bakes use.
+ *
+ * Only cloud passes include this file; the path tracer does not.
+ */
+
+#pragma once
+
+#include "numos/lib/atmosphere_common.slangh"
+#include "numos/lib/cloud_nvdf.h"
+
+// Schneider value-erosion remap: erode `value` from below by `erosion`, renormalized so the
+// surviving range still reaches 1 (Nubis Cubed p.123).
+float valueErosion(float value, float erosion) {
+  return saturate((value - erosion) / max(1.0f - erosion, 1e-4f));
+}
+
+// ---------------------------------------------------------------------------
+// Density sampler arguments shared by the cumulus and stratiform samplers below.
+//
+// sdfStepKmOut: a conservative distance in km the caller may advance from this sample without
+// crossing any rendered surface, for sphere-traced stepping. It uses the minimum of the hex taps
+// (a blended distance is not a metric), minus the coverage offset, and stops at the hex triangle
+// boundary where a different tile can enter the blend. The march applies nvdfStepScale as a final
+// safety factor. It can be <= 0 inside or near bodies, where the march steps normally.
+//
+// cameraDistKm: distance from the camera to the sample (the march passes its ray t). It fades the
+// fine detail tap near the camera (Nubis p.125); bake and optical-depth callers pass a huge value
+// to turn it off.
+//
+// Coverage: the NVDF is baked at args.nvdfNominalCoverage, and the live coverageLocal shifts the
+// iso-level at sample time, so weather grows, shrinks and merges bodies between re-bakes.
+//
+// Animation: wind translates the whole field. The body SDF only changes on re-bakes; the visible
+// motion comes from the erosion, whose detail lookups drift with the evolution offsets so
+// silhouettes churn against the steady bodies.
+//
+// coarseOd: set only by short optical-depth taps. It drops the two non-dominant hex taps and the
+// fine detail tap: they hide texture repeats and add fine structure, neither of which shows in an
+// optical depth. The flag is constant per call site, so each inlined copy drops the untaken branch.
+// Bakes must pass false so the baked shadows match the rendered clouds.
+// ---------------------------------------------------------------------------
+
+// Mip level for step-based filtering of the detail volume. The noise is filtered before nonlinear
+// displacement and the density gates, so keeping its mean does not keep the cloud coverage.
+// lodStepKm <= 0 selects the unfiltered detail, which all lighting-grid taps use.
+float cloudDetailMip(float freqPerKm, float lodStepKm, float lodBias) {
+  if (lodStepKm <= 0.0f) {
+    return 0.0f;
+  }
+  const float kDetailVolumeTexels = 128.0f;
+  const float texelsPerStep = lodStepKm * freqPerKm * kDetailVolumeTexels;
+  return clamp(log2(max(2.0f * texelsPerStep, 1.0f)) + lodBias, 0.0f, 7.0f);
+}
+
+// detailLodStepKm: the march step this sample stands for, or 0 for full-frequency detail; see
+// cloudDetailMip. The view march passes its step when args.cloudDetailLodEnable is set.
+// ---------------------------------------------------------------------------
+// Cumulus density, built from the minimum the cumulus body needs:
+//   1. body: the NVDF distance field, de-tiled as a weighted union (see below), offset by the
+//      live coverage;
+//   2. profile: depth into the body over nvdfProfileDepthKm;
+//   3. curl: one tap of the turbulence volume's curl channels distorts the detail lookup,
+//      strongest at the cloud base (wind-torn bases, rounded tops);
+//   4. detail: one tap of billows (R) and wisps (G), wispy low and billowy high, plus a finer
+//      tap of the same volume within kCumulusFineFarKm;
+//   5. Schneider remap erosion of the profile by that detail.
+// Erosion only removes density, so nothing grows outside the body and the empty-space step is
+// the distance field itself. `noise` is the cumulus turbulence volume.
+
+static const float kCumulusDetailTileKm  = 1.6f;   // billow volume repeat: 400 m lumps, 2 finer octaves
+static const float kCumulusCurlTileKm    = 6.0f;   // curl field repeat (2 cells per repeat)
+static const float kCumulusFineScale     = 3.17f;  // fine tap frequency multiple
+static const float kCumulusFineFarKm     = 6.0f;   // fine tap fades out by this camera distance
+static const float kCumulusUnionShrinkKm = 0.5f;
+
+// How far a hex tile's clouds shrink at blend weight w: 0 at w = 1, kCumulusUnionShrinkKm at
+// w = 0.5, unbounded as w -> 0, so a tile has no clouds left by the time it leaves the blend
+// triangle and the union stays continuous across triangle edges.
+// A closed deck (cloudDeckAmount of the baked coverage) starts shrinking only below w = 0.25: the
+// union of three closed decks is still a closed deck, while shrinking all three where they meet
+// (w = 1/3 each, 1 km) would cut straight lines of holes along the blend zones. The dominant tile
+// (w >= 1/3) of a closed deck never shrinks.
+float cloudUnionShrinkKm(float w, AtmosphereArgs args) {
+  const float wt = lerp(1.0f, 0.25f, cloudDeckAmount(args.nvdfNominalCoverage));
+  return kCumulusUnionShrinkKm * max(wt - w, 0.0f) / max(w, 1e-3f);
+}
+
+// Largest distance the baked field holds inside a cloud: the wrapped tile caps XZ distances at
+// tileKm / sqrt(2) (cloud_nvdf_resolve.comp) and the slab caps the vertical.
+float cloudNvdfMaxInsideKm(AtmosphereArgs args) {
+  return sqrt(0.5f * args.cloudNoiseTileKm * args.cloudNoiseTileKm + args.cloudThickness * args.cloudThickness);
+}
+
+// The hex union's distance (km, negative inside, before the coverage offset): the three tiles' fields,
+// each shrunk by its blend weight, as the full density takes them, so it is continuous across tile
+// edges. A tile whose shrink alone keeps it above the union so far is not read, since no distance in
+// the field is below -cloudNvdfMaxInsideKm; deep in a tile's triangle that skips both other taps.
+float cloudHexUnionSdfKm(CloudHexTile hex, float v, AtmosphereArgs args, Texture3D<float> nvdfSdf,
+                         SamplerState cloudSampler) {
+  const float maxInsideKm = cloudNvdfMaxInsideKm(args);
+  float sdfKm = nvdfSdf.SampleLevel(cloudSampler, vec3(hex.uv1.x, v, hex.uv1.y), 0).r
+              + cloudUnionShrinkKm(hex.w1, args);
+  const float shrink2 = cloudUnionShrinkKm(hex.w2, args);
+  if (shrink2 - maxInsideKm < sdfKm) {
+    sdfKm = min(sdfKm, nvdfSdf.SampleLevel(cloudSampler, vec3(hex.uv2.x, v, hex.uv2.y), 0).r + shrink2);
+  }
+  const float shrink3 = cloudUnionShrinkKm(hex.w3, args);
+  if (shrink3 - maxInsideKm < sdfKm) {
+    sdfKm = min(sdfKm, nvdfSdf.SampleLevel(cloudSampler, vec3(hex.uv3.x, v, hex.uv3.y), 0).r + shrink3);
+  }
+  return sdfKm;
+}
+
+// Body-only cumulus density: the profile of the hex union's SDF, one to three texture taps. The
+// cumulus body carries billows down to ~150 m, so short sun marches that only need to know
+// whether a billow lies between a sample and the sun read this instead of the full density
+// (curl + detail taps).
+float cloudBodySdfKm(vec3 worldPosKm, float heightFraction, float coverageLocal,
+                     AtmosphereArgs args, Texture3D<float> nvdfSdf, SamplerState cloudSampler);
+
+float cloudErodeProfile(vec3 perturbed, float heightFraction, float typeLocal, float profile,
+                        float cameraDistKm, float detailLodStepKm, AtmosphereArgs args,
+                        Texture3D<float4> noise, SamplerState cloudSampler, bool coarseOd);
+
+// Water content with height: a parcel condenses more water the higher it has risen above the cloud
+// base (adiabatic liquid water grows with height), so density grows from a quarter at the base to
+// full kCloudFullWaterKm above it, in metres, whatever the deck's depth: a 600 m stratus stays
+// thin, an 8 km tower is solid above its first kilometre. A thin base also lets a sun below the
+// base's horizon light it from beneath.
+static const float kCloudFullWaterKm = 1.0f;
+float cloudCumulusHeightDensity(float heightFraction, float slabThicknessKm) {
+  return clamp(0.25f + 0.75f * heightFraction * slabThicknessKm / kCloudFullWaterKm, 0.25f, 1.0f);
+}
+
+// The cumulus body's signed distance (km, negative inside) of the hex union, offset by the live
+// coverage.
+float cloudBodySdfKm(vec3 worldPosKm, float heightFraction, float coverageLocal,
+                     AtmosphereArgs args, Texture3D<float> nvdfSdf, SamplerState cloudSampler) {
+  const vec3 perturbed = worldPosKm - vec3(args.cloudWindOffset.x, 0.0f, args.cloudWindOffset.y);
+  const float kHalfTexelV = 0.5f / float(CLOUD_NVDF_SIZE_Y);
+  const float v = clamp(heightFraction, kHalfTexelV, 1.0f - kHalfTexelV);
+  float sdfKm;
+  if (args.cloudHexTilingEnable > 0.5f) {
+    sdfKm = cloudHexUnionSdfKm(computeCloudHexTile(perturbed.xz, args), v, args, nvdfSdf, cloudSampler);
+  } else {
+    const vec2 tileUV = frac(perturbed.xz / args.cloudNoiseTileKm);
+    sdfKm = nvdfSdf.SampleLevel(cloudSampler, vec3(tileUV.x, v, tileUV.y), 0).r;
+  }
+  return sdfKm - (coverageLocal - args.nvdfNominalCoverage) * args.nvdfCoverageOffsetKm;
+}
+
+float sampleCloudDensityCumulus(vec3 worldPosKm, float heightFraction, float typeLocal,
+                                float coverageLocal, float densityScale, float cameraDistKm,
+                                float detailLodStepKm, AtmosphereArgs args, Texture3D<float> nvdfSdf,
+                                Texture3D<float4> noise, SamplerState cloudSampler, bool coarseOd,
+                                out float sdfStepKmOut) {
+  const vec3 windOffset = vec3(args.cloudWindOffset.x, 0.0f, args.cloudWindOffset.y);
+  const vec3 perturbed = worldPosKm - windOffset;
+  const float kHalfTexelV = 0.5f / float(CLOUD_NVDF_SIZE_Y);
+  const float v = clamp(heightFraction, kHalfTexelV, 1.0f - kHalfTexelV);
+
+  // 1. Body. Hex de-tiling as a weighted union: averaging three unrelated cloudscapes' distance
+  // fields would morph every cloud in a blend zone into a blob. Each tile's clouds shrink as its
+  // weight falls instead, so a blend zone holds solid clouds from both tiles.
+  float sdfKm;
+  float sdfMinKm;
+  float tileBoundaryKm = 100.0f;
+  if (args.cloudHexTilingEnable > 0.5f) {
+    CloudHexTile hex = computeCloudHexTile(perturbed.xz, args);
+    const float s1 = nvdfSdf.SampleLevel(cloudSampler, vec3(hex.uv1.x, v, hex.uv1.y), 0).r;
+    sdfKm = s1 + cloudUnionShrinkKm(hex.w1, args);
+    sdfMinKm = s1;
+    if (!coarseOd) {
+      const float s2 = nvdfSdf.SampleLevel(cloudSampler, vec3(hex.uv2.x, v, hex.uv2.y), 0).r;
+      const float s3 = nvdfSdf.SampleLevel(cloudSampler, vec3(hex.uv3.x, v, hex.uv3.y), 0).r;
+      sdfKm = min(sdfKm, min(s2 + cloudUnionShrinkKm(hex.w2, args), s3 + cloudUnionShrinkKm(hex.w3, args)));
+      sdfMinKm = min(s1, min(s2, s3));
+    }
+    tileBoundaryKm = hex.boundaryKm;
+  } else {
+    const vec2 tileUV = frac(perturbed.xz / args.cloudNoiseTileKm);
+    sdfKm = nvdfSdf.SampleLevel(cloudSampler, vec3(tileUV.x, v, tileUV.y), 0).r;
+    sdfMinKm = sdfKm;
+  }
+  const float offsetKm = (coverageLocal - args.nvdfNominalCoverage) * args.nvdfCoverageOffsetKm;
+  const float sdfLive = sdfKm - offsetKm;
+  sdfStepKmOut = min(sdfMinKm - offsetKm, tileBoundaryKm);
+  if (sdfLive >= 0.0f) {
+    return 0.0f;
+  }
+
+  // 2. Profile.
+  const float profile = saturate(-sdfLive / max(args.nvdfProfileDepthKm, 1e-3f));
+
+  // 3-5. Detail erosion of the profile.
+  const float density = cloudErodeProfile(perturbed, heightFraction, typeLocal, profile, cameraDistKm,
+                                          detailLodStepKm, args, noise, cloudSampler, coarseOd);
+  return density * cloudCumulusHeightDensity(heightFraction, args.cloudThickness) * densityScale;
+}
+
+// Steps 3-5 of the cumulus sampler, shared with the stratiform layer below: the curl-distorted
+// detail erodes a body's profile. `perturbed` is the wind-relative position.
+float cloudErodeProfile(vec3 perturbed, float heightFraction, float typeLocal, float profile,
+                        float cameraDistKm, float detailLodStepKm, AtmosphereArgs args,
+                        Texture3D<float4> noise, SamplerState cloudSampler, bool coarseOd) {
+  // 3. Curl distortion of the detail lookup (evolution drift keeps the detail churning).
+  const vec3 windDir = vec3(args.cloudWindDirUnitX, 0.0f, args.cloudWindDirUnitZ);
+  vec3 p = perturbed + vec3(0.0f, args.cloudEvolutionOffsetY, 0.0f)
+         + windDir * (args.cloudEvolutionOffsetX * heightFraction);
+  const vec2 curl = (noise.SampleLevel(cloudSampler, frac(p / kCumulusCurlTileKm), 0).ba - 0.5f) * 4.0f;
+  const float curlKm = args.cloudCurlStrengthKm * lerp(1.0f, 0.3f, saturate(heightFraction * 2.0f));
+  p.xz += curl * curlKm;
+
+  // 4. Detail: wisps at the base and in thin cloud, billows higher up and in cumulus types.
+  const float detailFreq = 1.0f / kCumulusDetailTileKm;
+  const float billowMix = saturate(smoothstep(0.05f, 0.45f, heightFraction) * 0.7f
+                                   + typeLocal * 0.3f + 0.15f);
+  const vec4 d = noise.SampleLevel(cloudSampler, frac(p * detailFreq),
+                                   cloudDetailMip(detailFreq, detailLodStepKm, args.cloudDetailLodBias));
+  float detail = lerp(d.g, d.r, billowMix);
+  if (!coarseOd && cameraDistKm < kCumulusFineFarKm) {
+    const float fineFreq = detailFreq * kCumulusFineScale;
+    const vec4 f = noise.SampleLevel(cloudSampler, frac(p * fineFreq + vec3(0.37f, 0.61f, 0.13f)),
+                                     cloudDetailMip(fineFreq, detailLodStepKm, args.cloudDetailLodBias));
+    const float fineFade = saturate(1.0f - cameraDistKm / kCumulusFineFarKm);
+    detail = lerp(detail, detail * 0.65f + lerp(f.g, f.r, billowMix) * 0.35f, fineFade);
+  }
+
+  // 5. Erosion: the detail eats into the shell, less deep inside the body.
+  const float erosion = (1.0f - detail) * max(args.nubis3ErosionStrength, 0.0f);
+  return valueErosion(profile, erosion * (1.0f - 0.6f * profile));
+}
+
+// ---------------------------------------------------------------------------
+// Stratiform body (cloud layer 2): fog, stratus, altostratus and dust sheets.
+//
+// Layer 2 cannot reuse the cumulus body field: that field is baked at layer 1's nominal coverage,
+// so the second layer's coverage would only nudge layer 1's bodies (and under a clear layer 1
+// there would be no bodies to nudge). A stratiform layer is a sheet broken into patches instead:
+//   * patches: 2D Worley F1 (distance to the nearest jittered feature point) on a
+//     kStratiformCellKm lattice, inside where F1 < r. For points scattered like a Poisson process
+//     the covered area fraction is 1 - exp(-pi r^2), so r is solved from the coverage, which makes
+//     coverage the share of the area the layer covers; near 1 the patches merge into a closed sheet
+//     with scattered holes. The lookup is warped by the turbulence volume's curl channels so the
+//     edges meander instead of tracing circles.
+//   * top: the slab top, lowered in lumps by the billow channel (at most kStratiformReliefKm and
+//     kStratiformReliefFraction of the depth), is a surface of the same body, so the profile ramps
+//     there and the detail erodes it into a ragged, lumpy top that shades itself. The base stays
+//     flat and dense: a fog bank sits on the ground.
+//   * water content with height: type 0 (stratus, fog) is densest at its base and halves toward the
+//     top; type 1 takes the cumulus profile (thin base, full by mid-height).
+// The detail erosion is the cumulus sampler's own (cloudErodeProfile), and the whole field moves
+// with the same wind. Both distances are bounds (F1 is 1-Lipschitz, the warp's stretch is divided
+// out, the relief is gentle), so the march's empty-space skip stays safe.
+static const float kStratiformCellKm = 3.0f;
+static const float kStratiformWarpTileKm = 6.0f;     // curl channels: ~1.5 km meanders
+static const float kStratiformWarpKm = 0.5f;         // edge displacement per unit of normalised curl
+static const float kStratiformWarpBound = 0.6f;      // 1 / (1 + the warp's largest stretch)
+static const float kStratiformReliefTileKm = 1.6f;   // billow channel: ~400 m lumps on the top
+static const float kStratiformReliefKm = 0.15f;
+static const float kStratiformReliefFraction = 0.4f;
+static const float kStratiformEdgeKm = 0.35f;        // profile ramp in from a patch edge
+static const float kStratiformEdgeBreakKm = 0.3f;    // relief's offset of a patch edge (cloudStratiformBodyFromFields)
+
+// Patch radius, in cells, for a covered area fraction `coverage`.
+float cloudStratiformRadius(float coverage) {
+  return sqrt(-log(1.0f - min(saturate(coverage), 0.999f)) / kPi);
+}
+
+// Profile ramp in from the top: a quarter of the layer at most, so a thin layer keeps a defined top
+// and still reaches full density.
+float cloudStratiformTopRampKm(float thicknessKm, AtmosphereArgs args) {
+  return max(min(args.nvdfProfileDepthKm, 0.25f * thicknessKm), 1e-3f);
+}
+
+float cloudStratiformHeightDensity(float heightFraction, float typeLocal, float thicknessKm) {
+  return lerp(1.0f - 0.5f * heightFraction, cloudCumulusHeightDensity(heightFraction, thicknessKm), saturate(typeLocal));
+}
+
+// The body's two horizontal fields at `xz` in the cloud frame (world xz minus the wind offset): x the
+// warped Worley F1 the patch edges are drawn from, y the billow channel that lowers the top. They do
+// not depend on height, coverage or depth, so the light paths read them from a baked map
+// (cloud_layer2_map.comp, cloudStratiformFieldsForLight). The mips prefilter them for a map whose
+// texels are coarser than the noise volume's.
+vec2 cloudStratiformPatchFields(vec2 xz, float seed, float curlMip, float billowMip, Texture3D<float4> noise,
+                                SamplerState cloudSampler) {
+  const float slice = frac(seed * 0.0137f);
+  const vec2 curl = (noise.SampleLevel(cloudSampler, frac(vec3(xz.x, slice * kStratiformWarpTileKm, xz.y)
+                                                         / kStratiformWarpTileKm), curlMip).ba - 0.5f) * 4.0f;
+  const float f1 = worleyNoise2D((xz + curl * kStratiformWarpKm) * (0.01f / kStratiformCellKm), seed);
+  const float billow = noise.SampleLevel(cloudSampler, frac(vec3(xz.x, slice * kStratiformReliefTileKm, xz.y)
+                                                            / kStratiformReliefTileKm), billowMip).r;
+  return vec2(f1, billow);
+}
+
+// Signed distances (km, negative inside) to the patch edge (x) and to the top (y) from the patch
+// fields; the body's distance is their max.
+vec2 cloudStratiformBodyFromFields(vec2 fields, float heightFraction, float coverageLocal, float thicknessKm) {
+  // The patches are Worley F1 disks, and F1 peaks along the straight edges of its Voronoi cells. Where
+  // the coverage nearly closes the sheet (an altostratus at 0.97) the edge ramp (kStratiformEdgeKm)
+  // reaches those ridges without opening holes, which would show as a net of straight seams and
+  // polygonal regions a few km across. The relief field (independent ~400 m lumps) offsets the edge,
+  // so near-closed ridges break into thin spots and the remaining edges are lumpy rather than
+  // straight. It moves a patch edge by at most kStratiformEdgeBreakKm, and its mean (0.5) leaves the
+  // coverage unchanged.
+  const float sideKm = (fields.x - cloudStratiformRadius(coverageLocal)) * (kStratiformCellKm * kStratiformWarpBound)
+                     + (fields.y - 0.5f) * (2.0f * kStratiformEdgeBreakKm);
+  const float reliefKm = min(kStratiformReliefKm, kStratiformReliefFraction * thicknessKm);
+  const float topKm = (heightFraction - 1.0f) * thicknessKm + reliefKm * saturate(1.0f - fields.y);
+  return vec2(sideKm, topKm);
+}
+
+// Signed distances (km, negative inside) to the patch edge (x) and to the top (y); the body's
+// distance is their max. `seed` decorrelates the patches and the relief.
+vec2 cloudStratiformBodyKm(vec3 worldPosKm, float heightFraction, float coverageLocal, float thicknessKm,
+                           float seed, AtmosphereArgs args, Texture3D<float4> noise,
+                           SamplerState cloudSampler) {
+  const vec2 fields = cloudStratiformPatchFields(worldPosKm.xz - args.cloudWindOffset, seed, 0.0f, 0.0f, noise,
+                                                 cloudSampler);
+  return cloudStratiformBodyFromFields(fields, heightFraction, coverageLocal, thicknessKm);
+}
+
+// Layer 2 patch-field map (cloud_layer2_map.comp): cloudStratiformPatchFields baked on two
+// nested square grids centred near the camera in the cloud frame, one per depth slice of an RG16F
+// volume. The fields hold still in that frame, so the map is re-baked only when the camera has
+// drifted kCloudLayer2MapRecentreKm from its centre (or the seed changed); the light paths then read
+// one bilinear tap instead of two noise-volume taps and a Worley cell search.
+//   cascade 0: 25 m texels over 25.6 km, the billow prefiltered to that texel (mip 1);
+//   cascade 1: 200 m texels over 205 km, curl and billow prefiltered (mips 2 and 4), for the long
+//              light paths (the horizon streams run tens of km through a thin layer).
+// Which cascade a tap reads depends on its distance from the camera, not from the map centre, so a
+// re-centre changes nothing but the texels' positions on the same field: kCloudLayer2MapFineKm
+// fine, blended to coarse by kCloudLayer2MapBlendKm, coarse to kCloudLayer2MapCoarseKm, live past it.
+// The centre is snapped to the coarse texel, a multiple of the fine one, so both grids keep their
+// texel positions across re-bakes.
+static const uint  kCloudLayer2MapSize = 1024u;
+static const float kCloudLayer2MapFineTexelKm = 0.025f;
+static const float kCloudLayer2MapCoarseTexelKm = 0.2f;
+static const float kCloudLayer2MapRecentreKm = 2.0f;
+static const float kCloudLayer2MapFineKm = 8.0f;
+static const float kCloudLayer2MapBlendKm = 10.0f;
+static const float kCloudLayer2MapCoarseKm = 90.0f;
+
+float cloudLayer2MapTexelKm(uint cascade) {
+  return cascade == 0u ? kCloudLayer2MapFineTexelKm : kCloudLayer2MapCoarseTexelKm;
+}
+
+// The body's profile: 0 at its surface, 1 kStratiformEdgeKm in from an edge and the top ramp below
+// the top.
+float cloudStratiformProfile(vec2 bodyKm, float thicknessKm, AtmosphereArgs args) {
+  return min(saturate(-bodyKm.x / kStratiformEdgeKm), saturate(-bodyKm.y / cloudStratiformTopRampKm(thicknessKm, args)));
+}
+
+float sampleCloudDensityStratiform(vec3 worldPosKm, float heightFraction, float typeLocal,
+                                   float coverageLocal, float densityScale, float thicknessKm,
+                                   float seed, float cameraDistKm, float detailLodStepKm,
+                                   AtmosphereArgs args, Texture3D<float4> noise,
+                                   SamplerState cloudSampler, out float sdfStepKmOut) {
+  const vec2 bodyKm = cloudStratiformBodyKm(worldPosKm, heightFraction, coverageLocal, thicknessKm, seed,
+                                            args, noise, cloudSampler);
+  const float sdfKm = max(bodyKm.x, bodyKm.y);
+  sdfStepKmOut = sdfKm;
+  if (sdfKm >= 0.0f) {
+    return 0.0f;
+  }
+  const float profile = cloudStratiformProfile(bodyKm, thicknessKm, args);
+  const vec3 perturbed = worldPosKm - vec3(args.cloudWindOffset.x, 0.0f, args.cloudWindOffset.y);
+  const float density = cloudErodeProfile(perturbed, heightFraction, typeLocal, profile, cameraDistKm,
+                                          detailLodStepKm, args, noise, cloudSampler, /*coarseOd=*/false);
+  return density * cloudStratiformHeightDensity(heightFraction, typeLocal, thicknessKm) * densityScale;
+}
+
+float sampleCloudDensityNubis3(vec3 worldPosKm,
+                               float heightFraction,
+                               float typeLocal,
+                               float coverageLocal,
+                               float densityScale,
+                               float cameraDistKm,
+                               float detailLodStepKm,
+                               AtmosphereArgs args,
+                               Texture3D<float> nvdfSdf,
+                               Texture3D<float4> detailNoise,
+                               SamplerState cloudSampler,
+                               bool coarseOd,
+                               out float sdfStepKmOut) {
+  return sampleCloudDensityCumulus(worldPosKm, heightFraction, typeLocal, coverageLocal,
+                                   densityScale, cameraDistKm, detailLodStepKm, args, nvdfSdf,
+                                   detailNoise, cloudSampler, coarseOd, sdfStepKmOut);
+}
+
+// ===========================================================================
+// Local cloud type and coverage at a horizontal position: the global means plus the spread of the
+// control noise fields. Used by callers that sample density outside the view march, such as the
+// reference path tracer.
+// ===========================================================================
+
+vec2 sampleCloudBakeControls(vec2 sampleXZKm, AtmosphereArgs args) {
+  float typeNoise = 0.5f;
+  float coverageNoise = 0.5f;
+  if (args.cloudTypeSpread != 0.0f) {
+    typeNoise = cloudControlFieldSmooth2D(sampleXZKm * args.cloudTypeNoiseScale, 200.0f);
+  }
+  if (args.cloudCoverageSpread != 0.0f) {
+    coverageNoise = cloudControlField2D(sampleXZKm * args.cloudCoverageNoiseScale, 250.0f);
+  }
+  return vec2(saturate(args.cloudTypeMean + (typeNoise - 0.5f) * args.cloudTypeSpread),
+              saturate(args.cloudCoverageMean + (coverageNoise - 0.5f) * args.cloudCoverageSpread));
+}
+

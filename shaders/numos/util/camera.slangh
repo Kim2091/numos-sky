@@ -1,0 +1,110 @@
+// Modifications Copyright 2026 Kim2091 (Sparkles), licensed under Apache-2.0.
+/*
+* Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// Note: camera.h must be first include to define required structures
+#include "numos/util/camera.h"
+
+// Converts a position at the center of a pixel with a coordinate from [0, resolution] with a
+// top left origin to a screen UV coordinate from [0, 1) also with a top left origin.
+vec2 cameraPixelCoordinateToScreenUV(Camera camera, ivec2 pixelCoordinate)
+{
+  // Note: Offset by 0.5 to be in the center of a pixel.
+  const vec2 pixelCenter = vec2(pixelCoordinate) + vec2(0.5f);
+
+  return pixelCenter / vec2(camera.resolution);
+}
+
+// Converts a screen UV coordinate from [0, 1) with a top left origin to a 2D NDC.
+vec2 cameraScreenUVToNDC(Camera camera, vec2 screenUV)
+{
+  return screenUV * vec2(2.0f, -2.0f) + vec2(-1.0f, 1.0f);
+}
+
+// Converts a 2D NDC to a screen UV coordinate from [0, 1) with a top left origin.
+vec2 cameraNDCToScreenUV(Camera camera, vec2 ndc)
+{
+  return ndc * vec2(0.5f, -0.5f) + vec2(0.5f, 0.5f);
+}
+
+struct CameraDirections {
+  // A direction in world space.
+  vec3 worldDirection;
+  // A direction in view space.
+  vec3 viewDirection;
+};
+
+// Converts a screen UV coordinate from [0, 1) to a world/view space direction from the camera origin
+// pointing towards the pixel. A jittered matrix can be specified to be used or not depending on
+// the use case.
+CameraDirections cameraScreenUVToDirection(Camera camera, vec2 screenUV, bool jitter) {
+  const vec2 ncd = cameraScreenUVToNDC(camera, screenUV);
+  const vec4 viewPosition = mul(
+    jitter ? camera.projectionToViewJittered : camera.projectionToView,
+    vec4(ncd.x, ncd.y, 1.0f, 1.0f)
+  );
+
+  CameraDirections cameraDirections;
+
+  cameraDirections.viewDirection = normalize(viewPosition.xyz);
+  cameraDirections.worldDirection = normalize(mul(mat3(camera.viewToWorld), cameraDirections.viewDirection));
+
+  return cameraDirections;
+}
+
+// Overload for converting a screen UV coordinate to a world/view space direction with the assumption
+// of using jittering (as this is the most common case).
+CameraDirections cameraScreenUVToDirection(Camera camera, vec2 screenUV) {
+  return cameraScreenUVToDirection(camera, screenUV, true);
+}
+
+// Converts a pixel coordinate from [0, resolution) to a world/view space direction similar to the
+// screen UV variant of this function.
+CameraDirections cameraPixelCoordinateToDirection(Camera camera, ivec2 pixelCoordinate, bool jitter) {
+  const vec2 screenUV = cameraPixelCoordinateToScreenUV(camera, pixelCoordinate);
+
+  return cameraScreenUVToDirection(camera, screenUV, jitter);
+}
+
+// Overload for converting a pixel coordinate to a world/view space direction with the assumption
+// of using jittering (as this is the most common case).
+CameraDirections cameraPixelCoordinateToDirection(Camera camera, ivec2 pixelCoordinate) {
+  return cameraPixelCoordinateToDirection(camera, pixelCoordinate, true);
+}
+
+// Gets the world space position the camera's projection is centered at.
+vec3 cameraGetWorldPosition(Camera camera)
+{
+  return transpose(camera.viewToWorld)[3].xyz;
+}
+
+// Gets the world space position the camera's projection was centered at on the previous frame.
+vec3 cameraGetPreviousWorldPosition(Camera camera)
+{
+  return transpose(camera.prevViewToWorld)[3].xyz;
+}
+
+// Note: For all translated world space functions, these may not do anything if an application does not specify a world to view matrix
+// (for instance by pre-transforming on the CPU or using a fullly composed model to view matrix like how OpenGL always operates).
+// This means when relying on translated world space for improved precision results may vary on some applications.
+

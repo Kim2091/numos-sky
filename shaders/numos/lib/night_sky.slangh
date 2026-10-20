@@ -1,0 +1,208 @@
+// Copyright 2026 Kim2091 (Sparkles)
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+// The night sky's sources beyond the atmosphere: the catalogue stars and the Milky Way background
+// (assets/nightsky, built by tools/build_nightsky_assets.py). All of it is in fractions of the sun's
+// illuminance (x kNightSkyAssetScale), so multiplying by args.sunIlluminance makes it physical and
+// pre-exposed like everything else.
+//
+// The stars and the background are fixed on the celestial sphere; args.celestialToLocal* turn them
+// into the local Y-up frame (the same frame the real moon uses).
+//
+// The sky-view LUT carries the starlight blurred to ~3 deg (NightSkyStarlightLow) seen through the
+// air, so the clouds' and the ground's sky light include it. The sky itself adds the rest:
+//   (stars + background - starlightLow) x transmittance,
+// which with the LUT's share sums to the full-resolution sky at any LUT resolution.
+//
+// The airglow and the zodiacal light (evalNightSkyGlow) need no assets; the sky-view LUT carries them
+// whole. They also light the air below them (args.nightGlowInScatter, evalAtmosphereRadiance).
+//
+// The stars need the host globals below (numos_host.slangh lists them) and NIGHT_SKY_AVAILABLE.
+
+#include "numos/lib/zodiacal_light_table.slangh"
+
+static const float kNightSkyAssetScale = 1e10f;
+
+// Equatorial (x toward RA 0h, z toward the north pole) <-> local Y-up. The frame is a rotation, so
+// the inverse is its transpose.
+vec3 nightSkyLocalToEquatorial(vec3 dirLocal, AtmosphereArgs args) {
+  return vec3(dot(dirLocal, args.celestialToLocalX), dot(dirLocal, args.celestialToLocalY),
+              dot(dirLocal, args.celestialToLocalZ));
+}
+
+// Equirectangular coordinates of the background textures: u = 0.5 - RA / 2pi, v = (pi/2 - Dec) / pi.
+vec2 nightSkyEquirectUv(vec3 e) {
+  const float ra = atan2(e.y, e.x);
+  const float dec = asin(clamp(e.z, -1.0f, 1.0f));
+  return vec2(frac(0.5f - ra / (2.0f * kPi)), 0.5f - dec / kPi);
+}
+
+// The starlight blurred to ~3 deg, with the azimuth wrapped by hand (the sampler clamps).
+vec3 sampleNightSkyStarlightLow(vec3 e, Texture2D<float4> lowTexture, SamplerState s) {
+  const vec2 uv = nightSkyEquirectUv(e);
+  return sampleCloudDomeLut(lowTexture, s, uv, 0.0f).rgb;
+}
+
+// Zodiacal light toward dirYUp in S10 (zodiacal_light_table.slangh): sunlight scattered by the
+// interplanetary dust, symmetric about the ecliptic and brightening toward the sun.
+float zodiacalLightS10(vec3 dirYUp, vec3 sunDirYUp, vec3 eclipticPoleYUp) {
+  const float sinBeta = dot(dirYUp, eclipticPoleYUp);
+  const vec3 dirInPlane = dirYUp - eclipticPoleYUp * sinBeta;
+  const vec3 sunInPlane = sunDirYUp - eclipticPoleYUp * dot(sunDirYUp, eclipticPoleYUp);
+  const float planeLength = length(dirInPlane) * length(sunInPlane);
+  const float cosLongitude = planeLength > 1e-6f ? dot(dirInPlane, sunInPlane) / planeLength : 1.0f;
+  const float x = degrees(acos(clamp(cosLongitude, -1.0f, 1.0f))) / 5.0f;
+  const float y = degrees(asin(clamp(abs(sinBeta), 0.0f, 1.0f))) / 5.0f;
+  const uint x0 = min(uint(x), 35u), y0 = min(uint(y), 17u);
+  const float fx = saturate(x - float(x0)), fy = saturate(y - float(y0));
+  const uint i = x0 * kZodiacalLightColumns + y0;
+  return lerp(lerp(kZodiacalLightS10[i], kZodiacalLightS10[i + 1u], fy),
+              lerp(kZodiacalLightS10[i + kZodiacalLightColumns], kZodiacalLightS10[i + kZodiacalLightColumns + 1u], fy), fx);
+}
+
+// Length of the part of a ray (from radius r0, elevation cosine mu, up to distance tMax) inside the
+// sphere of radius r.
+float nightSkyLengthInsideSphere(float r0, float mu, float r, float tMax) {
+  const float b = r0 * mu;
+  const float disc = b * b - r0 * r0 + r * r;
+  if (disc <= 0.0f) {
+    return 0.0f;
+  }
+  const float s = sqrt(disc);
+  return max(min(-b + s, tMax) - max(-b - s, 0.0f), 0.0f);
+}
+
+// The natural glow of the night sky beyond the lower air toward viewDirYUp, before the air in front of
+// it: airglow, the emission of the ~90 km layer (args.airglowEmission per km of path through it, so
+// the van Rhijn brightening toward the horizon falls out of the geometry), and the zodiacal light.
+// Physical, pre-exposed radiance. groundDistance: where the ray meets the ground (or a huge value).
+vec3 evalNightSkyGlow(vec3 viewDirYUp, float eyeRadius, float groundDistance, AtmosphereArgs args) {
+  const float rLow = args.planetRadius + args.airglowAltitudeKm - 0.5f * args.airglowThicknessKm;
+  const float rHigh = rLow + args.airglowThicknessKm;
+  const float path = nightSkyLengthInsideSphere(eyeRadius, viewDirYUp.y, rHigh, groundDistance)
+                   - nightSkyLengthInsideSphere(eyeRadius, viewDirYUp.y, rLow, groundDistance);
+  vec3 glow = args.airglowEmission * max(path, 0.0f);
+  if (groundDistance > 1e9f) {
+    glow += args.sunIlluminance * (args.zodiacalLightScale
+            * zodiacalLightS10(viewDirYUp, normalize(args.sunDirection), args.eclipticPoleLocal));
+  }
+  return glow;
+}
+
+#ifdef NIGHT_SKY_AVAILABLE
+
+// The cube-map cell of an equatorial direction. MUST match cell_of() in
+// tools/build_nightsky_assets.py.
+uint nightSkyStarCell(vec3 d, uint cellsPerFace) {
+  const vec3 a = abs(d);
+  uint face;
+  float u, v, m;
+  if (a.x >= a.y && a.x >= a.z) {
+    face = 0u; m = a.x; u = d.y; v = d.z;
+  } else if (a.y >= a.z) {
+    face = 1u; m = a.y; u = d.x; v = d.z;
+  } else {
+    face = 2u; m = a.z; u = d.x; v = d.y;
+  }
+  const float sgn = face == 0u ? d.x : (face == 1u ? d.y : d.z);
+  const uint f = face * 2u + (sgn < 0.0f ? 1u : 0u);
+  const float n = float(cellsPerFace);
+  const uint iu = uint(clamp((u / m * 0.5f + 0.5f) * n, 0.0f, n - 1.0f));
+  const uint iv = uint(clamp((v / m * 0.5f + 0.5f) * n, 0.0f, n - 1.0f));
+  return (f * cellsPerFace + iv) * cellsPerFace + iu;
+}
+
+vec3 nightSkyDecodeRgb9e5(uint p) {
+  const float scale = exp2(float(int(p >> 27u)) - 24.0f);
+  return vec3(float(p & 511u), float((p >> 9u) & 511u), float((p >> 18u) & 511u)) * scale;
+}
+
+// The Milky Way background (every star fainter than the catalogue), bilinear, azimuth wrapped.
+vec3 sampleNightSkyMilkyWay(vec3 e, AtmosphereArgs args) {
+  const uint w = args.milkyWayWidth, h = args.milkyWayHeight;
+  const vec2 uv = nightSkyEquirectUv(e);
+  const vec2 t = uv * vec2(float(w), float(h)) - 0.5f;
+  const vec2 f = t - floor(t);
+  const int x0 = int(floor(t.x)), y0 = int(floor(t.y));
+  vec3 c[4];
+  [unroll] for (int k = 0; k < 4; ++k) {
+    const uint x = uint((x0 + (k & 1) + int(w)) % int(w));
+    const uint y = uint(clamp(y0 + (k >> 1), 0, int(h) - 1));
+    c[k] = nightSkyDecodeRgb9e5(NightSkyMilkyWay[y * w + x]);
+  }
+  return lerp(lerp(c[0], c[1], f.x), lerp(c[2], c[3], f.x), f.y);
+}
+
+// Relative air mass toward a direction of local elevation sine `mu` (Kasten & Young 1989).
+float nightSkyAirMass(float mu) {
+  const float zenithDeg = degrees(acos(clamp(mu, 0.0f, 1.0f)));
+  return 1.0f / (max(mu, 0.0f) + 0.50572f * pow(max(96.07995f - zenithDeg, 1e-3f), -1.6364f));
+}
+
+// The catalogue stars toward viewDirYUp (radiance, x 1/kNightSkyAssetScale of the sun), drawn as
+// Gaussian footprints at least a pixel wide (args.skyPixelAngle) - no star ever falls between pixels
+// or crawls as the view turns - plus a faint wide wing that makes bright stars look bigger, as any eye
+// or lens does. Both integrate to the star's illuminance. Scintillation: relative intensity
+// fluctuations sigma_I ~ 0.1 X^1.75 (Young 1967), with a per-star phase, and chromatic near the
+// horizon where the air's dispersion splits the colours.
+vec3 evalNightSkyStars(vec3 viewDirYUp, AtmosphereArgs args) {
+  const vec3 e = nightSkyLocalToEquatorial(viewDirYUp, args);
+  const uint cell = nightSkyStarCell(e, args.starCellsPerFace);
+  const uint begin = NightSkyStarCells[cell];
+  const uint end = NightSkyStarCells[cell + 1u];
+
+  // The footprint: half a pixel, at least ~1 arcmin of seeing, and never wider than the cell margin
+  // the catalogue was binned with (0.35 deg = 3.5 sigma at 1.75 mrad).
+  const float sigma = clamp(0.5f * args.skyPixelAngle, 2.9e-4f, 1.75e-3f);
+  const float invTwoSigma2 = 1.0f / (2.0f * sigma * sigma);
+  const float sigmaWing = min(4.0f * sigma, 1.75e-3f);
+  const float invTwoSigmaWing2 = 1.0f / (2.0f * sigmaWing * sigmaWing);
+  const float kWing = 0.04f;
+  const float core = (1.0f - kWing) / (2.0f * kPi * sigma * sigma);
+  const float wing = kWing / (2.0f * kPi * sigmaWing * sigmaWing);
+
+  // Scintillation strength for this direction (the stars in one cell share their air mass).
+  const float airMass = nightSkyAirMass(viewDirYUp.y);
+  const float scint = min(0.1f * args.starScintillation * pow(airMass, 1.75f), 0.6f);
+  const vec3 chroma = vec3(0.12f, 0.0f, -0.12f) * saturate((airMass - 2.0f) * 0.1f);
+
+  vec3 sum = vec3(0.0f);
+  for (uint i = begin; i < end; ++i) {
+    const vec4 a = NightSkyStars[2u * i];
+    const vec4 b = NightSkyStars[2u * i + 1u];
+    const vec3 d = e - a.xyz;
+    const float theta2 = dot(d, d);  // chord^2 = theta^2 for small angles
+    const float psf = core * exp(-theta2 * invTwoSigma2) + wing * exp(-theta2 * invTwoSigmaWing2);
+    if (psf < 1e-3f * core) {
+      continue;
+    }
+    vec3 twinkle = vec3(1.0f);
+    if (scint > 0.0f) {
+      const float phase = b.w * 6.2831853f;
+      const float f1 = 3.0f + 4.0f * b.w, f2 = 7.3f + 5.0f * frac(b.w * 7.13f);
+      const vec3 t = args.timeSeconds + chroma;
+      twinkle = max(vec3(1.0f) + scint * 1.4f
+                    * (0.6f * sin(6.2831853f * f1 * t + phase) + 0.4f * sin(6.2831853f * f2 * t + 2.3f * phase)),
+                    vec3(0.0f));
+    }
+    sum += b.xyz * (psf * twinkle);
+  }
+  return sum;
+}
+
+// Everything beyond the air toward viewDirYUp that the sky-view LUT does not already hold, in
+// physical (pre-exposed) radiance outside the atmosphere: catalogue stars + background - the
+// LUT's blurred share. The caller applies the air's transmittance.
+vec3 evalNightSkyBeyondAir(vec3 viewDirYUp, AtmosphereArgs args, SamplerState s) {
+  if ((args.nightSkyFlags & 3u) != 3u) {
+    return vec3(0.0f);
+  }
+  const vec3 e = nightSkyLocalToEquatorial(viewDirYUp, args);
+  vec3 r = evalNightSkyStars(viewDirYUp, args) + sampleNightSkyMilkyWay(e, args)
+         - sampleNightSkyStarlightLow(e, NightSkyStarlightLow, s);
+  return r * args.sunIlluminance * (args.nightSkyGain / kNightSkyAssetScale);  // night gain
+}
+
+#endif // NIGHT_SKY_AVAILABLE

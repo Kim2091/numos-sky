@@ -1,0 +1,57 @@
+// Copyright 2026 Kim2091 (Sparkles)
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+// Parallel front-to-back integration of an aerial perspective column.
+//
+// The far LUT builds each slice from its predecessor plus one segment. One thread per direction is
+// only 8192 serial threads, latency-bound on their LUT taps, so a group owns a column instead: each
+// lane integrates a contiguous chunk of slices from an empty segment (in-scatter 0, transmittance
+// 1), a scan in group-shared memory composites the chunk totals in lane order, and every slice's
+// result is its chunk's prefix composited with the slice's own partial sum. Compositing segment a
+// then b is (I_a + T_a I_b, T_a T_b), which is associative, so the result equals the serial march up
+// to float rounding. The froxel integration has 32k columns, enough threads already, and stays
+// serial (a scan made it 25-180% slower).
+
+// Lanes per column: the including pass may set it (a power of two) before the include.
+#ifndef AP_SCAN_LANES
+#define AP_SCAN_LANES 64u
+#endif
+#ifndef AP_SCAN_MAX_CHUNK
+#define AP_SCAN_MAX_CHUNK (256u / AP_SCAN_LANES)  // 256 slices, the froxel grid's maximum
+#endif
+
+groupshared vec3 gs_apScanInScatter[AP_SCAN_LANES];
+groupshared vec3 gs_apScanTransmittance[AP_SCAN_LANES];
+
+// Slices per lane for a column of `slices` slices (at most AP_SCAN_LANES * AP_SCAN_MAX_CHUNK).
+uint apScanChunk(uint slices) {
+  return (slices + AP_SCAN_LANES - 1u) / AP_SCAN_LANES;
+}
+
+// The composite of every earlier lane's segment (exclusive prefix). Every lane of the group must
+// call it.
+void apScanExclusive(uint lane, vec3 inScatter, vec3 transmittance,
+                     out vec3 prefixInScatter, out vec3 prefixTransmittance) {
+  gs_apScanInScatter[lane] = inScatter;
+  gs_apScanTransmittance[lane] = transmittance;
+  GroupMemoryBarrierWithGroupSync();
+  [unroll]
+  for (uint offset = 1u; offset < AP_SCAN_LANES; offset <<= 1u) {
+    vec3 i = gs_apScanInScatter[lane];
+    vec3 t = gs_apScanTransmittance[lane];
+    if (lane >= offset) {
+      const vec3 earlierI = gs_apScanInScatter[lane - offset];
+      const vec3 earlierT = gs_apScanTransmittance[lane - offset];
+      i = earlierI + earlierT * i;
+      t = earlierT * t;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    gs_apScanInScatter[lane] = i;
+    gs_apScanTransmittance[lane] = t;
+    GroupMemoryBarrierWithGroupSync();
+  }
+  prefixInScatter = lane > 0u ? gs_apScanInScatter[lane - 1u] : vec3(0.0f);
+  prefixTransmittance = lane > 0u ? gs_apScanTransmittance[lane - 1u] : vec3(1.0f);
+}

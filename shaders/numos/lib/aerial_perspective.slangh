@@ -1,0 +1,379 @@
+// Copyright 2026 Kim2091 (Sparkles)
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+// Aerial perspective v2 (docs/aerial-perspective-v2.md): the shared half of the near-field froxel
+// grid, the far-field LUT and the analytic height fog. Included by the three aerial perspective
+// passes and by the host shader API, so it binds nothing itself; every texture is a parameter.
+//
+// Frames and units:
+//   * world units, render space: positions, the froxel grid, scene rays (the host's TLAS lives here);
+//   * haze km (numosWorldToAirKm, args.apWorldUnitsPerKm from rtx.atmosphere.hazeWorldScale): every
+//     distance the media, the fog and the local-light glow are integrated over, the far field's
+//     slices, and the atmosphere's Y-up frame with the camera at the origin, at
+//     args.apCameraAltitudeKm above the datum.
+// The grid and the rays stay in world units because the scene is traced there; every length leaves
+// world units through numosWorldToAirKm before it meets a coefficient. Cloud shadow lookups convert
+// world positions with the clouds' own scale (numosWorldToCloudKm).
+
+#include "numos/util/camera.slangh"
+#include "numos/lib/atmosphere_common.slangh"
+
+// ============================================================================
+// Slice distributions
+// ============================================================================
+// Both fields put slice w at d * ((1 + range / d)^w - 1): linear for distances below d, exponential
+// past it, so slices are thin at the camera and each later one is a fixed fraction deeper than the
+// last. A pure exponential would spend most of its slices in the first metre; a pure linear one
+// would leave the near field with a single slice.
+
+float apFroxelSliceToDepth(float w, AtmosphereArgs args) {
+  return args.apFroxelLinearDepth * (exp(saturate(w) * args.apFroxelLogScale) - 1.0f);
+}
+
+float apFroxelDepthToSlice(float forwardDistance, AtmosphereArgs args) {
+  return log(1.0f + max(forwardDistance, 0.0f) / max(args.apFroxelLinearDepth, 1e-6f))
+       / max(args.apFroxelLogScale, 1e-6f);
+}
+
+float apFarSliceToKm(float w, AtmosphereArgs args) {
+  return args.apFarLinearDepthKm * (exp(saturate(w) * args.apFarLogScale) - 1.0f);
+}
+
+float apFarKmToSlice(float km, AtmosphereArgs args) {
+  return log(1.0f + max(km, 0.0f) / max(args.apFarLinearDepthKm, 1e-6f)) / max(args.apFarLogScale, 1e-6f);
+}
+
+// Texture W coordinate and identity blend for a cumulative volume whose slice k holds the integral
+// out to the FAR edge of slice k. Inside the first slice the value is blended toward the identity
+// (no in-scatter, full transmittance) instead of being held at the first slice's value.
+vec2 apCumulativeSliceCoord(float w, uint slices) {
+  const float n = float(max(slices, 1u));
+  const float coord = clamp(w - 0.5f / n, 0.5f / n, 1.0f - 0.5f / n);
+  return vec2(coord, saturate(w * n));
+}
+
+// ============================================================================
+// Froxel geometry
+// ============================================================================
+
+// World-space ray through a screen UV, scaled so its forward (view Z) component is one: multiplying
+// it by a forward distance lands exactly on that depth plane. Unjittered, like the volume itself.
+vec3 apFroxelRayVector(vec2 screenUv, Camera camera) {
+  const CameraDirections ray = cameraScreenUVToDirection(camera, screenUv, false);
+  return ray.worldDirection / max(abs(ray.viewDirection.z), 1e-6f);
+}
+
+// Centre of a froxel in world space. The host uses this (and numosFroxelViewDirection) to write the
+// local-light injection volume; the passes use it for reprojection.
+vec3 apFroxelCenterWorld(uint3 froxel, Camera camera, AtmosphereArgs args) {
+  const vec2 uv = (vec2(froxel.xy) + 0.5f) / vec2(args.apFroxelSizeX, args.apFroxelSizeY);
+  const float w = (float(froxel.z) + 0.5f) / float(max(args.apFroxelSlices, 1u));
+  return args.cameraPosition + apFroxelRayVector(uv, camera) * apFroxelSliceToDepth(w, args);
+}
+
+float apForwardDistance(vec3 viewPosition, Camera camera) {
+  return (camera.flags & rightHandedFlag) != 0u ? -viewPosition.z : viewPosition.z;
+}
+
+// World position -> froxel UVW through the given view and projection. False behind the camera or
+// outside the grid.
+bool apWorldToFroxelUvw(vec3 worldPos, mat4 worldToView, mat4 worldToProjection, Camera camera,
+                        AtmosphereArgs args, out vec3 uvw) {
+  uvw = vec3(0.0f);
+  const vec3 viewPosition = mul(worldToView, vec4(worldPos, 1.0f)).xyz;
+  const float forward = apForwardDistance(viewPosition, camera);
+  const vec4 clip = mul(worldToProjection, vec4(worldPos, 1.0f));
+  if (!(forward > 0.0f) || !(clip.w > 0.0f)) {
+    return false;
+  }
+  uvw = vec3(cameraNDCToScreenUV(camera, clip.xy / clip.w), apFroxelDepthToSlice(forward, args));
+  return all(uvw >= vec3(0.0f)) && all(uvw <= vec3(1.0f));
+}
+
+bool apWorldToCurrentFroxelUvw(vec3 worldPos, Camera camera, AtmosphereArgs args, out vec3 uvw) {
+  const mat4 worldToProjection = mul(camera.viewToProjection, camera.worldToView);
+  return apWorldToFroxelUvw(worldPos, camera.worldToView, worldToProjection, camera, args, uvw);
+}
+
+bool apWorldToPreviousFroxelUvw(vec3 worldPos, Camera camera, AtmosphereArgs args, out vec3 uvw) {
+  return apWorldToFroxelUvw(worldPos, camera.prevWorldToView, camera.prevWorldToProjection, camera, args, uvw);
+}
+
+// ============================================================================
+// Medium
+// ============================================================================
+
+float apFogExtinctionAt(float altitudePhysKm, AtmosphereArgs args) {
+  if (!(args.fogExtinctionPerKm > 0.0f)) {
+    return 0.0f;
+  }
+  // Clamped below the base so a camera far under the base cannot overflow the exponential.
+  const float x = max(altitudePhysKm - args.fogBaseAltitudeKm, -10.0f * args.fogScaleHeightKm);
+  return args.fogExtinctionPerKm * exp(-x / max(args.fogScaleHeightKm, 1e-4f));
+}
+
+// The ground-fog clear zone (fogNearFadeKm): 0 at the camera, 1 from fogNearFadeKm on.
+float apFogNearFade(float distanceKm, AtmosphereArgs args) {
+  return args.fogNearFadeKm > 0.0f ? smoothstep(0.0f, args.fogNearFadeKm, distanceKm) : 1.0f;
+}
+
+// Everything the integrands need about the medium at one world position.
+struct ApMediumSample {
+  AtmosphereMedium atmosphere;  // per km
+  float fogExtinction;          // per km
+  float fogScattering;
+  float altitudeKm;             // atmosphere altitude
+  vec3  hazePosition;           // atmosphere Y-up frame, km, camera at the origin
+};
+
+ApMediumSample apSampleMedium(vec3 worldPos, AtmosphereArgs args) {
+  const vec3 rel = numosWorldToAirKmYUp(worldPos - args.cameraPosition, args);
+  ApMediumSample m;
+  m.hazePosition = rel;
+  m.altitudeKm = clamp(length(m.hazePosition - getAirPlanetCenter(args)) - args.planetRadius,
+                       0.0f, args.atmosphereThickness);
+  m.atmosphere = sampleAtmosphereMedium(m.altitudeKm, args);
+  // Flat-earth fog height: within the froxel range the curvature drop is metres.
+  const float fogAltitude = args.apCameraAltitudeKm + rel.y;
+  m.fogExtinction = apFogExtinctionAt(fogAltitude, args) * apFogNearFade(length(rel), args);
+  m.fogScattering = m.fogExtinction * args.fogAlbedo;
+  return m;
+}
+
+struct ApPhase {
+  float rayleigh;
+  float mie;
+  float fog;
+};
+
+// cosTheta between the view ray (pointing away from the camera) and the direction TO the light.
+ApPhase apPhase(float cosTheta, AtmosphereArgs args) {
+  ApPhase p;
+  p.rayleigh = rayleighPhase(cosTheta);
+  // Capped anisotropy, both fields: the air in front of a surface hiding the sun sits in that
+  // surface's shadow, which is exactly where an uncapped forward lobe would be brightest.
+  p.mie = hgPhase(cosTheta, min(args.mieAnisotropy, args.aerialPerspectiveMieAnisotropyMax));
+  p.fog = hgPhase(cosTheta, args.fogAnisotropy);
+  return p;
+}
+
+// ============================================================================
+// Cloud-shadow hook
+// ============================================================================
+// The only place either field asks about clouds. Within the cloud shadow map's cascades
+// (lib/cloud_shadow_map.slangh, the same map the ground shadows read) the answer is exact; beyond
+// the outermost window the map knows nothing, so samples there fade to a coverage-based mean.
+
+float apCloudShadowMean(AtmosphereArgs args) {
+  if (args.cloudVoxelShadowsEnable == 0u || args.cloudEnabled < 0.5f || args.cloudCoverageMean < 0.01f) {
+    return 1.0f;
+  }
+  return lerp(1.0f, 1.0f - saturate(args.cloudCoverageMean), args.cloudShadowStrength);
+}
+
+float apCloudSunTransmittance(vec3 worldPos, AtmosphereArgs args, Texture3D<float2> cloudShadowMap,
+                              SamplerState cloudSampler) {
+  if (args.cloudVoxelShadowsEnable == 0u) {
+    return 1.0f;
+  }
+  const float mean = apCloudShadowMean(args);
+  if (args.cloudShadowLive == 0u) {
+    return mean;
+  }
+  const bool isZUp = args.isZUp != 0u;
+  const bool flip = args.flipUpAxis != 0u;
+  const vec3 posKm = numosWorldToCloudKm(worldPos, args);
+  const CloudShadowLookup lookup = cloudShadowLookup(posKm, 0u, args);
+  const float valid = saturate(lookup.weight0 + lookup.weight1);
+  if (valid <= 0.0f) {
+    return mean;
+  }
+  const vec3 sunDirWorld = normalize(atmosphereYUpToWorld(normalize(args.sunDirection), isZUp, flip));
+  const float exact = sampleCloudGroundShadowFromMap(worldPos, sunDirWorld, args, isZUp, cloudShadowMap, cloudSampler);
+  return lerp(mean, exact, valid);
+}
+
+// ============================================================================
+// Segment integration (shared by the near field, the far field and the path tracer API)
+// ============================================================================
+// One segment of `lengthWorld` around `worldPos`, lit by:
+//   sunVisibility / skyVisibility: scene visibility of the sun and the sky (1 = unoccluded);
+//   cloudSunT: cloud transmittance toward the sun (apCloudSunTransmittance);
+//   localRadiance: local-light in-scatter per unit scattering coefficient (phase applied).
+// Energy-conserving: the segment's source is integrated against its own extinction (Hillaire 2015,
+// Eq. 17).
+void apIntegrateSegment(vec3 worldPos, vec3 viewDirYUp, float lengthWorld, bool includeNearMedia,
+                        float sunVisibility, float skyVisibility, float cloudSunT, vec3 localRadiance,
+                        AtmosphereArgs args, Texture2D<float4> transmittanceLut,
+                        Texture2D<float4> multiscatteringLut, SamplerState lutSampler,
+                        inout vec3 inScatter, inout vec3 transmittance) {
+  if (!(lengthWorld > 0.0f)) {
+    return;
+  }
+  ApMediumSample m = apSampleMedium(worldPos, args);
+  if (!includeNearMedia) {
+    m.fogExtinction = 0.0f;
+    m.fogScattering = 0.0f;
+  }
+  const vec3 sunDir = normalize(args.sunDirection);
+  const ApPhase phase = apPhase(dot(viewDirYUp, sunDir), args);
+
+  // Sun single scattering: atmosphere transmittance and planet shadow, clouds, scene. Every higher
+  // order arrives through Psi_ms (Hillaire 2020, Eq. 10), gated by how much sky the point sees: the
+  // paper drops that visibility for open landscapes, but indoors it is the whole answer.
+  const vec3 sunLight = evalSunShadowingClampedToSurface(numosAirToSkyFrame(m.hazePosition, args), sunDir,
+                                                        transmittanceLut, lutSampler, args)
+                      * (cloudSunT * sunVisibility);
+  const vec3 up = normalize(m.hazePosition - getAirPlanetCenter(args));
+  const vec3 multiScatter = sampleMultiscatteringLut(multiscatteringLut, lutSampler, m.altitudeKm, dot(up, sunDir), args)
+                          * (skyVisibility * cloudDeckSkyKeepAt(m.altitudeKm, args));
+
+  const vec3 atmosphereSource = args.sunIlluminance
+    * (sunLight * (m.atmosphere.rayleighScattering * phase.rayleigh + m.atmosphere.mieScattering * phase.mie)
+       + multiScatter * m.atmosphere.scattering);
+  const vec3 fogSource = args.sunIlluminance * m.fogScattering * (sunLight * phase.fog + multiScatter);
+  const vec3 localSource = (m.atmosphere.scattering + m.fogScattering) * localRadiance;
+
+  const float lengthKm = numosWorldToAirKm(lengthWorld, args);
+  const vec3 tau = (m.atmosphere.extinction + m.fogExtinction) * lengthKm;
+  const vec3 source = max((atmosphereSource + fogSource + localSource) * lengthKm, vec3(0.0f));
+  const vec3 segmentT = exp(-tau);
+  // (1 - e^-tau) / tau, with its series where the division loses precision.
+  const vec3 escape = select(tau > vec3(1e-3f), (1.0f - segmentT) / max(tau, vec3(1e-7f)), 1.0f - 0.5f * tau);
+  const vec3 contribution = transmittance * source * escape;
+  if (all(isfinite(contribution))) {
+    inScatter += contribution;
+  }
+  transmittance *= segmentT;
+}
+
+// ============================================================================
+// Analytic transmittance and fog
+// ============================================================================
+
+// Integral of exp(-(h0 + mu x) / H) over x in [0, length]: the column of an exponential layer
+// along a straight segment (flat earth, fine within the froxel range and the fog's reach).
+float apExponentialColumn(float h0, float mu, float length, float scaleHeight) {
+  const float H = max(scaleHeight, 1e-4f);
+  const float a = mu * length / H;
+  const float shape = abs(a) < 1e-3f ? 1.0f - 0.5f * a + a * a / 6.0f : (1.0f - exp(-a)) / a;
+  return length * exp(-max(h0, -30.0f * H) / H) * shape;
+}
+
+// Fog optical depth between two distances along a camera ray (world units). Infinite distances are
+// clamped to 2000 km, past which no fog layer is anything but opaque or empty.
+float apFogOpticalDepth(vec3 viewDirYUp, float startWorld, float endWorld, AtmosphereArgs args) {
+  if (!(args.fogExtinctionPerKm > 0.0f) || !(endWorld > startWorld)) {
+    return 0.0f;
+  }
+  const float endKm = numosWorldToAirKm(endWorld, args);
+  // The clear zone (apFogNearFade) as a later start: a smoothstep ramp over [0, R] holds the fog of
+  // a full-density run starting at R / 2.
+  const float startKm = max(numosWorldToAirKm(startWorld, args), min(0.5f * args.fogNearFadeKm, endKm));
+  const float lengthKm = min(endKm, 2000.0f) - startKm;
+  if (!(lengthKm > 0.0f)) {
+    return 0.0f;
+  }
+  const float h0 = args.apCameraAltitudeKm + viewDirYUp.y * startKm - args.fogBaseAltitudeKm;
+  return args.fogExtinctionPerKm * apExponentialColumn(h0, viewDirYUp.y, lengthKm, args.fogScaleHeightKm);
+}
+
+// RGB transmittance of the near-field media along a camera ray from the volumetrics handoff out to
+// `distanceWorld`. The integration pass integrates the same media numerically; this closed form is
+// what the composite applies to a surface, per pixel and unfiltered.
+vec3 apNearTransmittance(vec3 viewDirYUp, float distanceWorld, AtmosphereArgs args) {
+  const float startWorld = min(args.apStartDistance, distanceWorld);
+  const float lengthKm = numosWorldToAirKm(distanceWorld - startWorld, args);
+  const float mu = viewDirYUp.y;
+  const float h0 = max(args.apCameraAltitudeKm + mu * numosWorldToAirKm(startWorld, args), 0.0f);
+  const vec3 tau = args.rayleighScattering * apExponentialColumn(h0, mu, lengthKm, args.rayleighScaleHeight)
+                 + (args.mieScattering + args.mieAbsorption) * apExponentialColumn(h0, mu, lengthKm, args.mieScaleHeight)
+                 + args.ozoneAbsorption * (ozoneDensity(h0 + 0.5f * mu * lengthKm, args) * lengthKm)
+                 + apFogOpticalDepth(viewDirYUp, startWorld, distanceWorld, args);
+  return exp(-tau);
+}
+
+// Radiance of the lit fog per unit of its own opacity: what a fog column of transmittance T adds in
+// front of whatever is behind it is fogRadiance * (1 - T). Lit at the fog base by the sun (through
+// the atmosphere, the mean cloud shadow and the fog's phase) and by Psi_ms; unshadowed by the scene,
+// because this is the fog beyond the froxel range.
+vec3 apFarFogRadiance(vec3 viewDirYUp, AtmosphereArgs args, Texture2D<float4> transmittanceLut,
+                      Texture2D<float4> multiscatteringLut, SamplerState lutSampler) {
+  if (!(args.fogExtinctionPerKm > 0.0f)) {
+    return vec3(0.0f);
+  }
+  const vec3 sunDir = normalize(args.sunDirection);
+  const float altitude = clamp(args.fogBaseAltitudeKm, 0.0f, args.atmosphereThickness);
+  const vec3 position = vec3(0.0f, altitude - args.cameraAltitudeKm, 0.0f);
+  const vec3 sunLight = evalSunShadowingClampedToSurface(position, sunDir, transmittanceLut, lutSampler, args)
+                      * apCloudShadowMean(args);
+  const vec3 multiScatter = sampleMultiscatteringLut(multiscatteringLut, lutSampler, altitude, sunDir.y, args)
+                          * cloudDeckSkyKeepAt(altitude, args);
+  return args.fogAlbedo * args.sunIlluminance
+       * (sunLight * hgPhase(dot(viewDirYUp, sunDir), args.fogAnisotropy) + multiScatter);
+}
+
+// ============================================================================
+// Far-field LUT
+// ============================================================================
+
+// Same parameterization as the sky-view LUT (sampleSkyViewLutForRay): absolute azimuth, and a
+// square-root latitude that concentrates texels at the horizon.
+vec2 apFarDirectionToUv(vec3 dirYUp) {
+  const float elevation = asin(clamp(dirYUp.y, -1.0f, 1.0f));
+  float azimuth = atan2(dirYUp.z, dirYUp.x);
+  if (azimuth < 0.0f) {
+    azimuth += 2.0f * kPi;
+  }
+  return vec2(azimuth / (2.0f * kPi), sign(elevation) * sqrt(abs(elevation) / (kPi * 0.5f)) * 0.5f + 0.5f);
+}
+
+vec3 apFarUvToDirection(vec2 uv) {
+  const float x = uv.y * 2.0f - 1.0f;
+  const float elevation = sign(x) * x * x * (kPi * 0.5f);
+  const float azimuth = uv.x * 2.0f * kPi;
+  return vec3(cos(elevation) * cos(azimuth), sin(elevation), cos(elevation) * sin(azimuth));
+}
+
+// The far field's U is azimuth like the sky-view LUT's, and the host's sampler clamps: within half a
+// texel of u = 0/1 blend the two edge columns here (sampleAzimuthWrappedLut for a 3D texture).
+vec4 apSampleFarWrapped(Texture3D<float4> lut, SamplerState s, vec3 uvw) {
+  uint width, height, depth;
+  lut.GetDimensions(width, height, depth);
+  const float halfTexel = 0.5f / max(float(width), 1.0f);
+  if (uvw.x >= halfTexel && uvw.x <= 1.0f - halfTexel) {
+    return lut.SampleLevel(s, uvw, 0);
+  }
+  const float t = frac(uvw.x * float(width) - 0.5f + float(width));
+  const vec4 last  = lut.SampleLevel(s, vec3(1.0f - halfTexel, uvw.yz), 0);
+  const vec4 first = lut.SampleLevel(s, vec3(halfTexel, uvw.yz), 0);
+  return lerp(last, first, t);
+}
+
+// Air in-scatter and RGB transmittance between the eye and the point `distanceKm` (km) along a
+// Y-up ray, atmosphere only (planet and cloud shadowed, no scene, no fog). This is the function the
+// cloud march calls per sample; it is valid out to the LUT's range and clamped past it.
+vec3 evalAerialPerspectiveFar(vec3 dirYUp, float distanceKm, AtmosphereArgs args,
+                              Texture3D<float4> farScatter, Texture3D<float4> farTransmittance,
+                              SamplerState lutSampler, out vec3 transmittance) {
+  transmittance = vec3(1.0f);
+  if (args.apFarSlices == 0u) {
+    return vec3(0.0f);
+  }
+  const vec2 slice = apCumulativeSliceCoord(apFarKmToSlice(distanceKm, args), args.apFarSlices);
+  const vec3 uvw = vec3(apFarDirectionToUv(dirYUp), slice.x);
+  transmittance = lerp(vec3(1.0f), saturate(apSampleFarWrapped(farTransmittance, lutSampler, uvw).rgb), slice.y);
+  return max(apSampleFarWrapped(farScatter, lutSampler, uvw).rgb, vec3(0.0f)) * slice.y;
+}
+
+// Near-field cumulative in-scatter at a forward distance through a screen UV. A holds the mean
+// transmittance of the same column (diagnostics; the composite uses apNearTransmittance).
+vec4 apSampleNear(Texture3D<float4> nearScatter, SamplerState volumeSampler, vec2 screenUv,
+                  float forwardDistance, AtmosphereArgs args) {
+  const vec2 slice = apCumulativeSliceCoord(apFroxelDepthToSlice(min(forwardDistance, args.apFroxelRange), args),
+                                            args.apFroxelSlices);
+  const vec4 v = nearScatter.SampleLevel(volumeSampler, vec3(screenUv, slice.x), 0);
+  return vec4(max(v.rgb, vec3(0.0f)) * slice.y, lerp(1.0f, v.a, slice.y));
+}

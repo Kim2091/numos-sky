@@ -1,0 +1,29 @@
+// Copyright 2026 Kim2091 (Sparkles)
+// Portions Copyright (c) 2025 CattaRappa (sambow23)
+// SPDX-License-Identifier: Apache-2.0 AND MIT
+// The portions are under the MIT licence (licenses/LICENSE-MIT-contributors.txt);
+// see THIRD_PARTY_NOTICES.md.
+
+#pragma once
+
+#include "numos/util/common_binding_indices.h"
+
+// The atmosphere LUTs at the shared binding slots, for passes that read the sky.
+layout(binding = BINDING_ATMOSPHERE_TRANSMITTANCE_LUT)
+Texture2D AtmosphereTransmittanceLut;
+// Tells atmosphere_common.slangh that AtmosphereTransmittanceLut is bound. Passes that do not
+// include this file declare the LUT themselves (cloud_render) or go without it (the LUT bakes).
+#define ATMOSPHERE_TRANSMITTANCE_LUT_AVAILABLE
+
+layout(binding = BINDING_ATMOSPHERE_MULTISCATTERING_LUT)
+Texture2D AtmosphereMultiscatteringLut;
+
+layout(binding = BINDING_ATMOSPHERE_SKY_VIEW_LUT)
+Texture2D AtmosphereSkyViewLut;
+
+// Linear, clamped sampler for the sky LUTs. Azimuth wraps in the shader (sampleAzimuthWrappedLut).
+layout(binding = BINDING_ATMOSPHERE_SKY_VIEW_SAMPLER)
+SamplerState AtmosphereSkyViewSampler;
+
+layout(binding = BINDING_ATMOSPHERE_CLOUD_NOISE_SAMPLER)
+SamplerState AtmosphereCloudNoise3DSampler;

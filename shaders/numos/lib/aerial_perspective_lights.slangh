@@ -1,0 +1,183 @@
+// Copyright 2026 Kim2091 (Sparkles)
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+// Local light in-scatter for the aerial perspective's froxel grid (docs/aerial-perspective-v2.md).
+//
+// The atmosphere's own in-scatter is the sun and the multiply-scattered sky. Everything an interior
+// or a night street contains - lamps, torches, muzzle flashes - scatters in the same air and fog,
+// and this is what lets the froxel grid stand in for a host's volumetric lighting. The structure is
+// clustered shading applied to a volume: the cull pass bins lights into the froxel grid coarsened to
+// AERIAL_PERSPECTIVE_LIGHT_TILE_SIZE froxels, and the lighting pass picks one light per froxel per
+// frame from its cluster by RIS, so the cost is set by local light density, not the scene's count.
+
+#include "numos/lib/aerial_perspective.slangh"
+#include "numos/lib/aerial_perspective_light.h"
+
+// Clusters are indexed [slice][tileY][tileX], so one screen tile's depth column is strided by a
+// whole slice of tiles.
+uint aerialPerspectiveLightClusterOffset(uint2 tile, uint slice, AtmosphereArgs args) {
+  const uint cluster = (slice * args.apLocalLightTilesY + tile.y) * args.apLocalLightTilesX + tile.x;
+  return cluster * AERIAL_PERSPECTIVE_LIGHT_CLUSTER_STRIDE;
+}
+
+// Per-screen-tile list over the whole froxel range, stored after the per-slice clusters.
+uint apLightTileOffset(uint2 tile, AtmosphereArgs args) {
+  const uint perSlice = args.apLocalLightTilesX * args.apLocalLightTilesY;
+  return (perSlice * args.apFroxelSlices + tile.y * args.apLocalLightTilesX + tile.x) * AERIAL_PERSPECTIVE_LIGHT_CLUSTER_STRIDE;
+}
+
+// Fraction of this light's radiance that leaves it toward `lightToPointDirection`.
+//
+// Matches the radial falloff of Remix's light shaping, without its rectangular-cone aspect scaling
+// (a host constant-buffer switch this library cannot see). Spot cones, which are what draw visible
+// shafts in a volume, are exact.
+float aerialPerspectiveLightShaping(AerialPerspectiveLight light, vec3 lightToPointDirection) {
+  // A zero axis is the unshaped marker; the CPU side writes it for every light with no shaping.
+  if (all(light.coneAxis == vec3(0.0f))) {
+    return 1.0f;
+  }
+
+  const float cosTheta = dot(light.coneAxis, lightToPointDirection);
+  if (cosTheta < light.cosConeAngle) {
+    return 0.0f;
+  }
+
+  const float softened = smoothstep(light.cosConeAngle, light.cosConeAngle + light.coneSoftness, cosTheta);
+  if (light.focusExponent <= 0.0f) {
+    return softened;
+  }
+
+  const float focused = pow(max(cosTheta, 0.0f), light.focusExponent);
+  return lerp(softened, 1.0f, focused * softened);
+}
+
+// Phase weights of the medium's components at a point, normalised by its total scattering
+// coefficient. The froxel grid stores local-light in-scatter per unit scattering coefficient, so the
+// phase it is weighted with must be the mixture the integration's sigma_s multiplies back in.
+struct ApPhaseMix {
+  float rayleigh;
+  float mie;
+  float fog;
+};
+
+ApPhaseMix apPhaseMixAt(ApMediumSample m) {
+  const float rayleigh = dot(m.atmosphere.rayleighScattering, vec3(1.0f / 3.0f));
+  const float mie = dot(m.atmosphere.mieScattering, vec3(1.0f / 3.0f));
+  const float total = max(rayleigh + mie + m.fogScattering, 1e-12f);
+  ApPhaseMix mix;
+  mix.rayleigh = rayleigh / total;
+  mix.mie = mie / total;
+  mix.fog = m.fogScattering / total;
+  return mix;
+}
+
+// Incident radiance from one light, phase-weighted toward the camera, per unit scattering
+// coefficient, at a point of the grid. `viewDirWorld` points away from the camera.
+//
+// The emitter is integrated as a sphere: a volume point has no normal, so all that survives of an
+// area light's shape is its solid angle, 2 pi (1 - sqrt(1 - (r/d)^2)), which saturates at a
+// hemisphere on the surface instead of diverging like a point light's inverse square.
+vec3 aerialPerspectiveLightRadiance(AerialPerspectiveLight light, vec3 worldPosition, vec3 viewDirWorld,
+                                    ApPhaseMix phaseMix, AtmosphereArgs args) {
+  const vec3 toLight = light.position - worldPosition;
+  const float distanceSq = dot(toLight, toLight);
+
+  // A cluster is a bound, not an exact reach: the far corner of a cluster a light touches may still
+  // be out of its range.
+  if (distanceSq > light.influenceRadius * light.influenceRadius) {
+    return vec3(0.0f);
+  }
+
+  const float distance = sqrt(max(distanceSq, 1e-12f));
+  const vec3 directionToLight = toLight / distance;
+
+  // Optional range window, (1 - (d/R)^2)^2: a game light's sphere has no range of its own, so its
+  // glow would otherwise run on as 1/d^2 and stop dead at the cull radius.
+  float window = 1.0f;
+  if (light.falloffWindow > 0.0f) {
+    const float x = saturate(distanceSq / max(light.influenceRadius * light.influenceRadius, 1e-8f));
+    window = (1.0f - x) * (1.0f - x);
+  }
+
+  const float shaping = aerialPerspectiveLightShaping(light, -directionToLight);
+  if (shaping <= 0.0f) {
+    return vec3(0.0f);
+  }
+
+  const float radius = max(light.equivalentRadius, 1e-4f);
+  const float sinThetaSq = saturate(radius * radius / max(distanceSq, radius * radius));
+  const float solidAngle = 2.0f * kPi * (1.0f - sqrt(max(0.0f, 1.0f - sinThetaSq)));
+
+  const ApPhase phase = apPhase(dot(viewDirWorld, directionToLight), args);
+  const float phaseWeight = phaseMix.rayleigh * phase.rayleigh + phaseMix.mie * phase.mie + phaseMix.fog * phase.fog;
+
+  return light.radiance * (solidAngle * shaping * window * phaseWeight);
+}
+
+// Single-scattered local-light radiance reaching the camera along one pixel's ray, between view-ray
+// distances `startWorld` and `endWorld`, evaluated per pixel so the glow's falloff never passes
+// through the froxel grid.
+//
+// Per light, equiangular quadrature (Kulla & Fajardo 2012): with t = t0 + h tan(theta) around the
+// ray's closest approach t0 at distance h, the 1/d^2 falloff cancels the Jacobian and the integrand
+// in theta is smooth, so a few taps are near exact however close the ray passes the lamp. Each tap
+// evaluates the real medium, phase, shaping, transmittance from the camera, and the froxel grid's
+// local-light visibility (the only low-frequency, grid-resolution input). Midpoint taps, not
+// jittered ones: the theta integrand is smooth enough that fixed taps show no banding, and a
+// per-pixel jitter only added noise.
+static const uint kApAirlightTaps = 8u;
+
+vec3 apLocalLightAirlight(StructuredBuffer<AerialPerspectiveLight> lights, StructuredBuffer<uint> clusters,
+                          Texture3D<float4> froxelAux, SamplerState volumeSampler, AtmosphereArgs args,
+                          vec2 screenUv, vec3 dirWorld, float forwardPerDistance,
+                          float startWorld, float endWorld) {
+  vec3 total = vec3(0.0f);
+  if (args.apLocalLightCount == 0u || !(endWorld > startWorld)) {
+    return total;
+  }
+  const uint2 tile = min(uint2(screenUv * vec2(args.apFroxelSizeX, args.apFroxelSizeY)) / AERIAL_PERSPECTIVE_LIGHT_TILE_SIZE,
+                         uint2(args.apLocalLightTilesX, args.apLocalLightTilesY) - 1u);
+  const uint offset = apLightTileOffset(tile, args);
+  const uint count = min(clusters[offset], AERIAL_PERSPECTIVE_MAX_LIGHTS_PER_CLUSTER);
+  const vec3 dirYUp = normalize(worldToAtmosphereYUp(dirWorld, args.isZUp != 0u, args.flipUpAxis != 0u));
+
+  for (uint slot = 0u; slot < count; ++slot) {
+    const AerialPerspectiveLight light = lights[clusters[offset + 1u + slot]];
+    const vec3 toLight = light.position - args.cameraPosition;
+    const float t0 = dot(toLight, dirWorld);
+    // Any h > 0 is a valid change of variables; the emitter radius keeps it well conditioned for a
+    // ray straight through the lamp.
+    const float h = max(length(toLight - dirWorld * t0), max(light.equivalentRadius, 1e-4f));
+    const float a = max(startWorld, t0 - light.influenceRadius);
+    const float b = min(endWorld, t0 + light.influenceRadius);
+    if (!(b > a)) {
+      continue;
+    }
+    const float thetaA = atan((a - t0) / h);
+    const float thetaB = atan((b - t0) / h);
+    const float dTheta = (thetaB - thetaA) / float(kApAirlightTaps);
+    vec3 sum = vec3(0.0f);
+    for (uint i = 0u; i < kApAirlightTaps; ++i) {
+      const float theta = thetaA + (float(i) + 0.5f) * dTheta;
+      const float cosTheta = cos(theta);
+      const float t = t0 + h * tan(theta);
+      const vec3 p = args.cameraPosition + dirWorld * t;
+      const ApMediumSample m = apSampleMedium(p, args);
+      const vec3 radiance = aerialPerspectiveLightRadiance(light, p, dirWorld, apPhaseMixAt(m), args);
+      if (all(radiance == vec3(0.0f))) {
+        continue;
+      }
+      const float visibility = froxelAux.SampleLevel(volumeSampler,
+        vec3(screenUv, apFroxelDepthToSlice(t * forwardPerDistance, args)), 0).b;
+      const float lengthKm = numosWorldToAirKm(h / (cosTheta * cosTheta) * dTheta, args);
+      sum += radiance * (m.atmosphere.scattering + m.fogScattering) * apNearTransmittance(dirYUp, t, args)
+           * (visibility * lengthKm);
+    }
+    if (all(isfinite(sum))) {
+      total += sum;
+    }
+  }
+  return total * args.apLocalLightIntensity;
+}

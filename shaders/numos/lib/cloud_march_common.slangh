@@ -1,0 +1,1925 @@
+// Copyright 2026 Kim2091 (Sparkles)
+// SPDX-License-Identifier: Apache-2.0
+
+// Cloud view march, shared by the screen pass (cloud_render.comp.slang) and the secondary-ray cloud
+// LUT bake (cloud_secondary_lut.comp.slang), so both run the same march and Nubis Cubed shading.
+//
+//   * CloudShadeContext and buildCloudShadeContext: the per-frame shading state (key light and sky
+//     precomputes). Every input is pixel-independent, so it is built from the constant buffer.
+//   * marchCloudSlab and marchCloudLayers: the per-slab raymarch, and the ordering of every crossing
+//     of layer 1 and the optional layer 2 (CloudSlab). tMinClamp and tMaxClamp clamp the marched
+//     segment to camera distances [tMinClamp, tMaxClamp]; 0 disables either clamp. The screen pass
+//     clamps at the primary surface; the LUT bake passes 0/0.
+//   * marchCloudLayers also returns entryDistanceKm (the nearest distance at which either layer
+//     found cloud, -1 if neither did) and meanCloudDepthKm (the transmittance-weighted mean distance
+//     through that cloud), both in km, for the screen pass's depth companion.
+//
+// The dome mapping shared by the LUT bake and its sampler (cloudDomeUvToDir / cloudDomeDirToUv)
+// lives in atmosphere_common.slangh, because the sampling side (atmosphere_sky.slangh) does not
+// include this header.
+//
+// Include after atmosphere_common.slangh, in a pass that declares the texture globals the helpers
+// use (AtmosphereCloudNoise3DSampler, AtmosphereSkyViewLut, AtmosphereSkyViewSampler and the
+// cloud textures).
+
+// Lightning flash gate. The in-cloud flash is a per-frame effect, so only the screen pass (which
+// defines CLOUD_MARCH_LIGHTNING to 1 before including) evaluates it. The secondary-ray cloud LUT
+// persists across frames, and a flash baked into it would linger in reflections. The default of 0
+// keeps every other includer flash-free.
+
+#ifndef CLOUD_LIGHT_DEBUG
+#define CLOUD_LIGHT_DEBUG 0
+#endif
+
+#ifndef CLOUD_MARCH_LIGHTNING
+#define CLOUD_MARCH_LIGHTNING 0
+#endif
+
+// The NVDF density samplers (sampleCloudDensityNubis3, valueErosion).
+#include "numos/lib/cloud_nubis3_common.slangh"
+
+// ===========================================================================
+// Nubis Cubed lighting (Schneider 2023, pp. 137 and 142). Only the cloud passes compile this
+// header, so lighting changes do not recompile the path tracer. The modeling inputs (the NVDF
+// profile, the live SDF and the light paths' optical depths) are parameters.
+// ===========================================================================
+
+// Henyey-Greenstein phase with the paper's max(denom, 1e-5) guard. hgPhase() in
+// atmosphere_common.slangh clamps g instead of the denominator; both are kept so other call sites
+// keep their results.
+float hgPhaseNubis(float cosTheta, float g) {
+  float g2 = g * g;
+  float denom = 1.0f + g2 - 2.0f * g * cosTheta;
+  return (1.0f - g2) / (4.0f * kPi * pow(max(denom, 1e-5f), 1.5f));
+}
+
+// =============================================================================
+// Shading state shared by both layer marches and both march passes. Two halves:
+//   * frame-constant: derived from the constant buffer alone (buildCloudShadeContext);
+//   * ray-constant: also depends on the view direction (cloudShadeContextBeginRay): the key
+//     light's phase-octave sums and the aerial perspective along the ray.
+// =============================================================================
+struct CloudShadeContext {
+  // ---- Frame-constant ----
+  vec3  sunDirYUp;
+  vec3  sunRadiance;         // sun at the eye; fallback for passes without the transmittance LUT
+  vec3  skyRadianceDown;     // upper-hemisphere sky irradiance / pi
+  vec3  skyHorizonSunward;      // mean sky radiance just above the horizon, sun's half
+  vec3  skyHorizonAntiSunward;  // ... the far half
+  vec3  sunHorizontalDir;       // unit horizontal direction toward the sun's azimuth
+  uint  msOctaveCount;
+  // The planet centre in the two frames the march needs.
+  vec3  planetCenterKm;      // getCloudPlanetCenter(args): camera-relative. Shell/planet intersections.
+  vec3  planetCenterWorldKm; // getCloudPlanetCenterWorldKm(args): world-anchored. Height fractions,
+                             // which travel with the world-anchored density fields.
+  float planetRadiusKm;      // args.planetRadius. The atmosphere's radius, not a cloud-only one.
+
+  // ---- Ray-constant (cloudShadeContextBeginRay) ----
+  float sunCosTheta;         // dot(viewDirYUp, sunDirYUp)
+  vec4  sunOctavePhase;      // b^i * phase_i, sun octaves 0-3 (unused lanes 0)
+  vec4  sunOctavePhase2;     // ... octaves 4-7
+  uint  sunOctaveCount;      // clamp(args.cloudSunOctaveCount, 1, 8)
+  // Aerial perspective along this ray (cloudAerialPerspective).
+  vec3  viewDirYUp;
+  vec3  airSky;              // sky radiance along the ray: all the air light out to space/ground
+  vec3  airTransmittanceEye; // transmittance LUT at the eye, along the ray (against it if descending)
+  vec3  airTransmittanceAll; // the ray's whole air transmittance (0 for a ray reaching the ground)
+  bool  airHitsGround;
+};
+
+// Per-sample cloud lighting. `direct` is the sun in-scatter radiance and `ambient` the sky,
+// ground and horizon light, both per unit density x step length; the caller integrates them.
+struct NubisCubedLighting {
+  vec3 direct;
+  vec3 ambient;
+};
+
+// Key light (the sun, or the moon at night): Wrenninge 2013 multiple-scattering octaves. Octave i
+// scales extinction by a^i, contribution by b^i and phase anisotropy by c^i, so the higher orders
+// are softer, less directional and reach deeper into the cloud. Every octave shadows on the real
+// extinction, and a weak back lobe gives the bright sun-behind-you face of a thick cumulus.
+static const float kCloudSunBackLobeG      = 0.3f;
+static const float kCloudSunBackLobeWeight = 0.3f;
+
+// Octave 0 (single scattering) is shadowed on the sharp optical depth; the higher orders on the
+// soft one (see sampleCloudOpticalDepthLive), because multiply scattered light also spreads
+// sideways and blurs every shadow edge over a few hundred metres. With one optical depth for all
+// orders, the soft orders would cast the same hard-edged shadows as the first.
+float evalCloudSunOctaves(vec4 octavePhase, vec4 octavePhase2, uint octaveCount, float octaveA,
+                          float sigma, float D_sun, float D_sunSoft) {
+  float L = octavePhase[0] * exp(-sigma * D_sun);
+  float a = octaveA;
+  for (uint i = 1; i < octaveCount; ++i) {
+    L += (i < 4u ? octavePhase[i] : octavePhase2[i - 4u]) * exp(-a * sigma * D_sunSoft);
+    a *= octaveA;
+  }
+  return L;
+}
+
+// The same octaves in a medium that absorbs: octave i stands for light scattered
+// i + 1 times, so it keeps albedo^(i + 1) of its energy per channel. Dust or smoke in layer 2 takes
+// its colour from what it absorbs, never from a tint. An albedo of 1 is evalCloudSunOctaves.
+vec3 evalCloudSunOctavesAbsorbing(vec4 octavePhase, vec4 octavePhase2, uint octaveCount, float octaveA,
+                                  float sigma, float D_sun, float D_sunSoft, vec3 albedo) {
+  vec3 kept = albedo;
+  vec3 L = octavePhase[0] * exp(-sigma * D_sun) * kept;
+  float a = octaveA;
+  for (uint i = 1; i < octaveCount; ++i) {
+    kept *= albedo;
+    L += (i < 4u ? octavePhase[i] : octavePhase2[i - 4u]) * exp(-a * sigma * D_sunSoft) * kept;
+    a *= octaveA;
+  }
+  return L;
+}
+
+// Sky-view LUT radiance toward an above-horizon direction (same encoding as
+// sampleSkyAmbientForVolume, without its camera-side cloud occlusion).
+vec3 sampleSkyViewLutAbove(vec3 dirYUp) {
+  const float elevation = asin(saturate(dirYUp.y));
+  float azimuth = atan2(dirYUp.z, dirYUp.x);
+  if (azimuth < 0.0f) azimuth += 2.0f * kPi;
+  const vec2 uv = vec2(azimuth / (2.0f * kPi), sqrt(elevation / (kPi * 0.5f)) * 0.5f + 0.5f);
+  return sampleAzimuthWrappedLut(AtmosphereSkyViewLut, AtmosphereSkyViewSampler, uv, 0.0f).rgb;
+}
+
+// Sun illuminance reaching a cloud sample: the atmosphere's transmittance from the sample's own
+// altitude along its own sun zenith angle, and zero in the planet's shadow. A cloud top keeps
+// more, whiter sun than its base, stays lit after ground sunset, and a base below the sun's
+// horizon line is lit from beneath. `posKm` is world Y-up.
+vec3 evalCloudSunRadiance(vec3 posKm, CloudShadeContext ctx, AtmosphereArgs args) {
+#ifdef ATMOSPHERE_TRANSMITTANCE_LUT_AVAILABLE
+  return args.sunIlluminance * evalSunShadowing(posKm - args.cameraWorldPosYUpKm, ctx.sunDirYUp,
+                                                AtmosphereTransmittanceLut, AtmosphereSkyViewSampler,
+                                                args);
+#else
+  return ctx.sunRadiance;
+#endif
+}
+
+// Distance from a point inside the cloud shell to where a ray leaves it, through the top or the
+// base. `altKm` is the point's altitude above the shell base, `mu` the cosine between
+// the ray and the local up. Written in altitude differences rather than as a ray-sphere test
+// against the planet centre, whose |oc|^2 - r^2 loses kilometres to float cancellation.
+float cloudShellExitKm(float altKm, float mu, float planetRadiusKm, float slabAltitudeKm,
+                       float slabThicknessKm) {
+  const float r = planetRadiusKm + slabAltitudeKm + altKm;
+  const float rMu = r * mu;
+  const float dTop = slabThicknessKm - altKm;  // >= 0
+  const float topProduct = dTop * (2.0f * r + dTop);
+  const float sTop = sqrt(topProduct + rMu * rMu);
+  float tExit = rMu > 0.0f ? topProduct / max(rMu + sTop, 1e-6f) : sTop - rMu;
+  if (mu < 0.0f) {
+    const float dBase = -altKm;  // <= 0
+    const float baseDisc = dBase * (2.0f * r + dBase) + rMu * rMu;
+    if (baseDisc >= 0.0f) {
+      tExit = min(tExit, -dBase * (2.0f * r + dBase) / max(sqrt(baseDisc) - rMu, 1e-6f));
+    }
+  }
+  return max(tExit, 0.0f);
+}
+
+// Cloud optical depth (km * density) from a sample to where `dir` leaves the cloud shell, marched
+// live on the cumulus body field. A precomputed grid around the camera would have to wrap, while the
+// hex de-tiled field does not repeat, so every cloud past half the grid would read another cloud's
+// shadow. Taps are spaced quadratically at segment
+// midpoints: dense near the sample, where billows shade their own far side, and sparse far out,
+// where only the soft scattering octaves still see the cloud. The march stops at
+// kCloudLightMarchMaxKm, past which even the softest octave is spent.
+static const float kCloudLightMarchMaxKm = 12.0f;
+static const int   kCloudSunDetailTaps   = 4;     // evenly spaced taps at the start of the sun path
+static const float kCloudSunDetailKm     = 0.4f;  // ... over this distance
+static const int   kCloudSunFarTaps      = 8;     // sun path past kCloudLightMarchMaxKm ...
+static const float kCloudSunFarKm        = 150.0f; // ... out to here
+
+// The cloud body seen by multiply scattered light: the same body, its surface ramp widened to
+// kCloudSoftProfileKm about the sharp ramp's half-density iso (sdf = -profileDepth / 2), so it holds
+// the same mass as the sharp body and occluder edges cast penumbrae of about that width. Its
+// integral is the "soft" optical depth the higher sun octaves are shadowed on.
+static const float kCloudSoftProfileKm = 0.5f;
+float cloudSoftBodyDensity(float sdfKm, float heightFraction, AtmosphereArgs args) {
+  return saturate(0.5f - (sdfKm + 0.5f * args.nvdfProfileDepthKm) / kCloudSoftProfileKm)
+       * cloudCumulusHeightDensity(heightFraction, args.cloudThickness);
+}
+
+// One cloud layer as the march and its light paths see it. Layer 1 is the cumulus
+// deck on the baked body field, lit through the baked shadow maps; layer 2 is a stratiform layer
+// (fog, stratus, a high deck, dust: see sampleCloudDensityStratiform) marched and lit by the same
+// code, its light paths marched live because the maps cover layer 1 only.
+struct CloudSlab {
+  float altitudeKm;
+  float thicknessKm;
+  float typeMean;
+  float coverageMean;
+  float typeSpread;
+  float coverageSpread;
+  float densityScale;  // extinction as a multiple of args.cloudDensity
+  float noiseSeed;     // offsets the control-field and patch hashes
+  vec3  albedo;        // single-scattering albedo per channel (1 = water cloud)
+  bool  primary;       // layer 1
+};
+
+CloudSlab cloudPrimarySlab(AtmosphereArgs args) {
+  CloudSlab s;
+  s.altitudeKm = args.cloudAltitude;
+  s.thicknessKm = args.cloudThickness;
+  s.typeMean = args.cloudTypeMean;
+  s.coverageMean = args.cloudCoverageMean;
+  s.typeSpread = args.cloudTypeSpread;
+  s.coverageSpread = args.cloudCoverageSpread;
+  s.densityScale = 1.0f;
+  s.noiseSeed = 0.0f;
+  s.albedo = vec3(1.0f);
+  s.primary = true;
+  return s;
+}
+
+// Layer 2's coverage is not spread by the regional coverage field: at the layer's own patch scale
+// that field's single-octave cells read as a tiled stipple. Its type still varies.
+CloudSlab cloudSecondSlab(AtmosphereArgs args) {
+  CloudSlab s;
+  s.altitudeKm = args.cloudLayer2Altitude;
+  s.thicknessKm = max(args.cloudLayer2Thickness, 1e-3f);
+  s.typeMean = args.cloudLayer2TypeMean;
+  s.coverageMean = args.cloudLayer2CoverageMean;
+  s.typeSpread = args.cloudLayer2TypeSpread;
+  s.coverageSpread = 0.0f;
+  s.densityScale = max(args.cloudLayer2DensityScale, 0.0f);
+  s.noiseSeed = args.cloudLayer2NoiseSeed;
+  s.albedo = saturate(args.cloudLayer2Albedo);
+  s.primary = false;
+  return s;
+}
+
+// Layer 2's patch fields (cloudStratiformPatchFields) for a light-path tap at world `p`: from the baked
+// map (kCloudLayer2Map*, cloud_layer2_map.comp) when the pass has it and the tap lies within its reach,
+// otherwise evaluated live.
+vec2 cloudStratiformFieldsForLight(vec3 p, CloudSlab slab, AtmosphereArgs args) {
+#ifdef CLOUD_LAYER2_MAP_AVAILABLE
+  if (args.cloudLayer2MapValid != 0.0f) {
+    const float camKm = length(p.xz - args.cameraWorldPosYUpKm.xz);
+    if (camKm < kCloudLayer2MapCoarseKm) {
+      const vec2 rel = p.xz - args.cloudWindOffset - vec2(args.cloudLayer2MapCenterX, args.cloudLayer2MapCenterZ);
+      const float fine = saturate((kCloudLayer2MapBlendKm - camKm) / (kCloudLayer2MapBlendKm - kCloudLayer2MapFineKm));
+      vec2 fields = vec2(0.0f);
+      if (fine > 0.0f) {
+        const vec2 uv = rel / (float(kCloudLayer2MapSize) * kCloudLayer2MapFineTexelKm) + 0.5f;
+        fields += fine * AtmosphereCloudLayer2Map.SampleLevel(AtmosphereCloudNoise3DSampler, vec3(uv, 0.25f), 0);
+      }
+      if (fine < 1.0f) {
+        const vec2 uv = rel / (float(kCloudLayer2MapSize) * kCloudLayer2MapCoarseTexelKm) + 0.5f;
+        fields += (1.0f - fine) * AtmosphereCloudLayer2Map.SampleLevel(AtmosphereCloudNoise3DSampler, vec3(uv, 0.75f), 0);
+      }
+      return fields;
+    }
+  }
+#endif
+  return cloudStratiformPatchFields(p.xz - args.cloudWindOffset, slab.noiseSeed, 0.0f, 0.0f,
+                                    AtmosphereCloudDetailNoise3D, AtmosphereCloudNoise3DSampler);
+}
+
+// Layer 2's body density (x) and soft body density (y) from its patch fields at height fraction hf.
+vec2 cloudStratiformBodyDensityFromFields(vec2 fields, float hf, float typeLocal, float coverageLocal,
+                                          CloudSlab slab, AtmosphereArgs args) {
+  const vec2 bodyKm = cloudStratiformBodyFromFields(fields, hf, coverageLocal, slab.thicknessKm);
+  const float h = cloudStratiformHeightDensity(hf, typeLocal, slab.thicknessKm);
+  return vec2(cloudStratiformProfile(bodyKm, slab.thicknessKm, args) * h,
+              saturate(0.5f - max(bodyKm.x, bodyKm.y) / kCloudSoftProfileKm) * h);
+}
+
+// Body density at `p` for the light paths: x the body (a one-tap, detail-free stand-in for the
+// full density), y the soft body the multiply scattered light sees.
+vec2 cloudSlabBodyDensity(vec3 p, float hf, float typeLocal, float coverageLocal, CloudSlab slab,
+                          AtmosphereArgs args) {
+  if (slab.primary) {
+    const float sdfKm = cloudBodySdfKm(p, hf, coverageLocal, args, AtmosphereCloudNvdfSdf,
+                                       AtmosphereCloudNoise3DSampler);
+    return vec2(saturate(-sdfKm / max(args.nvdfProfileDepthKm, 1e-3f)) * cloudCumulusHeightDensity(hf, args.cloudThickness),
+                cloudSoftBodyDensity(sdfKm, hf, args));
+  }
+  return cloudStratiformBodyDensityFromFields(cloudStratiformFieldsForLight(p, slab, args), hf, typeLocal,
+                                             coverageLocal, slab, args);
+}
+
+// The first `detailKm` are sampled at `detailTaps` evenly spaced midpoints, so a billow shading
+// its own far side is resolved; the rest of the path at quadratically spaced ones. Every tap reads
+// the one-tap body field: shadow taps on the eroded detail would make each pore of a sunlit top cast
+// its own hard shadow, which the path-traced reference shows multiple scattering smooths away.
+// `farTaps` more, evenly spaced, cover the path from maxKm out to farKm: a low sun crosses a
+// hundred kilometres of broken deck, and the clouds past the first 12 km are what keep a sunset
+// deck's lower and far-side faces in shadow.
+// Light-march tap offset within each segment, set per view sample by the march (0.5 = midpoints).
+// Fixed midpoints are noise-free and fine for a high sun, but under a grazing sun the taps run
+// nearly level for kilometres, sit at the same places for every sample at one altitude, and alias
+// the billows into horizontal bands and blotchy shadows. Jittered per pixel and frame, that
+// aliasing becomes noise the temporal filter averages out.
+static float g_cloudLightJitter = 0.5f;
+// Per-pixel seed for those offsets, set by a pass that has one (cloud_render: blue noise
+// decorrelated from the view jitter). Negative = derive it from the view jitter.
+static float g_cloudLightJitterSeed = -1.0f;
+// Performance preset: closer than this (km) a sample's sun path is marched, not read from the Beer map.
+static const float kCloudBeerMapNearKm = 1.5f;
+
+float sampleCloudOpticalDepthLive(vec3 samplePos, vec3 dir, int taps, float maxKm,
+                                  int detailTaps, float detailKm, int farTaps, float farKm,
+                                  float typeLocal,
+                                  float coverageLocal, CloudShadeContext ctx,
+                                  CloudSlab slab, AtmosphereArgs args,
+                                  out float softOpticalDepth) {
+  const float slabAltitudeKm = slab.altitudeKm;
+  const float slabThicknessKm = slab.thicknessKm;
+  const vec3 rel = samplePos - ctx.planetCenterWorldKm;
+  const float rLen = length(rel);
+  const float altKm = clamp(rLen - ctx.planetRadiusKm - slabAltitudeKm, 0.0f, slabThicknessKm);
+  const float mu = dot(dir, rel / rLen);
+  const float fullExitKm = cloudShellExitKm(altKm, mu, ctx.planetRadiusKm, slabAltitudeKm,
+                                            slabThicknessKm);
+  const float exitKm = min(fullExitKm, maxKm);
+  float opticalDepth = 0.0f;
+  softOpticalDepth = 0.0f;
+  const float nearKm = min(detailKm, exitKm);
+  if (detailTaps > 0 && nearKm > 0.0f) {
+    const float stepKm = nearKm / float(detailTaps);
+    for (int i = 0; i < detailTaps; ++i) {
+      const vec3 p = samplePos + dir * (stepKm * (float(i) + g_cloudLightJitter));
+      const float hf = computeCloudHeightFractionC(p, ctx.planetCenterWorldKm, ctx.planetRadiusKm,
+                                                   slabAltitudeKm, slabThicknessKm);
+      const vec2 body = cloudSlabBodyDensity(p, hf, typeLocal, coverageLocal, slab, args);
+      opticalDepth += body.x * stepKm;
+      softOpticalDepth += body.y * stepKm;
+    }
+  }
+  const float lengthKm = exitKm - nearKm;
+  const vec3 farStart = samplePos + dir * nearKm;
+  const float invTaps = 1.0f / float(max(taps, 1));
+  // A path that leaves the shell within its detail stretch has nothing left for these taps: each
+  // would add its density times a zero segment.
+  const int midTaps = lengthKm > 0.0f ? taps : 0;
+  for (int i = 0; i < midTaps; ++i) {
+    const float u0 = float(i) * invTaps;
+    const float u1 = u0 + invTaps;
+    const float u = (float(i) + g_cloudLightJitter) * invTaps;
+    const vec3 p = farStart + dir * (lengthKm * u * u);
+    const float hf = computeCloudHeightFractionC(p, ctx.planetCenterWorldKm, ctx.planetRadiusKm,
+                                                 slabAltitudeKm, slabThicknessKm);
+    const vec2 body = cloudSlabBodyDensity(p, hf, typeLocal, coverageLocal, slab, args);
+    const float segKm = lengthKm * (u1 * u1 - u0 * u0);
+    opticalDepth += body.x * segKm;
+    softOpticalDepth += body.y * segKm;
+  }
+  const float farLengthKm = min(fullExitKm, farKm) - exitKm;
+  if (farTaps > 0 && farLengthKm > 0.0f) {
+    const float stepKm = farLengthKm / float(farTaps);
+    for (int i = 0; i < farTaps; ++i) {
+      const vec3 p = samplePos + dir * (exitKm + stepKm * (float(i) + g_cloudLightJitter));
+      const float hf = computeCloudHeightFractionC(p, ctx.planetCenterWorldKm, ctx.planetRadiusKm,
+                                                   slabAltitudeKm, slabThicknessKm);
+      const vec2 body = cloudSlabBodyDensity(p, hf, typeLocal, coverageLocal, slab, args);
+      opticalDepth += body.x * stepKm;
+      softOpticalDepth += body.y * stepKm;
+    }
+  }
+  return opticalDepth;
+}
+
+// Layer 2's body optical depth straight up or down (`dir` = +-the local vertical) from samplePos to
+// where the ray leaves the shell, capped at kCloudLightMarchMaxKm: sampleCloudOpticalDepthLive's
+// quadratic taps without detail or far taps, but on the patch fields at the sample. The fields are
+// horizontal, so along the vertical they are the sample's own (a tap a few hundred metres up drifts
+// sideways by its height over the planet radius, under a metre); only the height terms change, so a
+// column costs one field lookup instead of one per tap.
+float cloudStratiformColumnOpticalDepth(vec3 samplePos, vec3 dir, int taps, vec2 fields, float typeLocal,
+                                        float coverageLocal, CloudShadeContext ctx, CloudSlab slab,
+                                        AtmosphereArgs args) {
+  const vec3 rel = samplePos - ctx.planetCenterWorldKm;
+  const float rLen = length(rel);
+  const float altKm = clamp(rLen - ctx.planetRadiusKm - slab.altitudeKm, 0.0f, slab.thicknessKm);
+  const float mu = dot(dir, rel / rLen);
+  const float lengthKm = min(cloudShellExitKm(altKm, mu, ctx.planetRadiusKm, slab.altitudeKm, slab.thicknessKm),
+                             kCloudLightMarchMaxKm);
+  float opticalDepth = 0.0f;
+  const float invTaps = 1.0f / float(max(taps, 1));
+  for (int i = 0; i < taps; ++i) {
+    const float u0 = float(i) * invTaps;
+    const float u1 = u0 + invTaps;
+    const float u = (float(i) + g_cloudLightJitter) * invTaps;
+    const vec3 p = samplePos + dir * (lengthKm * u * u);
+    const float hf = computeCloudHeightFractionC(p, ctx.planetCenterWorldKm, ctx.planetRadiusKm,
+                                                 slab.altitudeKm, slab.thicknessKm);
+    opticalDepth += cloudStratiformBodyDensityFromFields(fields, hf, typeLocal, coverageLocal, slab, args).x
+                  * (lengthKm * (u1 * u1 - u0 * u0));
+  }
+  return opticalDepth;
+}
+
+// Aerial perspective in front of a cloud sample `tKm` along the ray: returns the air light between
+// the eye and the sample, and the air's transmittance in `airT`. The in-scatter is the ray's whole
+// air light (the sky behind the cloud) scaled per colour channel by the share of the ray's air
+// extinction in front of the sample. A grey per-km dimming with a per-km opacity fade would turn
+// distant clouds into translucent washes of the sky colour.
+// The sky-view LUT's air light assumes all air is sunlit, which over-brightens air under a deck;
+// cloudAirLightKeep corrects for that. Without the in-scatter, distant clouds turn brown and the
+// horizon muddy.
+static const float kCloudAirInScatter = 1.0f;
+
+// Cloud shadow on the air in front of a cloud. The sky-view LUT's air light assumes all air is
+// sunlit. Air in a cloud's shadow is not: under a deck, and above all in front of a cloud that hides
+// the sun, where the whole column sits in that cloud's shadow exactly where the Mie forward lobe
+// peaks; unshadowed, that lobe paints a bright sun-shaped glow over the cloud.
+// This returns the share of the air light in front of the cloud that survives (by luminance): the
+// sun's single scattering is weighted by the cloud transmittance toward the sun at a few points of
+// the air column, multiple scattering (the library's analytic term) reaches shadowed air from all
+// directions and is kept, as evalAtmosphereInScatterSegment does for scene occluders. The phase
+// function is constant along the ray, so only the Rayleigh/Mie mix matters, not the lobe's shape.
+// Computed once per ray, for the air up to the first cloud sample.
+static const int kCloudAirShadowSamples = 6;
+
+#ifdef CLOUD_SHADOW_MAP_AVAILABLE
+#include "numos/lib/cloud_shadow_map.slangh"
+
+// Cloud above and below a point (km x body density), from the vertical optical-depth volume
+// (cloud_vertical_od.comp). x = above, y = below.
+//
+// The rendered body is the union of the three hex tiles' clouds, each shrunk by its blend weight
+// (cloudUnionShrinkKm), so the lookup takes each tile's columns at that tile's shrink and keeps the
+// largest above and below. Reading the dominant tile alone would leave the clouds of the other two
+// tiles, and the dominant tile's own clouds shrunk past the baked levels, with no cloud above or
+// below them: fully lit from below and by the sky, they would read as smooth, flat bright patches
+// with straight edges along the tile boundaries, where the dominant tile changes. The maximum of the
+// three is continuous across those boundaries.
+
+// Weights of the baked shrink levels (kCloudVerticalShrinkLevelsKm) for a shrink of `shrinkKm`:
+// linear between levels, fading out by twice the last one.
+vec4 cloudVerticalShrinkWeights(float shrinkKm) {
+  const vec4 levels = kCloudVerticalShrinkLevelsKm;
+  if (shrinkKm >= levels.w) {
+    return vec4(0.0f, 0.0f, 0.0f, saturate(2.0f - shrinkKm / levels.w));
+  }
+  if (shrinkKm >= levels.z) {
+    const float f = (shrinkKm - levels.z) / (levels.w - levels.z);
+    return vec4(0.0f, 0.0f, 1.0f - f, f);
+  }
+  if (shrinkKm >= levels.y) {
+    const float f = (shrinkKm - levels.y) / (levels.z - levels.y);
+    return vec4(0.0f, 1.0f - f, f, 0.0f);
+  }
+  const float f = saturate((shrinkKm - levels.x) / (levels.y - levels.x));
+  return vec4(1.0f - f, f, 0.0f, 0.0f);
+}
+
+// One tile's (above, below) at texture coordinate `uv`, height `v`, shrunk by `shrinkKm`. The top
+// voxel holds the column total.
+vec2 cloudVerticalOdTile(Texture3D<float4> volume, SamplerState cloudSampler, vec2 uv, float v, float shrinkKm) {
+  if (shrinkKm >= 2.0f * kCloudVerticalShrinkLevelsKm.w) {
+    return vec2(0.0f);
+  }
+  const vec4 weights = cloudVerticalShrinkWeights(shrinkKm);
+  const float kTopV = 1.0f - 0.5f / float(CLOUD_NVDF_SIZE_Y);
+  const float below = dot(volume.SampleLevel(cloudSampler, vec3(uv.x, v, uv.y), 0), weights);
+  const float total = dot(volume.SampleLevel(cloudSampler, vec3(uv.x, kTopV, uv.y), 0), weights);
+  return vec2(max(total - below, 0.0f), below);
+}
+
+vec2 sampleCloudVerticalOpticalDepth(Texture3D<float4> volume, SamplerState cloudSampler, vec3 posWorldKm,
+                                     float heightFraction, AtmosphereArgs args) {
+  const vec3 perturbed = posWorldKm - vec3(args.cloudWindOffset.x, 0.0f, args.cloudWindOffset.y);
+  const float kHalfTexelV = 0.5f / float(CLOUD_NVDF_SIZE_Y);
+  const float v = clamp(heightFraction, kHalfTexelV, 1.0f - kHalfTexelV);
+  if (args.cloudHexTilingEnable > 0.5f) {
+    const CloudHexTile hex = computeCloudHexTile(perturbed.xz, args);
+    vec2 od = cloudVerticalOdTile(volume, cloudSampler, hex.uv1, v, cloudUnionShrinkKm(hex.w1, args));
+    od = max(od, cloudVerticalOdTile(volume, cloudSampler, hex.uv2, v, cloudUnionShrinkKm(hex.w2, args)));
+    od = max(od, cloudVerticalOdTile(volume, cloudSampler, hex.uv3, v, cloudUnionShrinkKm(hex.w3, args)));
+    return od;
+  }
+  return cloudVerticalOdTile(volume, cloudSampler, frac(perturbed.xz / args.cloudNoiseTileKm), v, 0.0f);
+}
+
+// Where a cloud-shell point sits along its sun ray (the shadow map's baked direction): the shell
+// exits toward and away from the sun, and the depth fraction between them.
+struct CloudSunRay {
+  float dSunKm;
+  float dAntiKm;
+  float w;
+};
+
+// The live part of the horizon streams (cloudHorizonMapRead covers the rest). One tap at a jittered
+// point of the stretch is enough: the soft horizon light averages over the stretch anyway, and 3 taps
+// look the same (mean 0.2 / max 18 of 255 in low-sun views) for 0.13-0.18 ms more at 1080p.
+static const float kCloudHorizonNearKm = 1.5f;
+static const int   kCloudHorizonNearTaps = 1;
+
+CloudSunRay cloudRayAlong(vec3 posKm, vec3 S, CloudShadeContext ctx, float slabAltitudeKm,
+                          float slabThicknessKm) {
+  const vec3 rel = posKm - ctx.planetCenterWorldKm;
+  const float rLen = length(rel);
+  const float altKm = clamp(rLen - ctx.planetRadiusKm - slabAltitudeKm, 0.0f, slabThicknessKm);
+  const float mu = dot(S, rel / rLen);
+  CloudSunRay ray;
+  ray.dSunKm = cloudShellExitKm(altKm, mu, ctx.planetRadiusKm, slabAltitudeKm, slabThicknessKm);
+  ray.dAntiKm = cloudShellExitKm(altKm, -mu, ctx.planetRadiusKm, slabAltitudeKm, slabThicknessKm);
+  ray.w = cloudShadowDepthFraction(ray.dSunKm, ray.dAntiKm);
+  return ray;
+}
+
+CloudSunRay cloudSunRay(vec3 posKm, CloudShadeContext ctx, float slabAltitudeKm, float slabThicknessKm,
+                        AtmosphereArgs args) {
+  return cloudRayAlong(posKm, ctx.sunDirYUp, ctx, slabAltitudeKm, slabThicknessKm);
+}
+
+// Optical depth (body, soft) toward the sun from `posKm`, `skipKm` along its sun ray.
+vec2 cloudShadowMapOpticalDepth(vec3 posKm, CloudSunRay ray, float skipKm, AtmosphereArgs args) {
+  const float w = saturate((ray.dSunKm - skipKm) / max(ray.dSunKm + ray.dAntiKm, 1e-4f));
+  return sampleCloudShadowMap(AtmosphereCloudShadowMap, AtmosphereCloudNoise3DSampler, posKm, w, args);
+}
+#endif
+// The air light the march adds in front of its samples, summed apart from the cloud light so its
+// cloud shadow (cloudAirLightKeep) is applied once, after the march. Evaluated lazily inside the
+// per-sample code, the compiler inlines the whole shadow march into the hot loop and the cloud
+// pass takes twice as long.
+static vec3 g_cloudAirAccum = vec3(0.0f);
+#if CLOUD_MARCH_LIGHTNING
+// The lightning flash's own share of the ray's radiance (luminance; the hue is args.lightningColor),
+// for the temporal filter: the flash changes every frame while the rest of the cloud does not.
+static float g_cloudFlashAccum = 0.0f;
+#endif
+// The last sample's sun + sky light on this ray, reused by samples below cloudLightingLodThreshold.
+static vec3 g_cloudLastLight = vec3(0.0f);
+static bool g_cloudHasLight = false;
+// Layer 2's share of the ray's depth-companion weight, for the temporal filter's reprojection of a
+// layer that follows the camera (marchCloudLayers sets g_cloudLayer2Share once per ray).
+static float g_cloudLayer2Weight = 0.0f;
+static float g_cloudLayer2Share = 0.0f;
+
+float cloudAirSunVisibility(vec3 posKm, CloudShadeContext ctx, AtmosphereArgs args) {
+  const float baseRadiusKm = ctx.planetRadiusKm + args.cloudAltitude;
+  const float topRadiusKm = baseRadiusKm + args.cloudThickness;
+  const float rKm = length(posKm - ctx.planetCenterWorldKm);
+  if (rKm >= topRadiusKm) {
+    return 1.0f;
+  }
+#ifdef CLOUD_SHADOW_MAP_AVAILABLE
+  if (args.cloudShadowLive != 0u) {
+    // Below the deck the whole sun ray's cloud lies ahead (w = 1); a ray is one texel wherever on
+    // it the point sits.
+    const float w = rKm < baseRadiusKm
+      ? 1.0f : cloudSunRay(posKm, ctx, args.cloudAltitude, args.cloudThickness, args).w;
+    const float tau = sampleCloudShadowMap(AtmosphereCloudShadowMap, AtmosphereCloudNoise3DSampler,
+                                           posKm, w, args).x;
+    return exp(-tau * args.cloudDensity);
+  }
+#endif
+  vec3 slabPos = posKm;
+  if (rKm < baseRadiusKm) {
+    // Below the deck: the sun ray reaches the cloud where it crosses the deck base.
+    float t0, t1;
+    if (!intersectSphere(posKm, ctx.sunDirYUp, ctx.planetCenterWorldKm, baseRadiusKm, t0, t1)) {
+      return 1.0f;
+    }
+    slabPos = posKm + ctx.sunDirYUp * (t1 + 1e-3f);
+  }
+  float softUnused;
+  const float tau = sampleCloudOpticalDepthLive(slabPos, ctx.sunDirYUp, 8, kCloudLightMarchMaxKm,
+                                                0, 0.0f, 4, kCloudSunFarKm,
+                                                args.cloudTypeMean, args.cloudCoverageMean, ctx,
+                                                cloudPrimarySlab(args), args, softUnused);
+  return exp(-tau * args.cloudDensity);
+}
+
+// Light crossing the other layer. Body optical depth (x sharp, y soft, in units of
+// args.cloudDensity, i.e. already scaled by the slab's densityScale) of `slab` along the ray from
+// posKm in `dir`, entering the slab's shell first when posKm lies outside it. Marched live at the
+// slab's mean coverage and type: `taps` quadratically spaced to kCloudLightMarchMaxKm past the
+// entry, `farTaps` more to kCloudSunFarKm.
+vec2 cloudSlabOpticalDepthFrom(vec3 posKm, vec3 dir, int taps, int farTaps, CloudShadeContext ctx,
+                               CloudSlab slab, AtmosphereArgs args) {
+  const float baseRadiusKm = ctx.planetRadiusKm + slab.altitudeKm;
+  const float topRadiusKm = baseRadiusKm + slab.thicknessKm;
+  const float rKm = length(posKm - ctx.planetCenterWorldKm);
+  vec3 start = posKm;
+  float t0, t1;
+  if (rKm >= topRadiusKm) {
+    // Above the slab: only a descending ray meets it, through its top.
+    if (!intersectSphere(posKm, dir, ctx.planetCenterWorldKm, topRadiusKm, t0, t1) || t0 <= 0.0f) {
+      return vec2(0.0f);
+    }
+    start = posKm + dir * (t0 + 1e-3f);
+  } else if (rKm < baseRadiusKm) {
+    // Below it: the ray reaches it where it crosses the base (from inside that sphere, the far root).
+    if (!intersectSphere(posKm, dir, ctx.planetCenterWorldKm, baseRadiusKm, t0, t1)) {
+      return vec2(0.0f);
+    }
+    start = posKm + dir * (t1 + 1e-3f);
+  }
+  float soft;
+  const float sharp = sampleCloudOpticalDepthLive(start, dir, taps, kCloudLightMarchMaxKm, 0, 0.0f,
+                                                  farTaps, kCloudSunFarKm, slab.typeMean, slab.coverageMean,
+                                                  ctx, slab, args, soft);
+  return vec2(sharp, soft) * slab.densityScale;
+}
+
+// Layer 1's optical depth (sharp, soft) toward the key light from posKm: zero above the deck, from
+// the shadow map when it is live (the whole sun ray's column below the deck, the share ahead of the
+// point inside it), otherwise marched live.
+vec2 cloudPrimarySunOpticalDepth(vec3 posKm, CloudShadeContext ctx, AtmosphereArgs args) {
+  const float baseRadiusKm = ctx.planetRadiusKm + args.cloudAltitude;
+  const float topRadiusKm = baseRadiusKm + args.cloudThickness;
+  const float rKm = length(posKm - ctx.planetCenterWorldKm);
+  if (rKm >= topRadiusKm) {
+    return vec2(0.0f);
+  }
+#ifdef CLOUD_SHADOW_MAP_AVAILABLE
+  if (args.cloudShadowLive != 0u) {
+    const float w = rKm < baseRadiusKm
+      ? 1.0f : cloudSunRay(posKm, ctx, args.cloudAltitude, args.cloudThickness, args).w;
+    return sampleCloudShadowMap(AtmosphereCloudShadowMap, AtmosphereCloudNoise3DSampler, posKm, w, args);
+  }
+#endif
+  return cloudSlabOpticalDepthFrom(posKm, ctx.sunDirYUp, 8, 4, ctx, cloudPrimarySlab(args), args);
+}
+
+// Layer 1's optical depth straight up (x) and down (y) from posKm, for the diffused sky and ground
+// light: from the vertical optical-depth volume when the maps are live, otherwise marched live.
+vec2 cloudPrimaryVerticalOpticalDepth(vec3 posKm, CloudShadeContext ctx, AtmosphereArgs args) {
+#ifdef CLOUD_SHADOW_MAP_AVAILABLE
+  if (args.cloudShadowLive != 0u) {
+    const float hf = computeCloudHeightFractionC(posKm, ctx.planetCenterWorldKm, ctx.planetRadiusKm,
+                                                 args.cloudAltitude, args.cloudThickness);
+    return sampleCloudVerticalOpticalDepth(AtmosphereCloudVerticalOd, AtmosphereCloudNoise3DSampler,
+                                           posKm, hf, args);
+  }
+#endif
+  const vec3 up = normalize(posKm - ctx.planetCenterWorldKm);
+  const CloudSlab slab = cloudPrimarySlab(args);
+  return vec2(cloudSlabOpticalDepthFrom(posKm, up, 4, 0, ctx, slab, args).x,
+              cloudSlabOpticalDepthFrom(posKm, -up, 4, 0, ctx, slab, args).x);
+}
+
+vec3 cloudAirLightKeep(float tKm, CloudShadeContext ctx, AtmosphereArgs args) {
+#ifdef ATMOSPHERE_TRANSMITTANCE_LUT_AVAILABLE
+  const float cosTheta = dot(ctx.viewDirYUp, ctx.sunDirYUp);
+  const float phaseR = rayleighPhase(cosTheta);
+  const float phaseM = hgPhase(cosTheta, args.mieAnisotropy);
+  const vec3 planetCenterEye = getCloudPlanetCenter(args);
+  const float jitter = g_cloudLightJitterSeed >= 0.0f ? g_cloudLightJitterSeed : 0.5f;
+  const float dt = tKm / float(kCloudAirShadowSamples);
+  vec3 viewT = vec3(1.0f);
+  vec3 lightAll = vec3(0.0f);
+  vec3 lightKept = vec3(0.0f);
+  // Under a closed deck the air's multiply scattered light also comes through the deck.
+  const float multiKeep = cloudDeckLightKeep(args).x;
+  for (int i = 0; i < kCloudAirShadowSamples; ++i) {
+    const vec3 posEye = ctx.viewDirYUp * (dt * (float(i) + jitter));
+    const vec3 rel = posEye - planetCenterEye;
+    const float r = length(rel);
+    const float alt = clamp(r - args.planetRadius, 0.0f, args.atmosphereThickness);
+    const float muSun = dot(rel / r, ctx.sunDirYUp);
+    const AtmosphereMedium medium = sampleAtmosphereMedium(alt, args);
+    const vec3 single = evalSunShadowing(posEye, ctx.sunDirYUp, AtmosphereTransmittanceLut,
+                                         AtmosphereSkyViewSampler, args)
+                      * (medium.rayleighScattering * phaseR + medium.mieScattering * phaseM);
+    const vec3 multi = getAnalyticalMultiscattering(alt, muSun, args);
+    const vec3 stepT = exp(-medium.extinction * dt);
+    const vec3 weight = viewT * (1.0f - stepT) / max(medium.extinction, vec3(1e-7f));
+    float visibility = 1.0f;
+    if (any(single > vec3(0.0f))) {
+      visibility = cloudAirSunVisibility(args.cameraWorldPosYUpKm + posEye, ctx, args);
+    }
+    lightAll += (single + multi) * weight;
+    lightKept += (single * visibility + multi * multiKeep) * weight;
+    viewT *= stepT;
+  }
+  // One ratio for all channels: the LUT's Mie lobe is blurred relative to this exact phase, so a
+  // per-channel ratio would leave the multiple scattering's blue as a cyan blot where the sun hides.
+  const vec3 lum = vec3(0.2126f, 0.7152f, 0.0722f);
+  return vec3(saturate(dot(lightKept, lum) / max(dot(lightAll, lum), 1e-12f)));
+#else
+  return vec3(1.0f);
+#endif
+}
+
+vec3 cloudAerialPerspective(float tKm, CloudShadeContext ctx, AtmosphereArgs args, out vec3 airT) {
+  airT = vec3(1.0f);
+#ifdef ATMOSPHERE_TRANSMITTANCE_LUT_AVAILABLE
+  const vec3 rel = ctx.viewDirYUp * tKm - getCloudPlanetCenter(args);
+  const float r = length(rel);
+  const float mu = dot(ctx.viewDirYUp, rel / r);
+  const float alt = max(r - args.planetRadius, 0.0f);
+  // A descending ray, up to its lowest point, takes the ratio against the ray (both rays point up
+  // and reach space) - whether or not it later reaches the ground. Along the ray, a grazing ray's
+  // T(eye) and T(point) both pass through the low air beyond the tangent point: the blue falls to
+  // ~1e-7 a couple of km up, under the 1e-6 floor and fp16's normal range, and the ratio would draw
+  // a bright blue line along the horizon through the clouds.
+  if (ctx.viewDirYUp.y < 0.0f && mu <= 0.0f) {
+    airT = sampleTransmittanceLut(AtmosphereTransmittanceLut, AtmosphereSkyViewSampler, alt, -mu, args)
+         / max(ctx.airTransmittanceEye, vec3(1e-6f));
+  } else {
+    airT = ctx.airTransmittanceAll
+         / max(sampleTransmittanceLut(AtmosphereTransmittanceLut, AtmosphereSkyViewSampler, alt, mu, args),
+               vec3(1e-6f));
+  }
+  airT = saturate(airT);
+  const vec3 share = saturate((1.0f - airT) / max(1.0f - ctx.airTransmittanceAll, vec3(1e-4f)));
+  return ctx.airSky * share * kCloudAirInScatter;
+#else
+  return vec3(0.0f);
+#endif
+}
+
+// D_sun / D_sunSoft: the sharp and soft optical depth toward the key light (in units of
+// args.cloudDensity), through every layer on the way. `slab` is the layer the sample belongs to; a
+// layer whose albedo is below 1 absorbs (see evalCloudSunOctavesAbsorbing and the diffusion below).
+NubisCubedLighting evalNubisCubedSampleCore(
+    vec3 samplePos,
+    float tauAbove, float tauBelow, float tauSunward, float tauAntiSunward,
+    CloudShadeContext ctx,
+    AtmosphereArgs args, float D_sun, float D_sunSoft, CloudSlab slab) {
+
+  const float sigma = args.cloudDensity;
+
+  NubisCubedLighting result;
+  const vec3 sunRadianceHere = evalCloudSunRadiance(samplePos, ctx, args);
+  // Sun: Wrenninge multiple-scattering octaves on the cloud along the sun ray, lit by the
+  // sun as it reaches this sample through the atmosphere.
+  if (slab.primary) {
+    result.direct = evalCloudSunOctaves(ctx.sunOctavePhase, ctx.sunOctavePhase2, ctx.sunOctaveCount,
+                                        args.cloudSunOctaveA, sigma, D_sun, D_sunSoft)
+                  * sunRadianceHere;
+  } else {
+    result.direct = evalCloudSunOctavesAbsorbing(ctx.sunOctavePhase, ctx.sunOctavePhase2, ctx.sunOctaveCount,
+                                                 args.cloudSunOctaveA, sigma, D_sun, D_sunSoft, slab.albedo)
+                  * sunRadianceHere;
+  }
+
+  // Sky and ground light by diffusion. Multiply scattered light crosses a thick cloud as
+  // T = 1 / (1 + 0.75 (1 - g) tau) (two-stream slab transmission), not exp(-tau): a 2 km cumulus
+  // still passes 10-20% of the skylight to its base. Four streams, each through the cloud
+  // marched along its own direction and weighted by the share of the sphere it stands for, so an
+  // unoccluded wisp gets the plain average of everything around it:
+  // the sky above, through the water overhead; the light from below (the sunlit ground and the haze
+  // under the cloud), through the water beneath; and the horizon on the sun's side (the warm glow at
+  // sunset) and on the far side (the cool anti-sun sky), each through the cloud in that horizontal
+  // direction, so a cloud's two sides take different light.
+  const float kDiffusion = 0.75f * (1.0f - saturate(args.cloudPhaseG1));
+  const float tUp   = 1.0f / (1.0f + kDiffusion * tauAbove);
+  const float tDown = 1.0f / (1.0f + kDiffusion * tauBelow);
+  const float tSun  = 1.0f / (1.0f + kDiffusion * tauSunward);
+  const float tAnti = 1.0f / (1.0f + kDiffusion * tauAntiSunward);
+  const vec3 groundSun = evalCloudSunRadiance(args.cameraWorldPosYUpKm, ctx, args);
+  // Under a closed deck the ground and the haze see the sky and the sun only through the deck
+  // (cloudDeckLightKeep; (1, 0) for broken cloud).
+  const vec2 deckKeep = cloudDeckLightKeep(args);
+  const vec3 ground = args.groundAlbedo
+                    * (groundSun * (saturate(ctx.sunDirYUp.y) * (evalCloudGroundShadow(ctx.sunDirYUp, args) + deckKeep.y) / kPi)
+                       + ctx.skyRadianceDown * deckKeep.x);
+  const float kAirLight = 0.1f;  // the lit haze between the ground and the cloud base
+  const vec3 below = ground + kAirLight * 0.5f * deckKeep.x * (ctx.skyHorizonSunward + ctx.skyHorizonAntiSunward);
+  // Sunlight diffused down through the cloud above. The octaves carry the sun along its own ray and
+  // fade as exp(-tau); under a thick cloud most of the sunlight still arrives as diffuse light: the
+  // two-stream total transmission 1 / (1 + k tau) less the part that came straight through. Without
+  // it a storm or overcast base is lit by the blue sky alone, dark and blue, and every thin seam or
+  // lobe flank glows blue where the sky comes through. It is zero with no cloud toward the sun, and
+  // white whatever the sky's colour. The path is the water overhead slanted toward the sun, not the
+  // sun ray's own optical depth: diffused light has lost the sun ray's structure, and using it would
+  // draw streaks along the sun direction across the base.
+  const float tauSun = tauAbove / max(ctx.sunDirYUp.y, 0.25f);
+  const float sunDiffuse = max(1.0f / (1.0f + kDiffusion * tauSun) - exp(-tauSun), 0.0f);
+  // Scaled by cloudDiffuseSunStrength: on a sunny cumulus sky it lights the shadowed sides bright
+  // and soft, a cartoon look, so it is a weather choice (the grey presets set it), off by default.
+  const vec3 sunDown = sunRadianceHere * (saturate(ctx.sunDirYUp.y) / kPi) * (sunDiffuse * args.cloudDiffuseSunStrength);
+  if (slab.primary) {
+    result.ambient = (0.4f * (ctx.skyRadianceDown * tUp + sunDown) + 0.4f * below * tDown
+                      + 0.1f * ctx.skyHorizonSunward * tSun
+                      + 0.1f * ctx.skyHorizonAntiSunward * tAnti);
+  } else {
+    // Absorption: diffusing light decays as exp(-k tau) on top of the slab transmission, with the
+    // diffusion eigenvalue k = sqrt(3 (1 - w)(1 - g w)) (0 for w = 1), and the last scattering into
+    // the view keeps w of it.
+    const vec3 w = slab.albedo;
+    const vec3 k = sqrt(max(3.0f * (1.0f - w) * (1.0f - 0.85f * w), vec3(0.0f)));
+    result.ambient = w * (0.4f * ctx.skyRadianceDown * (tUp * exp(-k * tauAbove))
+                          + 0.4f * below * (tDown * exp(-k * tauBelow))
+                          + 0.1f * ctx.skyHorizonSunward * (tSun * exp(-k * tauSunward))
+                          + 0.1f * ctx.skyHorizonAntiSunward * (tAnti * exp(-k * tauAntiSunward)));
+  }
+#if CLOUD_LIGHT_DEBUG == 1
+  result.ambient = vec3(0.0f);
+#elif CLOUD_LIGHT_DEBUG == 2
+  result.direct = vec3(0.0f);
+#elif CLOUD_LIGHT_DEBUG == 3
+  result.direct = vec3(0.0f); result.ambient = vec3(tUp, tSun, tAnti);
+#endif
+  return result;
+}
+
+// buildCloudShadeContext fills the frame-constant half of CloudShadeContext;
+// cloudShadeContextBeginRay fills the view-direction half.
+// One azimuth of the sky ring buildCloudShadeContext integrates (see there): `down` is its
+// upper-hemisphere term (two Gauss-Legendre rings in mu, cosine-weighted), `horizon` its radiance
+// just above the horizon. Azimuth i of 8, straddling the sun.
+static const float kCloudSkyRingMu0 = 0.2113249f;
+static const float kCloudSkyRingMu1 = 0.7886751f;
+static const float kCloudSkyRingMuHorizon = 0.06f;
+void cloudSkyRingTerm(int i, float sunAzimuth, out vec3 down, out vec3 horizon) {
+  const float kMu0 = kCloudSkyRingMu0, kMu1 = kCloudSkyRingMu1, kMuHorizon = kCloudSkyRingMuHorizon;
+  const float phi = sunAzimuth + (float(i) + 0.5f) * (2.0f * kPi / 8.0f);
+  const vec2 h = vec2(cos(phi), sin(phi));
+  down = kMu0 * sampleSkyViewLutAbove(vec3(h.x * sqrt(1.0f - kMu0 * kMu0), kMu0, h.y * sqrt(1.0f - kMu0 * kMu0)))
+       + kMu1 * sampleSkyViewLutAbove(vec3(h.x * sqrt(1.0f - kMu1 * kMu1), kMu1, h.y * sqrt(1.0f - kMu1 * kMu1)));
+  horizon = sampleSkyViewLutAbove(vec3(h.x * sqrt(1.0f - kMuHorizon * kMuHorizon), kMuHorizon,
+                                       h.y * sqrt(1.0f - kMuHorizon * kMuHorizon)));
+}
+
+// The frame-constant context from the sky ring's eight terms, summed in ring order.
+CloudShadeContext buildCloudShadeContextFromRing(AtmosphereArgs args, vec3 ringDown[8], vec3 ringHorizon[8]) {
+  vec3 sunDirYUp = normalize(args.sunDirection);
+  // Fallback sun for passes without the transmittance LUT (see evalCloudSunRadiance).
+  vec3 sunRadiance = args.sunIlluminance * getAtmosphericTransmittanceForDir(sunDirYUp, args);
+
+  // Sky light on the clouds, from the sky-view LUT without the camera's cloud occlusion (the
+  // march's own diffusion terms handle the cloud in the way):
+  //   skyRadianceDown: the upper hemisphere's irradiance / pi, from 8 azimuths x 2 Gauss-Legendre
+  //                    rings in mu, which integrate cos-weighted radiance exactly for a sky that
+  //                    is linear in mu. The azimuths straddle the sun symmetrically so the bright
+  //                    aureole has the same weight at every sun azimuth.
+  //   skyHorizon*:     the mean radiance just above the horizon, on the sun's half of the sky and
+  //                    on the far half.
+  // Sampling single directions (toward the sun, the anti-sun horizon, the zenith) would let the
+  // aureole stand in for the whole sky at sunset and light every cloud in the sun's glow colour.
+  // There is no twilight gate: the sky-view LUT carries twilight and night physically.
+  const float sunAzimuth = atan2(sunDirYUp.z, sunDirYUp.x);
+  vec3 skyDown = vec3(0.0f);
+  vec3 skyHorizonSun = vec3(0.0f);
+  vec3 skyHorizonAnti = vec3(0.0f);
+  [unroll]
+  for (int i = 0; i < 8; ++i) {
+    skyDown += ringDown[i];
+    if (i < 2 || i >= 6) {
+      skyHorizonSun += ringHorizon[i];
+    } else {
+      skyHorizonAnti += ringHorizon[i];
+    }
+  }
+  const vec3 skyRadianceDown = skyDown * (1.0f / 8.0f);
+  const vec3 skyHorizonSunward = skyHorizonSun * (1.0f / 4.0f);
+  const vec3 skyHorizonAntiSunward = skyHorizonAnti * (1.0f / 4.0f);
+
+  CloudShadeContext ctx;
+  ctx.sunDirYUp                = sunDirYUp;
+  ctx.sunRadiance              = sunRadiance;
+  ctx.skyRadianceDown          = skyRadianceDown;
+  ctx.skyHorizonSunward        = skyHorizonSunward;
+  ctx.skyHorizonAntiSunward    = skyHorizonAntiSunward;
+  ctx.sunHorizontalDir         = vec3(cos(sunAzimuth), 0.0f, sin(sunAzimuth));
+  ctx.msOctaveCount            = clamp(args.cloudMultiScatterOctaves, 1u, 4u);
+
+  // The planet in both frames the march needs, computed once per frame.
+  ctx.planetCenterKm      = getCloudPlanetCenter(args);
+  ctx.planetCenterWorldKm = getCloudPlanetCenterWorldKm(args);
+  ctx.planetRadiusKm      = args.planetRadius;
+
+  // Ray-constant fields stay zeroed until cloudShadeContextBeginRay runs.
+  ctx.sunCosTheta  = 0.0f;
+  ctx.sunOctavePhase = vec4(0.0f);
+  ctx.sunOctavePhase2 = vec4(0.0f);
+  ctx.sunOctaveCount = clamp(args.cloudSunOctaveCount, 1u, 8u);
+  return ctx;
+}
+
+float cloudShadeContextSunAzimuth(AtmosphereArgs args) {
+  const vec3 sunDirYUp = normalize(args.sunDirection);
+  return atan2(sunDirYUp.z, sunDirYUp.x);
+}
+
+// The per-thread context: every thread samples the whole sky ring itself.
+CloudShadeContext buildCloudShadeContext(AtmosphereArgs args) {
+  const float sunAzimuth = cloudShadeContextSunAzimuth(args);
+  vec3 ringDown[8];
+  vec3 ringHorizon[8];
+  [unroll]
+  for (int i = 0; i < 8; ++i) {
+    cloudSkyRingTerm(i, sunAzimuth, ringDown[i], ringHorizon[i]);
+  }
+  return buildCloudShadeContextFromRing(args, ringDown, ringHorizon);
+}
+
+// The same context with the sky ring sampled once per workgroup. Its 24 sky-view taps are
+// frame-constant, and taking them in every thread of the screen pass costs ~0.2 ms at 1080p.
+// Lanes 0-7 each sample one azimuth into group-shared memory and every lane sums the eight in ring
+// order, the same arithmetic as the per-thread version. Every lane of a group of at least 8 lanes
+// must call it, in uniform control flow (it has a barrier).
+groupshared vec3 gs_cloudSkyRingDown[8];
+groupshared vec3 gs_cloudSkyRingHorizon[8];
+CloudShadeContext buildCloudShadeContextGroup(AtmosphereArgs args, uint lane) {
+  if (lane < 8u) {
+    vec3 down, horizon;
+    cloudSkyRingTerm(int(lane), cloudShadeContextSunAzimuth(args), down, horizon);
+    gs_cloudSkyRingDown[lane] = down;
+    gs_cloudSkyRingHorizon[lane] = horizon;
+  }
+  GroupMemoryBarrierWithGroupSync();
+  vec3 ringDown[8];
+  vec3 ringHorizon[8];
+  [unroll]
+  for (int i = 0; i < 8; ++i) {
+    ringDown[i] = gs_cloudSkyRingDown[i];
+    ringHorizon[i] = gs_cloudSkyRingHorizon[i];
+  }
+  return buildCloudShadeContextFromRing(args, ringDown, ringHorizon);
+}
+
+// =============================================================================
+// Per-ray shading precompute. Everything here depends only on the constant buffer and the view
+// direction, so it is computed once per ray (from marchCloudLayers) rather than at each of the
+// march's samples. The Wrenninge phase-octave sums are the largest part: loops over phase functions
+// whose inputs are a fixed dot product and constants.
+// =============================================================================
+CloudShadeContext cloudShadeContextBeginRay(CloudShadeContext ctx, vec3 viewDirYUp,
+                                            AtmosphereArgs args) {
+  g_cloudAirAccum = vec3(0.0f);  // per ray; see cloudAirLightKeep
+#if CLOUD_MARCH_LIGHTNING
+  g_cloudFlashAccum = 0.0f;
+#endif
+  g_cloudHasLight = false;  // per ray; see the lighting LOD in integrateCloudSample
+  ctx.sunCosTheta = dot(viewDirYUp, ctx.sunDirYUp);
+
+  // Sun octave phases (see evalCloudSunOctaves). Octave i has its forward anisotropy scaled by c^i
+  // and a weak back lobe, weighted by b^i.
+  ctx.sunOctavePhase = vec4(0.0f);
+  ctx.sunOctavePhase2 = vec4(0.0f);
+  {
+    float b = 1.0f, c = 1.0f;
+    for (uint i = 0; i < ctx.sunOctaveCount; ++i) {
+      const float forward = hgPhaseNubis(ctx.sunCosTheta, c * args.cloudPhaseG1);
+      const float back    = hgPhaseNubis(ctx.sunCosTheta, -c * kCloudSunBackLobeG);
+      const float phase   = b * lerp(forward, back, kCloudSunBackLobeWeight);
+      if (i < 4u) {
+        ctx.sunOctavePhase[i] = phase;
+      } else {
+        ctx.sunOctavePhase2[i - 4u] = phase;
+      }
+      b *= args.cloudSunOctaveB;
+      c *= args.cloudSunOctaveC;
+    }
+  }
+
+  // Aerial perspective. For a ray that reaches space, the air between the eye and a
+  // point is T_lut(eye) / T_lut(point) along the ray; for one that reaches the ground, the
+  // reverse ratio against the ray. The sky-view LUT holds the ray's whole in-scattered air light.
+  ctx.viewDirYUp = viewDirYUp;
+  ctx.airSky = vec3(0.0f);
+  ctx.airTransmittanceEye = vec3(1.0f);
+  ctx.airTransmittanceAll = vec3(1.0f);
+  ctx.airHitsGround = false;
+#ifdef ATMOSPHERE_TRANSMITTANCE_LUT_AVAILABLE
+  {
+    const float rEye = args.planetRadius + args.cameraWorldPosYUpKm.y;
+    const float muEye = viewDirYUp.y;
+    const float horizonMu = -sqrt(max(1.0f - (args.planetRadius / rEye) * (args.planetRadius / rEye), 0.0f));
+    ctx.airHitsGround = muEye < horizonMu;
+    const float altEye = max(rEye - args.planetRadius, 0.0f);
+    // Against the ray for any descending ray (see cloudAerialPerspective), along it otherwise.
+    ctx.airTransmittanceEye = sampleTransmittanceLut(AtmosphereTransmittanceLut, AtmosphereSkyViewSampler,
+                                                     altEye, muEye < 0.0f ? -muEye : muEye, args);
+    ctx.airTransmittanceAll = ctx.airHitsGround ? vec3(0.0f)
+      : (muEye < 0.0f ? sampleTransmittanceLut(AtmosphereTransmittanceLut, AtmosphereSkyViewSampler,
+                                               altEye, muEye, args)
+                      : ctx.airTransmittanceEye);
+    ctx.airSky = sampleSkyViewLutForRay(viewDirYUp, AtmosphereSkyViewLut, AtmosphereSkyViewSampler);
+  }
+#endif
+
+  return ctx;
+}
+
+// =============================================================================
+// Per-slab raymarch helper: slab intersection, per-step density sampling, lighting and
+// Beer-Lambert accumulation for one crossing of one layer (CloudSlab). The per-frame and per-ray
+// shading state lives in CloudShadeContext, shared by every crossing. marchCloudLayers calls it for
+// each crossing of each layer in the order the ray meets them, so the composite stays front to back
+// for a camera below, between or above the layers.
+//
+// tMinClamp / tMaxClamp clamp the marched segment to camera distances [tMinClamp, tMaxClamp]
+// (0 disables the respective clamp). The screen pass clamps at the primary surface; the dome LUT
+// passes 0/0.
+#if CLOUD_MARCH_LIGHTNING
+// In-cloud lightning flash glow. The flash is a source of luminous intensity I
+// (args.lightningFlashIntensity: illuminance x km^2, pre-exposed) inside the deck. Cloud absorbs
+// almost nothing, so the light diffuses until it leaves through the cloud's surfaces; the glow is
+// the in-scatter source J(d) at a march sample d km from the strike:
+// J = I N exp(-d / L) / (d^2 + c^2). c is the core where the channel and the first scatterings sit
+// (no blow-up at the strike or at a camera beside it), and L = 1 / 0.35 km is the diffusion reach
+// before the light leaks out of the deck. N conserves energy: an opaque deck seen from either side
+// shows J, so its exitance pi J over both faces integrates to the flash's 4 pi I, giving
+// N = 1 / (pi Int_0^inf r exp(-r / L) / (r^2 + c^2) dr) = 0.2276 for these c and L. This ties the
+// glow to the scene light (FrameOutputs::lights[kLightningLight]), which carries the same I. There
+// is no occlusion march: the cloud in front of the sample attenuates it through viewTransmittance,
+// and the caller's (1 - stepTransmittance) factor puts the glow on cloud material only.
+vec3 evalLightningFlash(vec3 samplePos, AtmosphereArgs args) {
+  vec3 dv = samplePos - args.lightningStrikePosKm;
+  float d2 = dot(dv, dv);
+  const float kFlashCoreSoftKm2 = 0.25f;      // c^2: ~0.5 km channel-glow core
+  const float kFlashExtinctionPerKm = 0.35f;  // 1 / L: in-cloud reach of the glow
+  const float kFlashEnergyNorm = 0.2276f;     // N for the two above (see the comment)
+  float fall = exp(-sqrt(d2) * kFlashExtinctionPerKm) / (d2 + kFlashCoreSoftKm2);
+  return args.lightningColor * (args.lightningFlashIntensity * kFlashEnergyNorm * fall);
+}
+#endif
+
+// =============================================================================
+// Per-sample shading + Beer-Lambert accumulation shared by the march loops of marchCloudSlab:
+// evaluates the slab's density at camera distance tSampleKm along viewDirYUp, lights the sample
+// (key light octaves, sky and ground diffusion, lightning) and folds a Beer-Lambert segment of
+// length segLenKm into accumColor / viewTransmittance. rayFrac positions the sample for the
+// caller's hoisted entry/exit control-field lerp. Returns false when the sample was empty
+// (density < 0.001, nothing accumulated); sdfStepKmOut is the sampler's conservative empty-space
+// radius in km, valid either way, so callers can sphere-trace past empty air.
+//
+// Both layers take this path. Layer 1 reads its light paths past the first few
+// hundred metres from the baked shadow maps; layer 2 marches its own live, and adds layer 1's
+// optical depth toward the light and the sky (from the same maps), so fog under an overcast deck
+// sits in that deck's shadow. A layer-1 sample adds layer 2's depth when a layer-2 deck lies above it.
+// The march's cloud density at distance tSampleKm along the view ray (x args.cloudDensity = the
+// extinction per km): the coverage / type fields lerped between the span's entry and exit evaluations,
+// the height fraction, and the slab's density model. integrateCloudSample shades this; the disk
+// aureole's continuation past the march's exit (cloudCrossingOpticalDepth) samples the same field.
+float cloudMarchDensity(float tSampleKm, float segLenKm, float rayFrac, vec3 viewDirYUp, CloudSlab slab,
+                        float typeNoiseEntry, float typeNoiseExit, float coverageNoiseEntry, float coverageNoiseExit,
+                        CloudShadeContext ctx, AtmosphereArgs args,
+                        out vec3 samplePos, out float hf, out float typeLocal, out float coverageLocal,
+                        out float sdfStepKmOut) {
+  sdfStepKmOut = 0.0f;
+
+  // World-anchored sample position (Y-up km): the slab intersection runs with the camera at the
+  // origin, so tSampleKm is the distance from the camera, and adding the camera's world position
+  // anchors the density fields to the world rather than to the view.
+  samplePos = args.cameraWorldPosYUpKm + viewDirYUp * tSampleKm;
+
+  // Spatial coverage / type fields: per-sample lerp between the slab entry and exit evaluations
+  // hoisted out of the march loop by the caller.
+  float typeNoise     = mix(typeNoiseEntry,     typeNoiseExit,     rayFrac);
+  float coverageNoise = mix(coverageNoiseEntry, coverageNoiseExit, rayFrac);
+  typeLocal     = saturate(slab.typeMean     + (typeNoise     - 0.5f) * slab.typeSpread);
+  coverageLocal = saturate(slab.coverageMean + (coverageNoise - 0.5f) * slab.coverageSpread);
+
+  hf = computeCloudHeightFractionC(samplePos, ctx.planetCenterWorldKm, ctx.planetRadiusKm,
+                                   slab.altitudeKm, slab.thicknessKm);
+  // tSampleKm doubles as the camera distance for the near-camera fine detail blend.
+  const float lodStepKm = args.cloudDetailLodEnable != 0u ? segLenKm : 0.0f;
+  float density;
+  if (slab.primary) {
+    density = sampleCloudDensityNubis3(samplePos, hf, typeLocal, coverageLocal,
+                                       slab.densityScale, tSampleKm, lodStepKm, args,
+                                       AtmosphereCloudNvdfSdf, AtmosphereCloudDetailNoise3D,
+                                       AtmosphereCloudNoise3DSampler,
+                                       /*coarseOd=*/false,
+                                       sdfStepKmOut);
+  } else {
+    density = sampleCloudDensityStratiform(samplePos, hf, typeLocal, coverageLocal, slab.densityScale,
+                                           slab.thicknessKm, slab.noiseSeed, tSampleKm, lodStepKm, args,
+                                           AtmosphereCloudDetailNoise3D, AtmosphereCloudNoise3DSampler,
+                                           sdfStepKmOut);
+    // The ground-fog clear zone (fogNearFadeMeters): seen from the camera only, its light paths keep
+    // the full layer.
+    if (args.fogNearFadeKm > 0.0f) {
+      density *= smoothstep(0.0f, args.fogNearFadeKm, tSampleKm);
+    }
+  }
+  return density;
+}
+
+bool integrateCloudSample(float tSampleKm,
+                          float segLenKm,
+                          float rayFrac,
+                          vec3  viewDirYUp,
+                          CloudSlab slab,
+                          float typeNoiseEntry,
+                          float typeNoiseExit,
+                          float coverageNoiseEntry,
+                          float coverageNoiseExit,
+                          CloudShadeContext ctx,
+                          AtmosphereArgs args,
+                          inout vec3  accumColor,
+                          inout float viewTransmittance,
+                          out float sdfStepKmOut,
+                          // Running sums for the transmittance-weighted mean cloud depth the screen
+                          // pass writes to its depth companion (finalised in marchCloudLayers).
+                          inout float sumWeightedDistKm,
+                          inout float sumWeight,
+                          // Nearest distance along this ray at which either layer found cloud
+                          // material; -1 on entry means "nothing found yet".
+                          inout float firstDensityDistanceKm) {
+  vec3 samplePos;
+  float hf, typeLocal, coverageLocal;
+  const float density = cloudMarchDensity(tSampleKm, segLenKm, rayFrac, viewDirYUp, slab,
+                                          typeNoiseEntry, typeNoiseExit, coverageNoiseEntry, coverageNoiseExit,
+                                          ctx, args, samplePos, hf, typeLocal, coverageLocal, sdfStepKmOut);
+  if (density < 0.001f) {
+    return false;
+  }
+
+  // First-density-hit entry: the empty-sample gate above defines where cloud starts. Narrowed with
+  // a min because the two layers share one value and either may hold the nearer cloud.
+  if (firstDensityDistanceKm < 0.0f || tSampleKm < firstDensityDistanceKm) {
+    firstDensityDistanceKm = tSampleKm;
+  }
+
+  // Contribution-weighted lighting LOD. The Beer-Lambert and aerial-perspective factors are
+  // computed before the lighting, so the sample's true weight in the pixel (sampleWeight, exactly
+  // the factor its colour is accumulated with below) decides whether it gets its own light or
+  // reuses the light of the last lit sample on this ray. Threshold 0 lights every sample.
+  float effectiveDensity   = density * args.cloudDensity;
+  float stepTransmittance  = exp(-effectiveDensity * segLenKm);
+  vec3  airT;
+  const vec3 airLight      = cloudAerialPerspective(tSampleKm, ctx, args, airT);
+  float sampleWeight       = viewTransmittance * dot(airT, vec3(1.0f / 3.0f)) * (1.0f - stepTransmittance);
+  bool  refineLighting     = sampleWeight >= args.cloudLightingLodThreshold;
+
+  vec3 surfaceLight;
+  if (refineLighting || !g_cloudHasLight) {
+    float softUnused;
+    float dSunSoft;
+    // Light paths, marched live on the cloud body (see sampleCloudOpticalDepthLive):
+    // the water overhead, for the diffused skylight, and the cloud along the sun ray. Optical
+    // depths are in units of args.cloudDensity; this slab's own scale with its densityScale.
+    const float sigmaSlab = args.cloudDensity * slab.densityScale;
+    float tauAbove;
+    float tauBelow;
+#ifdef CLOUD_SHADOW_MAP_AVAILABLE
+    if (args.cloudShadowLive != 0u && slab.primary) {
+      const vec2 vertical = sampleCloudVerticalOpticalDepth(AtmosphereCloudVerticalOd, AtmosphereCloudNoise3DSampler,
+                                                            samplePos, hf, args);
+      tauAbove = vertical.x * args.cloudDensity;
+      tauBelow = vertical.y * args.cloudDensity;
+    } else
+#endif
+    if (!slab.primary) {
+      const vec3 up = normalize(samplePos - ctx.planetCenterWorldKm);
+      const vec2 fields = cloudStratiformFieldsForLight(samplePos, slab, args);
+      tauAbove = cloudStratiformColumnOpticalDepth(samplePos, up, 4, fields, typeLocal, coverageLocal, ctx, slab, args)
+               * sigmaSlab;
+      tauBelow = cloudStratiformColumnOpticalDepth(samplePos, -up, 4, fields, typeLocal, coverageLocal, ctx, slab, args)
+               * sigmaSlab;
+    } else {
+      const vec3 up = normalize(samplePos - ctx.planetCenterWorldKm);
+      tauAbove = sampleCloudOpticalDepthLive(samplePos, up, 4, kCloudLightMarchMaxKm, 0, 0.0f, 0, 0.0f, typeLocal,
+                                             coverageLocal, ctx, slab, args, softUnused)
+               * sigmaSlab;
+      tauBelow = sampleCloudOpticalDepthLive(samplePos, -up, 4, kCloudLightMarchMaxKm, 0, 0.0f, 0, 0.0f, typeLocal,
+                                             coverageLocal, ctx, slab, args, softUnused)
+               * sigmaSlab;
+    }
+    float tauSunward;
+    float tauAntiSunward;
+    float dSun;
+#ifdef CLOUD_SHADOW_MAP_AVAILABLE
+    if (args.cloudShadowLive != 0u && slab.primary) {
+      // The sun path past its first kCloudSunDetailKm and the two horizon streams from the shadow
+      // map: the streams read the cloud along the sun ray toward the sun and away from it, which
+      // runs along the horizon at the low sun where those streams matter. The near detail taps stay
+      // live: they are the billows shading their own far side.
+      const CloudSunRay ray = cloudSunRay(samplePos, ctx, slab.altitudeKm, slab.thicknessKm, args);
+#if CLOUD_SUN_BEER_MAP
+      // Performance preset: the whole sun path from the Beer map (front and back depth, total optical
+      // depth per sun ray), no live taps. Billow tops at a low sun read brighter: the map spreads a
+      // ray's cloud evenly between its front and back, so a top's own far side shades it less.
+      // Near the camera the full path stays: inside a cloud every visible sample is near, and the
+      // evenly spread optical depth would light the cloud's interior too brightly.
+      if (tSampleKm >= kCloudBeerMapNearKm) {
+        const vec2 beer = cloudBeerMapRead(AtmosphereCloudBeerMap, cloudShadowLookup(samplePos, 0u, args), ray.w);
+        dSun = beer.x;
+        dSunSoft = beer.y;
+      } else
+#endif
+      {
+        dSun = sampleCloudOpticalDepthLive(samplePos, ctx.sunDirYUp, 0, kCloudSunDetailKm,
+                                           kCloudSunDetailTaps, kCloudSunDetailKm, 0, 0.0f, typeLocal,
+                                           coverageLocal, ctx, slab, args, dSunSoft);
+        const vec2 far = cloudShadowMapOpticalDepth(samplePos, ray, kCloudSunDetailKm, args);
+        dSun += far.x;
+        dSunSoft += far.y;
+      }
+      // Horizon streams: the first kCloudHorizonNearKm live (a cloud's own extent decides how much
+      // horizon light reaches into it, finer than the horizon map's slices), the rest out to
+      // kCloudSunFarKm from the horizon map, as cumulative differences along the horizontal ray.
+      const vec3 H = ctx.sunHorizontalDir;
+      const CloudShadowLookup hLookup = cloudShadowLookup(samplePos, 1u, args);
+      // Whole top-shell chord, as the horizon map is baked (cloudHorizonDepthFraction).
+      const vec3 hRel = samplePos - ctx.planetCenterWorldKm;
+      const float hRho = length(hRel);
+      float hT0, hT1;
+      cloudShadowSphereRoots(hRho, dot(H, hRel / hRho), ctx.planetRadiusKm + slab.altitudeKm + slab.thicknessKm,
+                             hT0, hT1);
+      const float hLength = max(hT1 - hT0, 1e-4f);
+      const float hSunKm = max(hT1, 0.0f);
+      const float cNearSun  = cloudHorizonMapRead(AtmosphereCloudHorizonMap, AtmosphereCloudNoise3DSampler, hLookup,
+                                                  (hSunKm - kCloudHorizonNearKm) / hLength);
+      const float cFarSun   = cloudHorizonMapRead(AtmosphereCloudHorizonMap, AtmosphereCloudNoise3DSampler, hLookup,
+                                                  (hSunKm - kCloudSunFarKm) / hLength);
+      const float cNearAnti = cloudHorizonMapRead(AtmosphereCloudHorizonMap, AtmosphereCloudNoise3DSampler, hLookup,
+                                                  (hSunKm + kCloudHorizonNearKm) / hLength);
+      const float cFarAnti  = cloudHorizonMapRead(AtmosphereCloudHorizonMap, AtmosphereCloudNoise3DSampler, hLookup,
+                                                  (hSunKm + kCloudSunFarKm) / hLength);
+      const float nearSun = sampleCloudOpticalDepthLive(samplePos, H, 0, kCloudHorizonNearKm,
+                                                        kCloudHorizonNearTaps, kCloudHorizonNearKm, 0, 0.0f,
+                                                        typeLocal, coverageLocal, ctx, slab, args, softUnused);
+      const float nearAnti = sampleCloudOpticalDepthLive(samplePos, -H, 0, kCloudHorizonNearKm,
+                                                         kCloudHorizonNearTaps, kCloudHorizonNearKm, 0, 0.0f,
+                                                         typeLocal, coverageLocal, ctx, slab, args, softUnused);
+      tauSunward = (nearSun + max(cNearSun - cFarSun, 0.0f)) * args.cloudDensity;
+      tauAntiSunward = (nearAnti + max(cFarAnti - cNearAnti, 0.0f)) * args.cloudDensity;
+    } else
+#endif
+    {
+      // Layer 2 (always here: the maps cover layer 1) is stratiform and smooth along its light
+      // paths: 2 + 4 horizon taps and a 2 + 2 + 2 sun path look the same as 4 + 4 and 8 + 4 + 8
+      // (fog views max 1/255, a storm's scud max 8) for about 0.4-0.5 ms less in fog views. Fewer
+      // far horizon taps miss scud patches far along the horizon (max 32/255 in a storm).
+      const bool deck = !slab.primary;
+      const int horizonTaps = deck ? 2 : 4;
+      tauSunward = sampleCloudOpticalDepthLive(samplePos, ctx.sunHorizontalDir, horizonTaps,
+                                               kCloudLightMarchMaxKm, 0, 0.0f, 4, kCloudSunFarKm, typeLocal,
+                                               coverageLocal, ctx, slab, args, softUnused) * sigmaSlab;
+      tauAntiSunward = sampleCloudOpticalDepthLive(samplePos, -ctx.sunHorizontalDir, horizonTaps,
+                                                   kCloudLightMarchMaxKm, 0, 0.0f, 4, kCloudSunFarKm, typeLocal,
+                                                   coverageLocal, ctx, slab, args, softUnused) * sigmaSlab;
+      dSun = sampleCloudOpticalDepthLive(samplePos, ctx.sunDirYUp, deck ? 2 : 8, kCloudLightMarchMaxKm,
+                                         deck ? 2 : kCloudSunDetailTaps, kCloudSunDetailKm,
+                                         deck ? 2 : kCloudSunFarTaps, kCloudSunFarKm, typeLocal,
+                                         coverageLocal, ctx, slab, args, dSunSoft) * slab.densityScale;
+      dSunSoft *= slab.densityScale;
+    }
+
+    // The other layer, where it lies between this sample and the key light or the sky above. Light
+    // from below is left alone both ways: a layer underneath reflects more than the ground it hides,
+    // so dimming that stream through it would darken the very bases it brightens.
+    if (!slab.primary) {
+      const vec2 sunPrimary = cloudPrimarySunOpticalDepth(samplePos, ctx, args);
+      dSun += sunPrimary.x;
+      dSunSoft += sunPrimary.y;
+      tauAbove += cloudPrimaryVerticalOpticalDepth(samplePos, ctx, args).x * args.cloudDensity;
+    } else if (args.cloudLayer2Enable != 0u) {
+      const CloudSlab deck = cloudSecondSlab(args);
+      const vec2 sunDeck = cloudSlabOpticalDepthFrom(samplePos, ctx.sunDirYUp, 4, 2, ctx, deck, args);
+      dSun += sunDeck.x;
+      dSunSoft += sunDeck.y;
+      const vec3 up = normalize(samplePos - ctx.planetCenterWorldKm);
+      tauAbove += cloudSlabOpticalDepthFrom(samplePos, up, 3, 0, ctx, deck, args).x * args.cloudDensity;
+    }
+
+    NubisCubedLighting lighting = evalNubisCubedSampleCore(
+        samplePos, tauAbove, tauBelow, tauSunward, tauAntiSunward, ctx, args, dSun, dSunSoft, slab);
+    surfaceLight = lighting.direct + lighting.ambient;
+    g_cloudLastLight = surfaceLight;
+    g_cloudHasLight = true;
+  } else {
+    surfaceLight = g_cloudLastLight;
+  }
+
+  // Composite: cloudColor multiplies all surface-scatter terms.
+  vec3 sampleColor = args.cloudColor * surfaceLight;
+
+#if CLOUD_MARCH_LIGHTNING
+  // Lightning flash glow: screen pass only, and inert unless a strike envelope is live this frame.
+  // An absorbing layer keeps its albedo's share of it.
+  vec3 flash = vec3(0.0f);
+  if (args.lightningFlashIntensity > 0.0f) {
+    flash = evalLightningFlash(samplePos, args);
+    if (!slab.primary) {
+      flash *= slab.albedo;
+    }
+    sampleColor += flash;
+  }
+#endif
+
+
+  // Beer-Lambert step accumulation. effectiveDensity, stepTransmittance and the aerial factors are
+  // computed above, before the lighting, for the contribution-weighted LOD.
+  vec3 stepRadiance = sampleColor * (1.0f - stepTransmittance);
+
+  // The cloud seen through the air in front of it, plus that air's own light.
+  accumColor += stepRadiance * airT * viewTransmittance;
+#if CLOUD_MARCH_LIGHTNING
+  g_cloudFlashAccum += dot(flash * airT, vec3(0.2126f, 0.7152f, 0.0722f))
+                     * ((1.0f - stepTransmittance) * viewTransmittance);
+#endif
+  g_cloudAirAccum += airLight * ((1.0f - stepTransmittance) * viewTransmittance);
+  // Depth companion: sampleWeight is exactly this sample's weight in accumColor above, so the
+  // running sums give a true transmittance-weighted mean distance.
+  sumWeightedDistKm += tSampleKm * sampleWeight;
+  sumWeight         += sampleWeight;
+  if (!slab.primary) {
+    g_cloudLayer2Weight += sampleWeight;
+  }
+  viewTransmittance *= stepTransmittance;
+  return true;
+}
+
+// =============================================================================
+// Ray-slab span in the camera-relative Y-up frame (the ray starts at the origin).
+//
+// Returns a marchable [tEntry, tExit] segment of the spherical shell between the slab's base and
+// top spheres for an eye at any radius, clipped against the planet. The slab along the ray is
+// [t0top, t1top] minus (t0base, t1base); below the deck that is [t1base, t1top].
+//
+// The planet clip ends below-horizon rays where they strike the ground, so the deck's underside
+// runs down to the true horizon and stops there. A ray passing between the horizon and the tangent
+// point misses the planet and keeps going: that is the deck still visible beyond the horizon.
+//
+// spanPiece selects which of up to two crossings to return. Piece 0 is the near crossing and piece
+// 1 the far one. Piece 1 exists only when the eye is above the deck base looking down through it:
+// the ray crosses the shell on the way down and again on the far side of the planet-facing gap,
+// which is the deck's underside seen through a gap. Marching both pieces also keeps the span
+// continuous in eye radius: as the eye sinks to the base, piece 0 shrinks to nothing while piece 1
+// becomes the span of the below-base case.
+bool cloudSlabSpan(vec3 rayDirYUp, vec3 planetCenter, float planetRadiusKm,
+                   float slabAltitudeKm, float slabThicknessKm, int spanPiece,
+                   out float tEntry, out float tExit) {
+  tEntry = 0.0f;
+  tExit  = -1.0f;
+
+  const float baseRadius = planetRadiusKm + slabAltitudeKm;
+  const float topRadius  = planetRadiusKm + slabAltitudeKm + slabThicknessKm;
+
+  float t0top, t1top;
+  if (!intersectSphere(vec3(0.0f), rayDirYUp, planetCenter, topRadius, t0top, t1top)) return false;
+  if (t1top <= 0.0f) return false;
+
+  float t0base, t1base;
+  const bool hitsBase = intersectSphere(vec3(0.0f), rayDirYUp, planetCenter, baseRadius,
+                                        t0base, t1base);
+
+  if (!hitsBase || t1base <= 0.0f) {
+    // Base shell missed entirely, or wholly behind us: the full top-shell chord is slab, and there
+    // is no second crossing.
+    if (spanPiece != 0) return false;
+    tEntry = max(t0top, 0.0f);
+    tExit  = t1top;
+  } else if (t0base > 0.0f) {
+    // Base shell ahead of the eye, so the eye is outside/above it and the ray crosses the shell
+    // twice: down through the near side, then out through the far side.
+    if (spanPiece == 0) {
+      tEntry = max(t0top, 0.0f);
+      tExit  = t0base;
+    } else {
+      // The far crossing: the deck's underside seen through a gap.
+      tEntry = max(t1base, 0.0f);
+      tExit  = t1top;
+    }
+  } else {
+    // Eye at or below the base shell: one crossing only.
+    if (spanPiece != 0) return false;
+    tEntry = max(t1base, 0.0f);
+    tExit  = t1top;
+  }
+
+  float tPlanet0, tPlanet1;
+  if (intersectSphere(vec3(0.0f), rayDirYUp, planetCenter, planetRadiusKm, tPlanet0, tPlanet1)
+      && tPlanet0 > 0.0f) {
+    tExit = min(tExit, tPlanet0);
+  }
+
+  return tExit > tEntry && tExit > 0.0f;
+}
+
+// Distance standing for "this ray hit nothing", far beyond any reachable cloud span.
+static const float kNoSurfaceKm = 1e9f;
+
+// Transmittance limit for every view march loop (Nubis p.174), and the zero of the scale the
+// reported transmittance is expressed on (see the rescale at the end of marchCloudLayers).
+//
+// The loops stop once viewTransmittance falls below this, so the background would still show
+// through cloud the march has declared opaque, at up to 1% of its radiance. Against the sky that is
+// invisible, but the sun here is the Mie aureole baked into the sky-view LUT at mieAnisotropy 0.97,
+// 20-50 radiance units near the sun. 1% of that is several times the radiance of a dark overcast
+// deck, so it would read as a sun disc drawn on top of opaque cloud. Physically a 1.5 km deck at
+// sigma 6.7 passes exp(-10) ~ 5e-5, not 1e-2.
+//
+// So the reported transmittance is rescaled once per ray to a scale whose zero is this threshold:
+// a ray that took the early exit reports exactly 0 and leaks nothing. Any rule that removes the
+// leak on one side of a boundary and keeps it on the other draws that boundary in the sky at up to
+// 1% of an HDR background. A sun-angle-dependent threshold draws a dark circle around the sun, and
+// zeroing T at the break draws a hard line along the T = threshold contour, nearly horizontal near
+// a low sun. The rescale has no boundary: it is continuous and monotone in T, exact at T = 1, and
+// reaches 0 where the march stops.
+//
+// Marching every opaque ray down to 1e-4 instead would cost ~12 more steps at the ~0.4 optical
+// depth of an interior step, 15-20% of the pass, to refine pixels that are already opaque by at
+// most 1% of the background.
+static const float kCloudExitTransmittance = 0.01f;
+
+// Density evaluation counter, a per-thread static so counting needs no signature changes. The
+// screen pass zeroes it before marchCloudLayers and writes the total into the depth companion's .w
+// channel for the sample statistics and debug views. Density evaluation dominates the march
+// (lighting is ~17% of it), so this shows where the march spends its budget.
+static uint g_cloudMarchSamples;
+
+// Where this ray's march stopped on the transmittance limit: the distance (km) of the first sample
+// it skipped and the crossing (marchCloudLayers' sorted index) it was in; -1 = it never stopped
+// early. The disk aureole measures the cloud past that point (cloudCrossingRestOpticalDepth).
+static float g_cloudExitTKm = -1.0f;
+static uint g_cloudExitCrossing = 0u;
+static uint g_cloudCurrentCrossing = 0u;
+
+void cloudNoteExit(float tKm) {
+  if (g_cloudExitTKm < 0.0f) {
+    g_cloudExitTKm = tKm;
+    g_cloudExitCrossing = g_cloudCurrentCrossing;
+  }
+}
+
+// One crossing of a slab by the view ray (cloudSlabSpan's piece), clipped to [tMinClamp, tMaxClamp]
+// (tMaxClamp 0 = no far clip) and to the camera: false when nothing of it is left.
+bool cloudCrossingSpan(vec3 viewDirYUp, CloudSlab slab, int spanPiece, float tMinClamp, float tMaxClamp,
+                       CloudShadeContext ctx, out float tEntry, out float tExit) {
+  if (!cloudSlabSpan(viewDirYUp, ctx.planetCenterKm, ctx.planetRadiusKm,
+                     slab.altitudeKm, slab.thicknessKm, spanPiece, tEntry, tExit)) return false;
+
+  tEntry = max(tEntry, tMinClamp);
+  if (tMaxClamp > 0.0f) {
+    tExit = min(tExit, tMaxClamp);
+  }
+  if (tEntry >= tExit || tExit <= 0.0f) return false;
+  tEntry = max(tEntry, 0.0f);
+  return true;
+}
+
+// The crossing's coverage / type control fields at its entry and exit (cloudMarchDensity lerps
+// between them). The type reads the crease-free cloudControlFieldSmooth2D: the Worley field's
+// straight Voronoi creases show as lines where the type changes the clouds' erosion and, under a
+// stratiform sheet, its shading.
+void cloudCrossingFields(vec3 viewDirYUp, CloudSlab slab, float tEntry, float tExit, AtmosphereArgs args,
+                         out float typeNoiseEntry, out float typeNoiseExit,
+                         out float coverageNoiseEntry, out float coverageNoiseExit) {
+  vec3 entryPosCF = args.cameraWorldPosYUpKm + viewDirYUp * tEntry;
+  vec3 exitPosCF  = args.cameraWorldPosYUpKm + viewDirYUp * tExit;
+  vec2 entryXZ = vec2(entryPosCF.x, entryPosCF.z);
+  vec2 exitXZ  = vec2(exitPosCF.x,  exitPosCF.z);
+  typeNoiseEntry = 0.5f;
+  typeNoiseExit = 0.5f;
+  coverageNoiseEntry = 0.5f;
+  coverageNoiseExit = 0.5f;
+  if (slab.typeSpread != 0.0f) {
+    typeNoiseEntry = cloudControlFieldSmooth2D(entryXZ * args.cloudTypeNoiseScale, 200.0f + slab.noiseSeed);
+    typeNoiseExit = cloudControlFieldSmooth2D(exitXZ * args.cloudTypeNoiseScale, 200.0f + slab.noiseSeed);
+  }
+  if (slab.coverageSpread != 0.0f) {
+    coverageNoiseEntry = cloudControlField2D(entryXZ * args.cloudCoverageNoiseScale, 250.0f + slab.noiseSeed);
+    coverageNoiseExit = cloudControlField2D(exitXZ * args.cloudCoverageNoiseScale, 250.0f + slab.noiseSeed);
+  }
+}
+
+void marchCloudSlab(vec3   viewDirYUp,
+                    float  pixelJitter,
+                    float  pixelJitterStatic,
+                    CloudSlab slab,
+                    float  tMinClamp,
+                    float  tMaxClamp,
+                    // Which slab crossing to march; see cloudSlabSpan. Callers march piece 0, then
+                    // piece 1, so accumulation stays front-to-back across both.
+                    int    spanPiece,
+                    uint   sampleCount,
+                    CloudShadeContext ctx,
+                    AtmosphereArgs args,
+                    inout vec3  accumColor,
+                    inout float viewTransmittance,
+                    // Depth-companion accumulators, shared by every crossing of both layers (see
+                    // integrateCloudSample).
+                    inout float entryDistanceKm,
+                    inout float sumWeightedDistKm,
+                    inout float sumWeight) {
+  // Slab crossing, sharing the planet centre and radius with the rest of the atmosphere and clipped
+  // against the planet (see cloudSlabSpan).
+  float tEntry, tExit;
+  if (!cloudCrossingSpan(viewDirYUp, slab, spanPiece, tMinClamp, tMaxClamp, ctx, tEntry, tExit)) return;
+
+  // entryDistanceKm is set by integrateCloudSample at the first sample with real density, not at
+  // the slab's geometric entry: the composite ramps cloud occlusion up from the entry distance, and
+  // the slab geometry can start kilometres before the nearest cloud. A ray whose slab is empty
+  // leaves the caller's -1 ("no cloud on this pixel").
+
+  // Adaptive step count. The span ranges from ~4 km at the zenith to 50+ km for horizon-grazing
+  // rays through the curved shell, so a fixed step count would sample ~2 km cloud features with
+  // ~1.6 km steps near the horizon, and the aliasing would show as soft horizontal bands. The count
+  // holds a target step length instead: span / cloudViewStepKm, floored at the base count when the
+  // cap allows and capped at cloudViewSamplesMax. cloudViewStepKm = 0 gives the fixed count.
+  uint effSampleCount = sampleCount;
+  if (args.cloudViewStepKm > 0.001f) {
+    uint wanted = uint(ceil((tExit - tEntry) / args.cloudViewStepKm));
+    uint maxSamples = max(uint(args.cloudViewSamplesMax), 2u);
+    effSampleCount = clamp(wanted, min(sampleCount, maxSamples), maxSamples);
+  }
+
+  float stepLen = (tExit - tEntry) / float(effSampleCount);
+
+  // Coverage and type control fields, evaluated at the crossing's entry and exit and lerped per
+  // step. The fields vary at a ~300 km wavelength (cloudCoverage/TypeNoiseScale ~ 0.0033 cycles/km)
+  // while a slab ray spans at most ~100 km, so evaluating the 9-hash Worley field per step is
+  // redundant. The lerp is exact at the endpoints; in between it only smooths weather-region
+  // boundaries along the ray, far below the jitter noise.
+  float typeNoiseEntry, typeNoiseExit, coverageNoiseEntry, coverageNoiseExit;
+  cloudCrossingFields(viewDirYUp, slab, tEntry, tExit, args,
+                      typeNoiseEntry, typeNoiseExit, coverageNoiseEntry, coverageNoiseExit);
+
+  // The sqrt-adaptive march needs a nonzero adaptive step floor (the setting is its off switch) and
+  // a step-length target to grow from.
+  bool adaptiveMarch = args.nubis3AdaptiveStepKm > 1e-4f
+                    && args.cloudViewStepKm > 0.001f;
+
+  if (!adaptiveMarch) {
+    // ---- Fixed-length lattice march ----
+    for (uint i = 0u; i < effSampleCount; ++i) {
+      if (viewTransmittance < kCloudExitTransmittance) {
+        cloudNoteExit(tEntry + stepLen * float(i));  // the start of the segment not marched
+        break;
+      }
+
+      float t = tEntry + stepLen * (float(i) + pixelJitter);
+      float rayFrac = (float(i) + pixelJitter) / float(effSampleCount);
+      float sdfStepKm;
+      ++g_cloudMarchSamples;
+      bool sampled = integrateCloudSample(t, stepLen, rayFrac, viewDirYUp, slab,
+                                          typeNoiseEntry, typeNoiseExit,
+                                          coverageNoiseEntry, coverageNoiseExit,
+                                          ctx, args, accumColor, viewTransmittance,
+                                          sdfStepKm, sumWeightedDistKm, sumWeight, entryDistanceKm);
+      // SDF empty-space skip. The sampler reports a radius around this sample that is guaranteed
+      // empty, so the loop index jumps to land the next sample just inside it. Whole-index jumps
+      // keep every sample on the jittered stratified lattice, so the temporal behaviour does not
+      // change. nvdfStepScale is a safety factor on top (0 disables the skip), and the advance is
+      // capped because the loop bound comes from the constant buffer.
+      if (!sampled && args.nvdfStepScale > 0.0f) {
+        float skipKm = sdfStepKm * args.nvdfStepScale;
+        if (skipKm > stepLen) {
+          uint advance = uint(min(floor(skipKm / stepLen), 4096.0f));
+          i += advance - 1u;  // the loop's ++i completes the advance
+        }
+      }
+    }
+    return;
+  }
+
+  // ---- sqrt-adaptive hybrid march (Nubis pp. 172, 174) ----
+  // A fixed step length caps the detail: 100 m steps cannot resolve the sub-200 m content of the
+  // detail volume. The paper marches
+  //   step = max(SDF distance, adaptive),  adaptive = sqrt(dist) * k,
+  // sphere-tracing past empty air and sampling finely near the camera, coarsening with distance as
+  // the pixel footprint grows. Here cloudViewStepKm keeps its meaning at the noise-tile distance:
+  //   adaptive(t) = clamp(cloudViewStepKm * sqrt(t / 12 km),
+  //                       nubis3AdaptiveStepKm, 4 * cloudViewStepKm)
+  // which gives 100 m at 12 km, ~30 m at a 1.3 km deck base, the floor (default 25 m) when flying
+  // through, and ~400 m at the far horizon. Sample positions are jittered inside each cell; the
+  // cursor is not. A ray that runs out of budget gets the coarse tail integration below.
+  const float kAdaptiveRefDistKm = 12.0f;  // adaptive == cloudViewStepKm here
+  // Animated by default so sampling error does not become a fixed screen-space pattern.
+  const float kJitterAnimateKm   = args.nubis3JitterAnimateKm;
+  float adaptiveCeilKm = max(4.0f * args.cloudViewStepKm, args.nubis3AdaptiveStepKm);
+  uint  iterCap = max(uint(args.cloudViewSamplesMax), 2u);
+  float t = tEntry;
+  float sdfStepKm = 0.0f;  // previous sample's conservative empty radius
+  // Far end of the previous sample's guaranteed-empty interval, as a distance along the ray (see
+  // the skip below). tEntry means nothing is proven yet, so the first iteration takes the adaptive
+  // step.
+  float tEmptyUntilKm = tEntry;
+  // Phase of the fixed-step lattice, re-drawn every frame (see the lattice restart below).
+  const float latticePhase = g_cloudLightJitterSeed >= 0.0f
+    ? frac(g_cloudLightJitterSeed + 0.7548776662f) : 1.0f;
+  bool latticeRestart = true;
+  for (uint iter = 0u; iter < iterCap && t < tExit; ++iter) {
+    if (viewTransmittance < kCloudExitTransmittance) {  // transmittance-limit exit (p.174)
+      cloudNoteExit(t);
+      break;
+    }
+
+    float stepKm = clamp(args.cloudViewStepKm * sqrt(t * (1.0f / kAdaptiveRefDistKm)),
+                         args.nubis3AdaptiveStepKm, adaptiveCeilKm);
+    // Lattice restart. Each skip through empty air ends at the body's bounding surface and the
+    // fixed steps start from there, so without this the cells would sit at the same offsets from
+    // the real (billow-displaced) surface every frame: the sample jitter moves a sample within its
+    // cell, never the cells, and the cells' quadrature error would draw the displacement's contours
+    // as ribs. Shortening the first fixed step after a skip by a per-frame random phase spreads the
+    // cells over all offsets, and the temporal filter averages the error flat. Only the step where a
+    // skip meets a surface is shortened (the last sample's empty radius has fallen below a step);
+    // shortening every step through clear air would double the march's iterations.
+    const float adaptiveKm = clamp(args.cloudViewStepKm * sqrt(t * (1.0f / kAdaptiveRefDistKm)),
+                                   args.nubis3AdaptiveStepKm, adaptiveCeilKm);
+    if (sdfStepKm > 2.0f * adaptiveKm) {
+      latticeRestart = true;
+    } else if (latticeRestart && sdfStepKm < adaptiveKm) {
+      latticeRestart = false;
+      stepKm *= max(latticePhase, 0.05f);
+    }
+    stepKm = min(stepKm, tExit - t);  // final-segment Beer length stays exact
+    if (stepKm <= 1e-5f) break;       // FP guard: t += denormal would stall
+
+    float hash    = t < kJitterAnimateKm ? pixelJitter : pixelJitterStatic;
+    float tSample = t + hash * stepKm;
+    // Decorrelated from the view jitter, and different for each sample along the ray. A golden-
+    // ratio shift keeps a blue-noise seed blue, so neighbouring pixels' errors cancel in the
+    // temporal filter's 3x3 tent; scaling the seed (hash * 7.31, the fallback) makes it white noise.
+    const float lightSeed = g_cloudLightJitterSeed >= 0.0f ? g_cloudLightJitterSeed : frac(hash * 7.31f);
+    g_cloudLightJitter = frac(lightSeed + float(iter) * 0.6180339887f);
+    float rayFrac = saturate((tSample - tEntry) / (tExit - tEntry));
+    ++g_cloudMarchSamples;
+    integrateCloudSample(tSample, stepKm, rayFrac, viewDirYUp, slab,
+                         typeNoiseEntry, typeNoiseExit,
+                         coverageNoiseEntry, coverageNoiseExit,
+                         ctx, args, accumColor, viewTransmittance,
+                         sdfStepKm, sumWeightedDistKm, sumWeight, entryDistanceKm);
+    // The interval this sample proved empty, in ray distance; the next iteration skips to it
+    // from wherever its cursor is (see above).
+    tEmptyUntilKm = tSample + sdfStepKm;
+    t += stepKm;
+    // Advance only through the remainder of the sample-anchored empty interval.
+    // Feeding this distance into a jittered sample instead re-evaluates known empty air.
+    const float emptyAdvanceKm = max(tEmptyUntilKm - t, 0.0f) * saturate(args.nvdfStepScale);
+    t = min(t + emptyAdvanceKm, tExit);
+  }
+
+  // Budget-exhausted tail. Near the deck a ray can spend its whole budget on the fine adaptive steps
+  // through the cloud in front of it and reach iterCap a few km out. Dropping the rest of the ray
+  // would cut the cloud off along a hard line across the sky, since the exhaustion distance is about
+  // the same for every ray in a direction. The cap should cost detail, not cloud, so the remainder
+  // is integrated coarsely: four long Beer-Lambert segments over [t, tExit]. One segment would let a
+  // single dense hit turn the whole remaining span opaque, a hard dark line instead of a bright one.
+  // Only rays that exhausted the budget pay, four samples on top of the cap.
+  if (t < tExit && viewTransmittance <= kCloudExitTransmittance) {
+    cloudNoteExit(t);  // opaque when the budget ran out: the tail below is skipped
+  }
+  if (t < tExit && viewTransmittance > kCloudExitTransmittance) {
+    const uint  kTailSamples = 4u;
+    const float tailStepKm   = (tExit - t) / float(kTailSamples);
+    if (tailStepKm > 1e-5f) {
+      for (uint tail = 0u; tail < kTailSamples; ++tail) {
+        if (viewTransmittance < kCloudExitTransmittance) {
+          cloudNoteExit(t + float(tail) * tailStepKm);
+          break;
+        }
+        const float tSample = t + (float(tail) + 0.5f) * tailStepKm;
+        const float rayFrac = saturate((tSample - tEntry) / max(tExit - tEntry, 1e-6f));
+        ++g_cloudMarchSamples;
+        integrateCloudSample(tSample, tailStepKm, rayFrac, viewDirYUp, slab,
+                             typeNoiseEntry, typeNoiseExit,
+                             coverageNoiseEntry, coverageNoiseExit,
+                             ctx, args, accumColor, viewTransmittance,
+                             sdfStepKm, sumWeightedDistKm, sumWeight, entryDistanceKm);
+      }
+    }
+  }
+}
+
+// =============================================================================
+// Disk aureole: the cloud droplets' diffraction peak (docs/night-sky.md, "Disk aureole")
+// =============================================================================
+//
+// About half of a droplet's extinction (args.cloudForwardPeakWeight = f) is diffraction into a peak
+// a degree or so wide, which the march's phase function (the broad lobe) does not hold. The march's
+// view transmittance T = exp(-tau) is the unscattered beam; the light that reaches the camera after
+// one or more peak scatterings and no broad one is exp(-(1 - f) tau) - exp(-tau), spread by an HG
+// lobe sized to the droplet's Airy pattern (1 - g = 0.671 lambda / d, per channel) and widened by n
+// peak scatterings to HG with g^n (n: the aureole light's mean count).
+//
+// It is computed in the march because it needs the cloud's true optical depth: past the march's exit
+// (T < kCloudExitTransmittance) the reported transmittance is 0 while the forward channel
+// exp(-(1 - f) tau) is still ~0.1 and decays only over about twice the depth. Read from the
+// reported transmittance, the aureole would fall from ~0.1 of the light to 0 on the exit contour, a
+// hard bright outline around thick cloud near the sun.
+//
+// So a ray that stopped early measures the cloud it did not march (cloudCrossingRestOpticalDepth):
+// density only, no light, with the march's own density field (cloudMarchDensity, the same span and
+// control fields), from where it stopped to the end of that crossing and through every later one.
+// This keeps the aureole continuous across the exit contour: neighbouring rays on either side of it
+// see the same cloud, one marched and one measured, and differ only by quadrature, which vanishes
+// where little cloud is left. Extrapolating the mean extinction over the rest of the slab shell
+// would not work: the shell runs far past the cloud's far side (tens of km toward a low sun) and
+// would jump from 0 to tens of optical depths across the contour. The taps start at the march's own
+// step length and double, so the cloud right behind the stop point is resolved as the march
+// resolves it and distant cloud is still counted. Added to the cloud's own radiance, the aureole
+// goes through the temporal filter and the dome LUT like the rest of the cloud's light.
+
+// The share of a light that arrives as aureole through cloud of optical depth tau, and the mean
+// number of peak scatterings in it.
+float cloudAureoleShare(float tau, float f, out float meanScatters) {
+  const float lambda = f * tau;
+  meanScatters = lambda > 1e-4f ? lambda / (1.0f - exp(-lambda)) : 1.0f + 0.5f * lambda;
+  return max(exp(-(1.0f - f) * tau) - exp(-tau), 0.0f);
+}
+
+// Henyey-Greenstein per steradian between unit directions a and b, per channel, exact for g near 1
+// at small angles: 1 + g^2 - 2 g cos = (1 - g)^2 + g |a - b|^2.
+vec3 cloudAureoleKernel(vec3 a, vec3 b, vec3 g) {
+  const vec3 d = a - b;
+  const float chord2 = dot(d, d);
+  const vec3 oneMinusG = vec3(1.0f) - g;
+  const vec3 denom = oneMinusG * oneMinusG + g * chord2;
+  return (vec3(1.0f) - g * g) / (4.0f * kPi * denom * sqrt(denom));
+}
+
+// The march's step length at distance tKm (the adaptive march's; marchCloudSlab).
+float cloudMarchStepKmAt(float tKm, AtmosphereArgs args) {
+  const float ceilKm = max(4.0f * args.cloudViewStepKm, args.nubis3AdaptiveStepKm);
+  return max(clamp(args.cloudViewStepKm * sqrt(max(tKm, 0.0f) * (1.0f / 12.0f)), args.nubis3AdaptiveStepKm, ceilKm),
+             0.01f);
+}
+
+// Optical depth (args.cloudDensity applied) of one crossing from tFromKm on, density only:
+// kCloudAureoleRestTaps segments that start at the march's step length and double, each tap
+// jittered inside its segment, stopping at the crossing's end.
+static const uint kCloudAureoleRestTaps = 8u;
+float cloudCrossingRestOpticalDepth(vec3 viewDirYUp, CloudSlab slab, int piece, float tMinClamp, float tMaxClamp,
+                                    float tFromKm, float jitter, CloudShadeContext ctx, AtmosphereArgs args) {
+  float tEntry, tExit;
+  if (!cloudCrossingSpan(viewDirYUp, slab, piece, tMinClamp, tMaxClamp, ctx, tEntry, tExit)) {
+    return 0.0f;
+  }
+  float typeNoiseEntry, typeNoiseExit, coverageNoiseEntry, coverageNoiseExit;
+  cloudCrossingFields(viewDirYUp, slab, tEntry, tExit, args,
+                      typeNoiseEntry, typeNoiseExit, coverageNoiseEntry, coverageNoiseExit);
+  float t = max(tFromKm, tEntry);
+  float segKm = cloudMarchStepKmAt(t, args);
+  float tau = 0.0f;
+  for (uint k = 0u; k < kCloudAureoleRestTaps && t < tExit; ++k) {
+    const float lenKm = min(segKm, tExit - t);
+    const float tSample = t + jitter * lenKm;
+    const float rayFrac = saturate((tSample - tEntry) / max(tExit - tEntry, 1e-6f));
+    vec3 samplePos;
+    float hf, typeLocal, coverageLocal, sdfUnused;
+    tau += cloudMarchDensity(tSample, lenKm, rayFrac, viewDirYUp, slab,
+                             typeNoiseEntry, typeNoiseExit, coverageNoiseEntry, coverageNoiseExit,
+                             ctx, args, samplePos, hf, typeLocal, coverageLocal, sdfUnused)
+         * args.cloudDensity * lenKm;
+    t += lenKm;
+    segKm *= 2.0f;
+  }
+  return tau;
+}
+
+// The aureole of `light` (toward lightDir) through cloud of optical depth tau.
+vec3 cloudAureoleOf(vec3 viewDirYUp, vec3 lightDir, vec3 light, float tau, AtmosphereArgs args) {
+  float meanScatters;
+  const float share = cloudAureoleShare(tau, args.cloudForwardPeakWeight, meanScatters);
+  if (share <= 0.0f) {
+    return vec3(0.0f);
+  }
+  const vec3 g1 = saturate(vec3(1.0f) - 0.671f * vec3(0.65f, 0.55f, 0.45f) / max(args.cloudDropletDiameterUm, 1.0f));
+  const vec3 g = pow(max(g1, vec3(1e-4f)), vec3(meanScatters));
+  return light * cloudAureoleKernel(viewDirYUp, lightDir, g) * share;
+}
+
+// The key light's aureole toward viewDirYUp, through the air in front of it (the cloud args' sun
+// slot: the sun, or the moon that lights the clouds at night), in the march's radiance units.
+// viewTransmittance is the marched (unrescaled) one; cloudRadiance the cloud's own light on this ray.
+// A ray that stopped early adds the cloud past its stop over the remaining crossings. That rest only
+// lowers the aureole (its share falls with depth beyond tau ~1.4, and the march stops at 4.6), so the
+// aureole at the marched depth bounds it; where the bound is under 2% of the cloud's own light the
+// measurement is skipped and the bound used: an error under 2% of the pixel, too small to show as an
+// edge, and the measurement's cost stays with the rays the aureole can reach.
+vec3 cloudAureoleRadiance(vec3 viewDirYUp, float viewTransmittance, vec3 cloudRadiance, float pixelJitter,
+                          float tMinClamp, float tMaxClamp, CloudSlab slabs[2], uint crossing[4],
+                          uint crossingCount, CloudShadeContext ctx, AtmosphereArgs args) {
+  if (args.cloudForwardPeakWeight <= 0.0f || viewTransmittance >= 1.0f) {
+    return vec3(0.0f);
+  }
+  // Below the horizon its air mass grows steeply, so a set sun or moon fades out.
+  const vec3 light = args.sunIlluminance * getAtmosphericTransmittanceForDir(ctx.sunDirYUp, args);
+  float tau = -log(max(viewTransmittance, 1e-30f));
+  vec3 aureole = cloudAureoleOf(viewDirYUp, ctx.sunDirYUp, light, tau, args);
+  const vec3 lumWeights = vec3(0.2126f, 0.7152f, 0.0722f);
+  if (g_cloudExitTKm >= 0.0f && dot(aureole, lumWeights) > 0.02f * dot(cloudRadiance, lumWeights)) {
+    const float jitter = frac(pixelJitter + 0.3819660113f);  // decorrelated from the view samples
+    for (uint c = g_cloudExitCrossing; c < crossingCount && tau < 24.0f; ++c) {
+      const uint layer = crossing[c] >> 1u;
+      const float fromKm = c == g_cloudExitCrossing ? g_cloudExitTKm : 0.0f;
+      tau += cloudCrossingRestOpticalDepth(viewDirYUp, slabs[layer], int(crossing[c] & 1u), tMinClamp, tMaxClamp,
+                                           fromKm, jitter, ctx, args);
+    }
+    aureole = cloudAureoleOf(viewDirYUp, ctx.sunDirYUp, light, tau, args);
+  }
+  return min(aureole, vec3(6.0e4f));
+}
+
+// =============================================================================
+// Both-layer march: layer 1 (the cumulus deck) and, when cloudLayer2Enable is set, layer 2 (a
+// stratiform layer: ground fog, stratus, a high deck, dust). Shared so the secondary-ray LUT bake
+// composites the layers identically.
+//
+// Every crossing of every layer is marched in the order the ray meets it: a slab is
+// crossed once, or twice by a ray from above its base looking down through it (cloudSlabSpan),
+// and with nested shells the crossings of the two layers never interleave, so marching them by
+// entry distance keeps the composite front to back with the camera below, between or above both
+// layers, or inside either. Layers that overlap in altitude are the exception: their crossings
+// overlap along the ray and are composited one after the other, nearer entry first.
+// =============================================================================
+void marchCloudLayers(vec3  viewDirYUp,
+                      float pixelJitter,
+                      float pixelJitterStatic,
+                      float tMinClamp,
+                      float tMaxClamp,
+                      uint  sampleCount,
+                      CloudShadeContext ctx,
+                      AtmosphereArgs args,
+                      inout vec3  accumColor,
+                      inout float viewTransmittance,
+                      // Depth-companion outputs. entryDistanceKm: the nearest distance (km) at
+                      // which either layer found cloud material, or -1 if neither did.
+                      // meanCloudDepthKm: the transmittance-weighted mean distance (km) through
+                      // the cloud material both layers found along the ray, or 0 if none. Only
+                      // cloud_render.comp.slang consumes these; the dome LUT passes throwaways.
+                      out float entryDistanceKm,
+                      out float meanCloudDepthKm) {
+  // Per-ray shading precompute, shared by every crossing.
+  ctx = cloudShadeContextBeginRay(ctx, viewDirYUp, args);
+
+  entryDistanceKm = -1.0f;
+  float sumWeightedDistKm = 0.0f;
+  float sumWeight = 0.0f;
+  g_cloudLayer2Weight = 0.0f;
+  g_cloudExitTKm = -1.0f;
+
+  CloudSlab slabs[2];
+  slabs[0] = cloudPrimarySlab(args);
+  slabs[1] = cloudSecondSlab(args);
+  const uint layerCount = args.cloudLayer2Enable != 0u ? 2u : 1u;
+
+  // The crossings on this ray, sorted by entry distance: (layer << 1) | piece.
+  float crossingEntry[4];
+  uint crossing[4];
+  uint crossingCount = 0u;
+  for (uint layer = 0u; layer < layerCount; ++layer) {
+    for (uint piece = 0u; piece < 2u; ++piece) {
+      float tEntry, tExit;
+      if (!cloudSlabSpan(viewDirYUp, ctx.planetCenterKm, ctx.planetRadiusKm, slabs[layer].altitudeKm,
+                         slabs[layer].thicknessKm, int(piece), tEntry, tExit)) {
+        continue;
+      }
+      uint i = crossingCount;
+      while (i > 0u && crossingEntry[i - 1u] > tEntry) {
+        crossingEntry[i] = crossingEntry[i - 1u];
+        crossing[i] = crossing[i - 1u];
+        --i;
+      }
+      crossingEntry[i] = tEntry;
+      crossing[i] = (layer << 1u) | piece;
+      ++crossingCount;
+    }
+  }
+
+  uint lastLayer = 0u;
+  for (uint c = 0u; c < crossingCount; ++c) {
+    g_cloudCurrentCrossing = c;
+    if (viewTransmittance < kCloudExitTransmittance) {
+      cloudNoteExit(crossingEntry[c]);  // the crossings from here on were not marched
+      break;
+    }
+    const uint layer = crossing[c] >> 1u;
+    // The lighting LOD reuses the last lit sample's light along the ray; never across layers.
+    if (layer != lastLayer) {
+      g_cloudHasLight = false;
+      lastLayer = layer;
+    }
+    marchCloudSlab(viewDirYUp, pixelJitter, pixelJitterStatic, slabs[layer],
+                   tMinClamp, tMaxClamp, int(crossing[c] & 1u),
+                   sampleCount, ctx, args,
+                   accumColor, viewTransmittance,
+                   entryDistanceKm, sumWeightedDistKm, sumWeight);
+  }
+
+  // Transmittance is reported on the scale whose zero is the march's exit threshold (see
+  // kCloudExitTransmittance):
+  //
+  //   T' = max(0, (T - e) / (1 - e)),   C' = C / (1 - e),   e = kCloudExitTransmittance
+  //
+  // Every ray that stopped on the transmittance limit was below e, so it lands at exactly 0 and no
+  // background reaches a pixel the march called opaque. Every other ray moves continuously (T' is
+  // monotone in T and exactly 1 at T = 1), so the threshold draws no contour.
+  //
+  // The radiance takes the same factor, so the result is the same cloud 1% more opaque rather than
+  // a darkening by 1% of the background. The energy the shift removes from the background is
+  // (T - T') x Lbar, where Lbar = accumColor / (1 - T) is the mean cloud radiance already measured;
+  // with T - T' = e(1 - T)/(1 - e) that is exactly C x e/(1 - e), so C' = C/(1 - e) and the pair
+  // stays a valid premultiplied (radiance, transmittance) cloud.
+  //
+  // It is applied once per ray, after every crossing of both layers: transmittance is
+  // multiplicative, so a per-loop shift would compound.
+  // The air in front of the clouds, with its cloud shadow (cloudAirLightKeep), once per ray.
+  if (any(g_cloudAirAccum > vec3(0.0f))) {
+    accumColor += g_cloudAirAccum
+                * (entryDistanceKm > 0.0f ? cloudAirLightKeep(entryDistanceKm, ctx, args) : vec3(1.0f));
+  }
+  // The key light's aureole (cloudAureoleRadiance), from the ray's true optical depth: before the
+  // rescale below, which is for the sharp disk and the background only.
+  const vec3 aureole = cloudAureoleRadiance(viewDirYUp, viewTransmittance, accumColor, pixelJitter, tMinClamp,
+                                            tMaxClamp, slabs, crossing, crossingCount, ctx, args);
+  const float kExitRescale = 1.0f / (1.0f - kCloudExitTransmittance);
+  accumColor        *= kExitRescale;
+#if CLOUD_MARCH_LIGHTNING
+  g_cloudFlashAccum *= kExitRescale;
+#endif
+  viewTransmittance  = max(0.0f, (viewTransmittance - kCloudExitTransmittance) * kExitRescale);
+  accumColor        += aureole;
+
+  // Finalize the depth companion now that both layers have contributed. sumWeight stays ~0 only
+  // when neither layer put cloud on the ray (both slabs missed, or every sample was empty); the mean
+  // is meaningless there, so it reports the "no cloud" value 0 instead of dividing by zero.
+  meanCloudDepthKm = (sumWeight > 1e-6f) ? (sumWeightedDistKm / sumWeight) : 0.0f;
+  g_cloudLayer2Share = (sumWeight > 1e-6f) ? saturate(g_cloudLayer2Weight / sumWeight) : 0.0f;
+}
