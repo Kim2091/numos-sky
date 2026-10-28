@@ -14,7 +14,7 @@
 
 namespace numos::detail {
 
-// AtmosphereArgs: 175 members, 1424 bytes in the shader layout
+// AtmosphereArgs: 179 members, 1440 bytes in the shader layout
 static_assert(offsetof(AtmosphereArgs, sunDirection) == 0, "AtmosphereArgs::sunDirection offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, planetRadius) == 12, "AtmosphereArgs::planetRadius offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, sunIlluminance) == 16, "AtmosphereArgs::sunIlluminance offset differs from the shader");
@@ -189,8 +189,12 @@ static_assert(offsetof(AtmosphereArgs, cloudShadowHalfV) == 1376, "AtmosphereArg
 static_assert(offsetof(AtmosphereArgs, cloudShadowBakeTarget) == 1408, "AtmosphereArgs::cloudShadowBakeTarget offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, cloudShadowBakeRow0) == 1412, "AtmosphereArgs::cloudShadowBakeRow0 offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, nightSkyGain) == 1416, "AtmosphereArgs::nightSkyGain offset differs from the shader");
-static_assert(offsetof(AtmosphereArgs, pad5) == 1420, "AtmosphereArgs::pad5 offset differs from the shader");
-static_assert(sizeof(AtmosphereArgs) >= 1424, "AtmosphereArgs is smaller than the shader layout");
+static_assert(offsetof(AtmosphereArgs, apDebugNitsPerUnit) == 1420, "AtmosphereArgs::apDebugNitsPerUnit offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, apDebugView) == 1424, "AtmosphereArgs::apDebugView offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, apDebugRadianceScale) == 1428, "AtmosphereArgs::apDebugRadianceScale offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, padApDebug0) == 1432, "AtmosphereArgs::padApDebug0 offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, padApDebug1) == 1436, "AtmosphereArgs::padApDebug1 offset differs from the shader");
+static_assert(sizeof(AtmosphereArgs) >= 1440, "AtmosphereArgs is smaller than the shader layout");
 
 // MoonParams: 12 members, 96 bytes in the shader layout
 static_assert(offsetof(MoonParams, direction) == 0, "MoonParams::direction offset differs from the shader");

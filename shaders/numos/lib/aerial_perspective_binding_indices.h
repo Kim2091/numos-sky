@@ -33,6 +33,8 @@
 #define AP_LIGHTING_OUTPUT               8
 #define AP_LIGHTING_OUTPUT_AUX           9
 #define AP_LIGHTING_INJECTION            10
+#define AP_LIGHTING_LINEAR_VIEW_Z        11
+#define AP_LIGHTING_SURFACE_ARGS         12
 
 // aerial_perspective_froxel_integrate: front-to-back integration of every froxel column.
 #define AP_INTEGRATE_ATMOSPHERE_ARGS     0
@@ -45,3 +47,5 @@
 #define AP_INTEGRATE_CLOUD_SHADOW_MAP    7
 #define AP_INTEGRATE_CLOUD_SAMPLER       8
 #define AP_INTEGRATE_OUTPUT              9
+#define AP_INTEGRATE_LINEAR_VIEW_Z       10
+#define AP_INTEGRATE_SURFACE_ARGS        11

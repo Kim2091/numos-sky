@@ -165,11 +165,14 @@ struct Renderer::Impl {
   struct ApHistoryKey {
     uint32_t x, y, z;
     float range, unitsPerKm, fogExtinction, fogScaleHeight;
+    // Traced and untraced visibility mean different things; neither may inherit the other's.
+    uint32_t sceneShadow;
   };
   ApGrid apGrid() const;
   void ensureAerialPerspectiveResources(PassRecorder& rec, const ApGrid& grid);
   void buildAerialPerspectiveLights(PassRecorder& rec);
   void dispatchAerialPerspective(PassRecorder& rec);
+  void dispatchAerialPerspectiveNear(PassRecorder& rec, GpuHandle linearViewZ, float missLinearViewZ);
   void dispatchCloudPlacementMapBake(PassRecorder& rec);
   bool needsCloudPlacementRebake() const;
   void cacheCloudPlacementBakeInputs();
@@ -264,11 +267,17 @@ struct Renderer::Impl {
   Texture  m_apFarTransmittance;
   Texture  m_apNearScatter;
   Texture  m_apFroxelLighting[2];  // history ping-pong: RGB local light, A sun visibility
-  Texture  m_apFroxelAux[2];       // R sky visibility, G age
+  Texture  m_apFroxelAux[2];       // R sky visibility, G age, B local-light visibility, A sun visibility
   Texture  m_apLightInjection;     // host-written local light, same grid
+  Texture  m_apNoDepth;            // 1x1 stand-in for linear view Z when the host passes none
   uint32_t m_apHistoryIndex = 0u;  // the pair holding the latest result
   bool     m_apHistoryValid = false;
-  uint32_t m_apLastFrame = UINT32_MAX - 1u;
+  uint32_t m_apLastFrame = UINT32_MAX - 1u;  // frame index of the last froxel lighting dispatch
+  // Set up by beginFrame, dispatched by dispatchPostDepth once linear view Z exists.
+  bool     m_apNearPending = false;
+  uint32_t m_apNearFrame = 0u;
+  ApGrid   m_apNearGrid {};
+  AtmosphereArgs m_apNearArgs {};
   ApHistoryKey m_apHistoryKey {};
   Buffer   m_apLightBuffer;
   Buffer   m_apLightClusterBuffer;

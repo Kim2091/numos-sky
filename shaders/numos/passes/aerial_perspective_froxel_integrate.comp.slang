@@ -13,6 +13,11 @@
 //
 // Writes the cumulative in-scatter to the far edge of every slice in RGB and the column's mean
 // transmittance in A. RGB transmittance is not stored: it has a closed form (apNearTransmittance).
+//
+// Past the deepest visible surface of the column's screen tile no pixel of the tile looks, and the
+// froxels there only hold samples moved in front of a surface, so those slices carry on with the
+// last froxel in front of it (docs/aerial-perspective-v2.md 4.2.2). The cumulative values stay
+// continuous for the filtered reads of the neighboring columns.
 
 #include "numos/lib/aerial_perspective.slangh"
 #include "numos/lib/aerial_perspective_binding_indices.h"
@@ -47,6 +52,12 @@ SamplerState cloudSampler;
 layout(binding = AP_INTEGRATE_OUTPUT, rgba16f)
 RWTexture3D<float4> nearScatterOutput;
 
+layout(binding = AP_INTEGRATE_LINEAR_VIEW_Z)
+Texture2D<float> sceneLinearViewZ;
+
+layout(binding = AP_INTEGRATE_SURFACE_ARGS)
+ConstantBuffer<ApSurfaceArgs> surfaceArgs;
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint2 column : SV_DispatchThreadID) {
@@ -65,18 +76,24 @@ void main(uint2 column : SV_DispatchThreadID) {
   vec3 transmittance = vec3(1.0f);
   const uint slices = max(args.apFroxelSlices, 1u);
   float startWorld = 0.0f;
+  const float debugVisibility = apDebugZeroesSunAndSky(args) ? 0.0f : 1.0f;
+  const float tileLimit = apSurfaceSampleLimit(apTileSurfaceForward(sceneLinearViewZ, surfaceArgs, column, args), args);
+  float sunVisibility = 1.0f;
+  float skyVisibility = 1.0f;
   for (uint slice = 0u; slice < slices; ++slice) {
     const float endWorld = apFroxelSliceToDepth(float(slice + 1u) / float(slices), args) * forwardToRay;
+    if (slice == 0u || apFroxelSliceToDepth(float(slice) / float(slices), args) < tileLimit) {
+      sunVisibility = froxelLighting.Load(int4(column, slice, 0)).a;
+      skyVisibility = froxelAux.Load(int4(column, slice, 0)).r;
+    }
     // The host's own volumetrics own everything nearer than the handoff.
     const float segmentStart = max(startWorld, args.apStartDistance);
     if (endWorld > segmentStart) {
       const float midWorld = 0.5f * (segmentStart + endWorld);
       const vec3 worldPos = args.cameraPosition + dirWorld * midWorld;
-      const float sunVisibility = froxelLighting.Load(int4(column, slice, 0)).a;
-      const float skyVisibility = froxelAux.Load(int4(column, slice, 0)).r;
       const float cloudT = apCloudSunTransmittance(worldPos, args, cloudShadowMap, cloudSampler);
       apIntegrateSegment(worldPos, dirYUp, endWorld - segmentStart, /*includeNearMedia=*/true,
-                         sunVisibility, skyVisibility, cloudT, vec3(0.0f), args,
+                         sunVisibility * debugVisibility, skyVisibility * debugVisibility, cloudT, vec3(0.0f), args,
                          transmittanceLutInput, multiscatteringLutInput, lutSampler,
                          inScatter, transmittance);
     }

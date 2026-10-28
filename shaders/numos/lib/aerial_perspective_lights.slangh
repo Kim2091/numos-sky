@@ -169,8 +169,10 @@ vec3 apLocalLightAirlight(StructuredBuffer<AerialPerspectiveLight> lights, Struc
       if (all(radiance == vec3(0.0f))) {
         continue;
       }
+      // Not past the slice holding the pixel's surface (endWorld): the froxel behind it describes
+      // other rays' air, moved in front of their own surfaces.
       const float visibility = froxelAux.SampleLevel(volumeSampler,
-        vec3(screenUv, apFroxelDepthToSlice(t * forwardPerDistance, args)), 0).b;
+        vec3(screenUv, apFroxelSliceCoordBefore(t * forwardPerDistance, endWorld * forwardPerDistance, args)), 0).b;
       const float lengthKm = numosWorldToAirKm(h / (cosTheta * cosTheta) * dTheta, args);
       sum += radiance * (m.atmosphere.scattering + m.fogScattering) * apNearTransmittance(dirYUp, t, args)
            * (visibility * lengthKm);

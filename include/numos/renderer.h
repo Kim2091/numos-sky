@@ -8,7 +8,7 @@
 //   renderer.setSettings(settings);                 // any time; read at the next beginFrame
 //   renderer.beginFrame(gpu, inputs);               // CPU state + pre-scene GPU work (LUTs, bakes)
 //   ... host renders its scene, producing linear view Z ...
-//   renderer.dispatchPostDepth(gpu, linearViewZ, miss); // screen-space cloud pass
+//   renderer.dispatchPostDepth(gpu, linearViewZ, miss); // screen clouds, near-field haze
 //   const FrameOutputs& out = renderer.outputs();   // textures/samplers/args to bind, lights to add
 //
 // All GPU work is recorded through the IGpu passed in; NUMOS never touches the host API itself.
@@ -18,7 +18,9 @@
 //   with the same IGpu, both while that IGpu is recording the frame's command stream. The cloud
 //   pass's temporal history assumes one dispatchPostDepth per beginFrame.
 // - outputs() after beginFrame: args, the LUTs and maps, samplers, lights[], radianceScale, night sky.
-//   After dispatchPostDepth: also cloudRender / cloudDepth for this frame. The reference stays valid
+//   After dispatchPostDepth: also cloudRender / cloudDepth and the aerial perspective's near field
+//   (apNearScatter, apFroxelLighting / apFroxelAux) for this frame; between the two calls those hold
+//   the previous frame's. The reference stays valid
 //   for the Renderer's lifetime; its contents change at the next beginFrame.
 // - Every GpuHandle in FrameOutputs belongs to NUMOS: never destroy or write it. Handles may change
 //   from one frame to the next (a resolution or setting change re-creates a texture; the old one is
@@ -245,6 +247,8 @@ public:
   void beginFrame(IGpu& gpu, const FrameInputs& inputs);
   // `linearViewZ`: Texture2D<float> at renderWidth x renderHeight (FrameInputs), the scene's distance
   // along the camera forward axis in world units (sign ignored); texels >= `missLinearViewZ` are sky.
+  // The screen clouds read it, and the aerial perspective's near field keeps its samples in front of
+  // the surfaces it shows (0: no depth, the near field is then sampled through walls).
   void dispatchPostDepth(IGpu& gpu, GpuHandle linearViewZ, float missLinearViewZ);
   const FrameOutputs& outputs() const;
 

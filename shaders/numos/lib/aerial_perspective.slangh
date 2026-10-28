@@ -102,6 +102,83 @@ bool apWorldToPreviousFroxelUvw(vec3 worldPos, Camera camera, AtmosphereArgs arg
 }
 
 // ============================================================================
+// Visible surface (docs/aerial-perspective-v2.md, 4.2.2)
+// ============================================================================
+// The froxel that holds a wall extends past it, and behind a one-sided shell (a cave, an interior
+// cell) a sample there sees the open sun and sky. The host's linear view Z says where each sample's
+// ray meets the visible surface, so the lighting pass keeps every sample in front of it, and the
+// integration and the reads that stop at a surface never use a froxel behind it.
+
+// A sample stays this fraction of its surface's forward distance in front of it (2 cm at 1 m, 2 m at
+// 100 m), and at least a hundredth of the grid's linear region (2 cm at the default range): enough
+// for the depth to vary inside the pixel at a grazing floor, and for the visibility rays not to start
+// on the surface.
+static const float kApSurfaceOffsetFraction = 0.02f;
+static const float kApNoSurface = 1e30f;
+// Samples deeper than (1 - this) of their surface's depth also trace a camera ray to the sample
+// (lighting pass): the host's depth may lie behind the geometry (a relief point, PSR, glass).
+static const float kApSurfaceGuardFraction = 0.25f;
+
+// x: 1 when the host supplied linear view Z; y: its miss threshold (texels at or past it are sky).
+struct ApSurfaceArgs {
+  vec4 params;
+};
+
+bool apSurfaceDepthValid(float z, ApSurfaceArgs s) {
+  return z > 0.0f && z < s.params.y;
+}
+
+// Forward distance of the visible surface through a screen UV; kApNoSurface on sky or without depth.
+float apSurfaceForward(Texture2D<float> linearViewZ, ApSurfaceArgs s, vec2 screenUv) {
+  if (!(s.params.x > 0.5f)) {
+    return kApNoSurface;
+  }
+  uint width, height;
+  linearViewZ.GetDimensions(width, height);
+  const uint2 pixel = min(uint2(saturate(screenUv) * vec2(width, height)), uint2(width, height) - 1u);
+  const float z = abs(linearViewZ.Load(int3(pixel, 0)));
+  return apSurfaceDepthValid(z, s) ? z : kApNoSurface;
+}
+
+// The deepest visible surface over a froxel column's screen tile; kApNoSurface if any of its pixels
+// sees the sky (or without depth). Past it no pixel of the tile looks, so nothing there is used.
+float apTileSurfaceForward(Texture2D<float> linearViewZ, ApSurfaceArgs s, uint2 column, AtmosphereArgs args) {
+  if (!(s.params.x > 0.5f)) {
+    return kApNoSurface;
+  }
+  uint width, height;
+  linearViewZ.GetDimensions(width, height);
+  const uint2 size = uint2(width, height);
+  const uint2 grid = max(uint2(args.apFroxelSizeX, args.apFroxelSizeY), uint2(1u));
+  const uint2 first = min(column * size / grid, size - 1u);
+  const uint2 last = clamp(((column + 1u) * size + grid - 1u) / grid, first + 1u, size);
+  float deepest = 0.0f;
+  for (uint y = first.y; y < last.y; ++y) {
+    for (uint x = first.x; x < last.x; ++x) {
+      const float z = abs(linearViewZ.Load(int3(x, y, 0)));
+      if (!apSurfaceDepthValid(z, s)) {
+        return kApNoSurface;
+      }
+      deepest = max(deepest, z);
+    }
+  }
+  return deepest;
+}
+
+// The deepest forward distance a sample in front of a surface at `surfaceForward` may take.
+float apSurfaceSampleLimit(float surfaceForward, AtmosphereArgs args) {
+  return max(surfaceForward - max(kApSurfaceOffsetFraction * surfaceForward, 0.01f * args.apFroxelLinearDepth), 0.0f);
+}
+
+// Slice coordinate of a filtered read of the lighting volume at `forwardDistance` that stops at the
+// slice holding the surface: the read still blends toward the slice in front, never the one behind.
+float apFroxelSliceCoordBefore(float forwardDistance, float surfaceForward, AtmosphereArgs args) {
+  const float n = float(max(args.apFroxelSlices, 1u));
+  const float surfaceSlice = min(floor(apFroxelDepthToSlice(min(surfaceForward, args.apFroxelRange), args) * n), n - 1.0f);
+  return min(apFroxelDepthToSlice(forwardDistance, args), (surfaceSlice + 0.5f) / n);
+}
+
+// ============================================================================
 // Medium
 // ============================================================================
 
@@ -376,4 +453,93 @@ vec4 apSampleNear(Texture3D<float4> nearScatter, SamplerState volumeSampler, vec
                                             args.apFroxelSlices);
   const vec4 v = nearScatter.SampleLevel(volumeSampler, vec3(screenUv, slice.x), 0);
   return vec4(max(v.rgb, vec3(0.0f)) * slice.y, lerp(1.0f, v.a, slice.y));
+}
+
+// ============================================================================
+// Debug view (rtx.atmosphere.aerialPerspectiveDebugView, docs/aerial-perspective-v2.md 4.9)
+// ============================================================================
+// Measuring tools: each view shows one absolute quantity, and a legend strip along the bottom of
+// the screen shows the same scale under the same exposure and tonemap, so a reading is "this pixel
+// matches that point of the strip", whatever the exposure does to the whole image.
+
+static const uint kApDebugViewOff = 0u;
+static const uint kApDebugViewSunVisibility = 1u;     // at the pixel's depth
+static const uint kApDebugViewSkyVisibility = 2u;     // at the pixel's depth
+static const uint kApDebugViewInScatter = 3u;         // haze luminance, cd/m^2, false color
+static const uint kApDebugViewNoSunOrSky = 4u;        // integration with both visibilities 0
+static const uint kApDebugViewTransmittance = 5u;
+static const uint kApDebugViewSunVisibilityNear = 6u; // at kApDebugNearKm
+static const uint kApDebugViewSkyVisibilityNear = 7u; // at kApDebugNearKm
+static const uint kApDebugViewInScatterNoSunOrSky = 8u;
+// Share of the froxel's samples (temporal average) that the depth clamp moved, at the pixel's depth.
+static const uint kApDebugViewSurfaceClamp = 9u;
+// Share the camera-ray guard moved further in front: the host's depth lay behind the geometry.
+static const uint kApDebugViewSurfaceGuard = 10u;
+
+static const float kApDebugNearKm = 0.002f;
+// False color: kApDebugDecades powers of ten upward from 10^kApDebugMinLog10 cd/m^2.
+static const float kApDebugMinLog10 = -4.0f;
+static const uint kApDebugDecades = 8u;
+static const float kApDebugLegendHeight = 0.04f;
+static const vec3 kApDebugStops[9] = {
+  vec3(0.0f, 0.0f, 0.5f),   // 1e-4
+  vec3(0.0f, 0.0f, 1.0f),   // 1e-3
+  vec3(0.0f, 1.0f, 1.0f),   // 1e-2
+  vec3(0.0f, 1.0f, 0.0f),   // 1e-1
+  vec3(1.0f, 1.0f, 0.0f),   // 1
+  vec3(1.0f, 0.5f, 0.0f),   // 10
+  vec3(1.0f, 0.0f, 0.0f),   // 100
+  vec3(1.0f, 0.0f, 1.0f),   // 1e3
+  vec3(1.0f, 1.0f, 1.0f),   // 1e4
+};
+
+bool apDebugZeroesSunAndSky(AtmosphereArgs args) {
+  return args.apDebugView == kApDebugViewNoSunOrSky || args.apDebugView == kApDebugViewInScatterNoSunOrSky;
+}
+
+// Black below the range, white above it, a dark line at every power of ten.
+vec3 apDebugFalseColor(float nits) {
+  if (!(nits > 0.0f)) {
+    return vec3(0.0f);
+  }
+  const float x = log10(nits) - kApDebugMinLog10;
+  if (x < 0.0f) {
+    return vec3(0.0f);
+  }
+  if (x >= float(kApDebugDecades)) {
+    return vec3(1.0f);
+  }
+  const uint i = min(uint(x), kApDebugDecades - 1u);
+  const float f = x - float(i);
+  const vec3 c = lerp(kApDebugStops[i], kApDebugStops[i + 1u], f);
+  return f < 0.04f ? c * 0.25f : c;
+}
+
+// A visibility in gray, except that values above 0 and below 0.1 are red, stretched ten times, so
+// "almost none" (a stuck history, a rare leaking ray) cannot pass for none.
+vec3 apDebugVisibilityColor(float v) {
+  if (v > 0.0f && v < 0.1f) {
+    return vec3(0.1f + 9.0f * v, 0.0f, 0.0f);
+  }
+  return vec3(v);
+}
+
+// The legend strip's color at screenUv, or false outside it. Gray views get 11 cells (0, 0.1 .. 1),
+// the first one a ramp over [0, 0.1); the false color runs half a decade past both ends so the black
+// and white ends show.
+bool apDebugLegend(uint view, vec2 screenUv, out vec3 color) {
+  color = vec3(0.0f);
+  if (screenUv.y < 1.0f - kApDebugLegendHeight) {
+    return false;
+  }
+  const float x = saturate(screenUv.x);
+  if (view == kApDebugViewInScatter || view == kApDebugViewInScatterNoSunOrSky) {
+    const float log10Nits = kApDebugMinLog10 - 0.5f + x * (float(kApDebugDecades) + 1.0f);
+    color = apDebugFalseColor(pow(10.0f, log10Nits));
+    return true;
+  }
+  const float cell = min(floor(x * 11.0f), 10.0f);
+  const float v = cell < 1.0f ? 0.1f * frac(x * 11.0f) : cell / 10.0f;
+  color = view == kApDebugViewTransmittance ? vec3(v) : apDebugVisibilityColor(v);
+  return true;
 }

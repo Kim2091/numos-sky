@@ -129,6 +129,10 @@ namespace {
     // quantized, by the sky-view key when the starlight is baked).
     args.skyPixelAngle               = 0.0f;
     args.starScintillation           = 0.0f;
+    // The debug view words sit outside the aerial perspective block; two move with the pre-exposure.
+    args.apDebugNitsPerUnit          = 0.0f;
+    args.apDebugView                 = 0u;
+    args.apDebugRadianceScale        = 0.0f;
   }
 
   float quantizeDirComponent(float v, float stepRad) {
@@ -315,6 +319,15 @@ namespace {
     args.celestialToLocalX = vec3(0.0f, 0.0f, 0.0f);
     args.celestialToLocalY = vec3(0.0f, 0.0f, 0.0f);
     args.celestialToLocalZ = vec3(0.0f, 0.0f, 0.0f);
+  }
+
+  // NUMOS's illuminance unit in lux (FrameOutputs::luxPerUnit): sunIlluminance x sunIntensity is the
+  // real sun's 1.27e5 lux, the calibration lightningIntensityKm2 and the night sky use.
+  float luxPerUnit(const Settings& settings) {
+    constexpr float kSunLux = 1.27e5f;
+    const Vector3 sun = settings.sunIlluminance * settings.sunIntensity;
+    const float sunLuminance = 0.2126f * sun.x + 0.7152f * sun.y + 0.0722f * sun.z;
+    return sunLuminance > 0.0f ? kSunLux / sunLuminance : 1.0f;
   }
 } // anonymous namespace
 
@@ -1187,6 +1200,7 @@ AtmosphereArgs Renderer::Impl::getAtmosphereArgs() const {
     args.apLocalLightShadows = m_settings.aerialPerspectiveLocalLightShadows ? 1u : 0u;
     args.apHistoryWeightMin = 1.0f / float(std::clamp(m_settings.aerialPerspectiveHistoryFrames, 1, 255));
     args.apHistoryReset = 0u;  // set per dispatch by dispatchAerialPerspective
+    args.apDebugView = static_cast<uint32_t>(std::clamp(m_settings.aerialPerspectiveDebugView, 0, 10));
 
     // Height fog. Koschmieder: contrast falls to 2% at the visibility distance, sigma = ln(50) / V.
     args.fogExtinctionPerKm = m_settings.fogVisibilityMeters > 0.0f
@@ -1287,6 +1301,8 @@ AtmosphereArgs Renderer::Impl::getAtmosphereArgs() const {
   args.apLocalLightIntensity *= m_radianceScale;  // the local-light gain; host injection is the host's own units
   args.airglowEmission = args.airglowEmission * m_radianceScale;
   args.nightGlowInScatter = args.nightGlowInScatter * m_radianceScale;
+  args.apDebugRadianceScale = m_radianceScale;
+  args.apDebugNitsPerUnit = luxPerUnit(m_settings) / m_radianceScale;
 
   return args;
 }
@@ -1599,6 +1615,7 @@ void Renderer::Impl::computeLuts(PassRecorder& rec) {
     dispatchAerialPerspective(rec);
   } else {
     m_apHistoryValid = false;
+    m_apNearPending = false;
   }
 
   if (m_settings.cloudSecondaryLutEnable && m_cloudSecondaryLut.isValid()) {
@@ -1958,9 +1975,10 @@ void Renderer::Impl::ensureAerialPerspectiveResources(PassRecorder& rec, const A
     replaceTexture(rec, m_apFroxelLighting[i], createTexture(rec,
       i == 0 ? "Atmosphere AP Froxel Lighting 0" : "Atmosphere AP Froxel Lighting 1", TextureType::Tex3D,
       Format::RGBA16Float, grid.x, grid.y, grid.z, 1));
+    // RGBA16F, not RGBA8: an 8-bit visibility blended toward 0 never got there (4.2, "Formats").
     replaceTexture(rec, m_apFroxelAux[i], createTexture(rec,
       i == 0 ? "Atmosphere AP Froxel Aux 0" : "Atmosphere AP Froxel Aux 1", TextureType::Tex3D,
-      Format::RGBA8Unorm, grid.x, grid.y, grid.z, 1));
+      Format::RGBA16Float, grid.x, grid.y, grid.z, 1));
   }
   replaceTexture(rec, m_apLightInjection, createTexture(rec, "Atmosphere AP Light Injection", TextureType::Tex3D,
     Format::RGBA16Float, grid.x, grid.y, grid.z, 1));
@@ -1969,7 +1987,8 @@ void Renderer::Impl::ensureAerialPerspectiveResources(PassRecorder& rec, const A
   m_apHistoryValid = false;
 }
 
-// Far LUT, light cull, froxel lighting, froxel integration (docs/aerial-perspective-v2.md).
+// Far LUT and light cull (docs/aerial-perspective-v2.md). The froxel lighting and integration need
+// this frame's linear view Z, so they wait for dispatchPostDepth (dispatchAerialPerspectiveNear).
 void Renderer::Impl::dispatchAerialPerspective(PassRecorder& rec) {
   GpuZone zone(rec.gpu(), "Atmosphere Aerial Perspective");
 
@@ -1983,12 +2002,11 @@ void Renderer::Impl::dispatchAerialPerspective(PassRecorder& rec) {
 
   // History is only meaningful for the same grid over consecutive frames.
   const ApHistoryKey key { grid.x, grid.y, grid.z, args.apFroxelRange, args.apWorldUnitsPerKm,
-                           args.fogExtinctionPerKm, args.fogScaleHeightKm };
+                           args.fogExtinctionPerKm, args.fogScaleHeightKm, args.apSceneShadow };
   const bool historyUsable = m_apHistoryValid && !m_inputs.cameraCut
     && m_apLastFrame + 1u == m_inputs.frameIndex && std::memcmp(&key, &m_apHistoryKey, sizeof(key)) == 0;
   args.apHistoryReset = historyUsable ? 0u : 1u;
   m_apHistoryKey = key;
-  m_apLastFrame = m_inputs.frameIndex;
 
   const GpuHandle lutSampler = sampler(rec.gpu(), Filter::Linear, Filter::Nearest, AddressMode::ClampToEdge);
   const GpuHandle cloudSampler = sampler(rec.gpu(), Filter::Linear, Filter::Nearest, AddressMode::Repeat, 0.0f);
@@ -2035,6 +2053,40 @@ void Renderer::Impl::dispatchAerialPerspective(PassRecorder& rec) {
     rec.barrier();
   }
 
+  m_apNearArgs = args;
+  m_apNearGrid = grid;
+  m_apNearFrame = m_inputs.frameIndex;
+  m_apNearPending = true;
+}
+
+// Froxel lighting and integration, in dispatchPostDepth: every froxel sample stays in front of the
+// visible surface in `linearViewZ` (docs/aerial-perspective-v2.md 4.2.2). Without depth (0) they run
+// as before, unclamped.
+void Renderer::Impl::dispatchAerialPerspectiveNear(PassRecorder& rec, GpuHandle linearViewZ, float missLinearViewZ) {
+  if (!m_apNearPending) {
+    return;
+  }
+  m_apNearPending = false;
+  GpuZone zone(rec.gpu(), "Atmosphere Aerial Perspective Near");
+  const AtmosphereArgs& args = m_apNearArgs;
+  const ApGrid grid = m_apNearGrid;
+  const GpuHandle lutSampler = sampler(rec.gpu(), Filter::Linear, Filter::Nearest, AddressMode::ClampToEdge);
+  const GpuHandle cloudSampler = sampler(rec.gpu(), Filter::Linear, Filter::Nearest, AddressMode::Repeat, 0.0f);
+
+  // The passes declare the depth whether or not the host has one.
+  if (linearViewZ == 0 && !m_apNoDepth.isValid()) {
+    replaceTexture(rec, m_apNoDepth, createTexture(rec, "Atmosphere AP No Depth", TextureType::Tex2D,
+      Format::R32Float, 1, 1, 1, 1));
+    const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    rec.gpu().clearTexture(m_apNoDepth.handle, zero);
+  }
+  const GpuHandle depth = linearViewZ != 0 ? linearViewZ : m_apNoDepth.handle;
+  // ApSurfaceArgs (lib/aerial_perspective.slangh).
+  const float surfaceArgs[4] = { linearViewZ != 0 ? 1.0f : 0.0f, missLinearViewZ, 0.0f, 0.0f };
+
+  // Covers the cull pass's clusters and the host's linear view Z write.
+  rec.barrier();
+
   // ---- froxel lighting: previous history -> current ----
   const uint32_t current = m_apHistoryIndex ^ 1u;
   {
@@ -2054,6 +2106,8 @@ void Renderer::Impl::dispatchAerialPerspective(PassRecorder& rec) {
     rec.bindTexture(AP_LIGHTING_OUTPUT, m_apFroxelLighting[current]);
     rec.bindTexture(AP_LIGHTING_OUTPUT_AUX, m_apFroxelAux[current]);
     rec.bindTexture(AP_LIGHTING_INJECTION, m_apLightInjection);
+    rec.bindTexture(AP_LIGHTING_LINEAR_VIEW_Z, depth);
+    rec.bindConstants(AP_LIGHTING_SURFACE_ARGS, surfaceArgs, sizeof(surfaceArgs));
     rec.setPass(traced ? PassId::aerial_perspective_froxel_lighting_traced : PassId::aerial_perspective_froxel_lighting);
     rec.dispatch((grid.x + 7u) / 8u, (grid.y + 7u) / 8u, grid.z);
   }
@@ -2072,12 +2126,15 @@ void Renderer::Impl::dispatchAerialPerspective(PassRecorder& rec) {
     rec.bindTexture(AP_INTEGRATE_CLOUD_SHADOW_MAP, m_cloudShadowMap);
     rec.bindSampler(AP_INTEGRATE_CLOUD_SAMPLER, cloudSampler);
     rec.bindTexture(AP_INTEGRATE_OUTPUT, m_apNearScatter);
+    rec.bindTexture(AP_INTEGRATE_LINEAR_VIEW_Z, depth);
+    rec.bindConstants(AP_INTEGRATE_SURFACE_ARGS, surfaceArgs, sizeof(surfaceArgs));
     rec.setPass(PassId::aerial_perspective_froxel_integrate);
     rec.dispatch((grid.x + 7u) / 8u, (grid.y + 7u) / 8u, 1u);
   }
 
   m_apHistoryIndex = current;
   m_apHistoryValid = true;
+  m_apLastFrame = m_apNearFrame;
 }
 
 void Renderer::Impl::dispatchCloudSkyTransmittanceLut(PassRecorder& rec) {
@@ -2979,6 +3036,9 @@ void Renderer::Impl::dispatchPostDepth(IGpu& gpu, GpuHandle linearViewZ, float m
   PassRecorder recorder(gpu);
   PassRecorder& rec = recorder;
   m_missLinearViewZ = missLinearViewZ;
+  // The aerial perspective's froxel lighting and integration keep their samples in front of this
+  // frame's visible surfaces, so they run here, whatever the cloud pass does below.
+  dispatchAerialPerspectiveNear(rec, linearViewZ, missLinearViewZ);
   // debugDispatchCloudRender skips the pass for an A/B frame-time read. The pass is also skipped
   // when nothing reads it: the composite ignores the RT unless m_cloudCompositeActive (with clouds
   // off the pass would only write "no cloud", an exact identity). The debug views read the RT
@@ -3566,13 +3626,7 @@ void Renderer::Impl::publishOutputs() {
   o.apFroxelAux = m_apFroxelAux[m_apHistoryIndex].handle;
   o.apLightInjection = m_apLightInjection.handle;
   o.groundLevelWorldUnits = m_groundLevelWorldUnits;
-  {
-    // The calibration lightningIntensityKm2 uses: sunIlluminance x sunIntensity is the real sun's lux.
-    constexpr float kSunLux = 1.27e5f;
-    const Vector3 sun = m_settings.sunIlluminance * m_settings.sunIntensity;
-    const float sunLuminance = 0.2126f * sun.x + 0.7152f * sun.y + 0.0722f * sun.z;
-    o.luxPerUnit = sunLuminance > 0.0f ? kSunLux / sunLuminance : 1.0f;
-  }
+  o.luxPerUnit = luxPerUnit(m_settings);
   o.nightGain = m_nightGain;
   o.groundLevelMeasured = m_groundLevelMeasured;
   o.cloudMarchStride = cloudMarchStride();

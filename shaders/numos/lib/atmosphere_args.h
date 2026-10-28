@@ -375,7 +375,17 @@ struct AtmosphereArgs {
   uint cloudShadowBakeTarget;
   uint cloudShadowBakeRow0;
   float nightSkyGain;  // rtx.atmosphere.nightGainStops as the factor in force (twilight-faded), for the star field
-  float pad5;
+  // cd/m^2 per unit of NUMOS's pre-exposed radiance (luxPerUnit / R): the AP debug view's absolute
+  // scale. Former pad5.
+  float apDebugNitsPerUnit;
+
+  // rtx.atmosphere.aerialPerspectiveDebugView (kApDebugView*, lib/aerial_perspective.slangh),
+  // and the radiance scale (pre-exposure R) the composite writes its debug color back in.
+  uint  apDebugView;
+  float apDebugRadianceScale;
+  // Pads the struct to a whole 16-byte row.
+  float padApDebug0;
+  float padApDebug1;
 
 };
 

@@ -17,6 +17,9 @@
 // Only lighting is stored, never the medium: cloud shadow, sun transmittance, phase and density are
 // smooth and analytic and are applied every frame by the integration pass, so they never lag.
 //
+// Every sample stays in front of the visible surface its ray meets (the host's linear view Z,
+// docs/aerial-perspective-v2.md 4.2.2): behind a one-sided shell it would see the open sun and sky.
+//
 // Without AP_TRACE_SCENE (no host TLAS) everything is unoccluded and the history only smooths the
 // local-light estimate.
 
@@ -43,7 +46,9 @@ StructuredBuffer<uint> aerialPerspectiveLightClusters;
 
 // Previous frame: RGB local-light in-scatter per unit sigma_s, A sun visibility; aux R sky
 // visibility, G age / 255, B local-light visibility (the shadowed share of the unshadowed local
-// in-scatter, which the composite multiplies into its per-pixel analytic glow).
+// in-scatter, which the composite multiplies into its per-pixel analytic glow), A a copy of the sun
+// visibility for the composite's debug view, which binds aux but not the lighting volume. Both
+// RGBA16F.
 layout(binding = AP_LIGHTING_HISTORY)
 Texture3D<float4> historyLighting;
 
@@ -56,13 +61,22 @@ SamplerState linearSampler;
 layout(binding = AP_LIGHTING_OUTPUT, rgba16f)
 RWTexture3D<float4> lightingOutput;
 
-layout(binding = AP_LIGHTING_OUTPUT_AUX, rgba8)
+// RGBA16F: an 8-bit visibility blended toward 0 rounds back to itself below 0.5 / (255 w), about
+// 0.06 at 32 history frames, so a froxel once lit never went dark again.
+layout(binding = AP_LIGHTING_OUTPUT_AUX, rgba16f)
 RWTexture3D<float4> auxOutput;
 
 // Host-written local-light in-scatter in the previous frame's grid (same layout and meaning as the
 // RGB above). Read only when args.apHostLightInjection is set.
 layout(binding = AP_LIGHTING_INJECTION)
 Texture3D<float4> hostInjection;
+
+// The host's linear view Z of this frame (FrameInputs render resolution), and whether there is one.
+layout(binding = AP_LIGHTING_LINEAR_VIEW_Z)
+Texture2D<float> sceneLinearViewZ;
+
+layout(binding = AP_LIGHTING_SURFACE_ARGS)
+ConstantBuffer<ApSurfaceArgs> surfaceArgs;
 
 uint apHash(uint x) {
   x ^= x >> 16;
@@ -97,6 +111,21 @@ bool apOccluded(vec3 origin, vec3 direction, float tMax) {
   query.Proceed();
   return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
+
+// Distance to the first opaque hit within tMax, or -1: the same geometry the visibility rays see.
+float apFirstHitDistance(vec3 origin, vec3 direction, float tMax) {
+  RayDesc ray;
+  ray.Origin = origin;
+  ray.Direction = direction;
+  ray.TMin = 0.0f;
+  ray.TMax = tMax;
+  static const uint kRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH
+    | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES;
+  RayQuery<kRayFlags> query;
+  query.TraceRayInline(sceneTlas, kRayFlags, OBJECT_MASK_OPAQUE, ray);
+  query.Proceed();
+  return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? query.CommittedRayT() : -1.0f;
+}
 #endif
 
 [shader("compute")]
@@ -117,8 +146,35 @@ void main(uint3 froxel : SV_DispatchThreadID) {
   const vec3 jitter = frac(seed + r3 * float(args.apFrameIndex % 4096u));
   const vec3 cell = (vec3(froxel) + jitter) / gridSize;
   const vec3 rayVector = apFroxelRayVector(cell.xy, atmosphereCamera);
-  const vec3 samplePos = args.cameraPosition + rayVector * apFroxelSliceToDepth(cell.z, args);
+  // In front of the surface this sample's ray meets: past it the sample would take the light of
+  // whatever lies behind the wall. A froxel that holds the surface, or lies wholly behind it on this
+  // ray, takes its sample just in front of the surface, so no history ever holds light from behind a
+  // wall (keeping the old value instead would carry it into the neighbors' filtered history reads
+  // whenever the camera moves).
+  const float surfaceForward = apSurfaceForward(sceneLinearViewZ, surfaceArgs, cell.xy);
+  const float jitteredForward = apFroxelSliceToDepth(cell.z, args);
+  const float surfaceLimit = apSurfaceSampleLimit(surfaceForward, args);
+  const bool depthClamped = jitteredForward > surfaceLimit;
+  float sampleForward = min(jitteredForward, surfaceLimit);
   const vec3 viewDirWorld = normalize(rayVector);
+  bool guardMoved = false;
+#if defined(AP_TRACE_SCENE)
+  // The host's depth can lie behind the geometry the rays see: a displaced surface writes its relief
+  // point (Remix: rtx.displacement.enableDepthOffset, up to the full displacement depth behind the
+  // mesh), PSR and glass write the virtual distance through them. Near the camera that exceeds the
+  // offset above and the sample sat behind the mesh again. So a sample near or past the depth also
+  // traces its own camera ray, against the same opaque geometry as its visibility rays.
+  if (sampleForward >= (1.0f - kApSurfaceGuardFraction) * surfaceForward) {
+    const float forwardPerDistance = 1.0f / length(rayVector);
+    const float hit = apFirstHitDistance(args.cameraPosition, viewDirWorld, sampleForward / forwardPerDistance);
+    if (hit >= 0.0f) {
+      const float hitLimit = apSurfaceSampleLimit(hit * forwardPerDistance, args);
+      guardMoved = hitLimit < sampleForward;
+      sampleForward = min(sampleForward, hitLimit);
+    }
+  }
+#endif
+  const vec3 samplePos = args.cameraPosition + rayVector * sampleForward;
 
   // ---- history: the froxel centre in the previous frame's grid ----
   vec3 prevUvw;
@@ -145,10 +201,14 @@ void main(uint3 froxel : SV_DispatchThreadID) {
   // screen edge the camera turns toward (docs/aerial-perspective-v2.md, 4.2 "Fresh froxels"). A
   // fresh froxel traces both terms this frame and takes them outright (alternateWeight is 1 at
   // age 0), so it starts from this frame's measurement and nothing assumed.
-  float sunVisibility = age < 1.0f ? 1.0f : previous.a;
-  float skyVisibility = age < 1.0f ? 1.0f : previousAux.r;
+  // Without scene shadows the visibilities are 1 ("unoccluded"), never the history: a history traced
+  // with them on would otherwise survive switching them off.
+  float sunVisibility = 1.0f;
+  float skyVisibility = 1.0f;
 #if defined(AP_TRACE_SCENE)
   if (args.apSceneShadow != 0u) {
+    sunVisibility = age < 1.0f ? 1.0f : previous.a;
+    skyVisibility = age < 1.0f ? 1.0f : previousAux.r;
     const bool isZUp = args.isZUp != 0u;
     const bool flip = args.flipUpAxis != 0u;
     const bool fresh = age < 1.0f;
@@ -242,5 +302,13 @@ void main(uint3 froxel : SV_DispatchThreadID) {
 
   const vec3 local = age < 1.0f ? localSample : lerp(previous.rgb, localSample, weight);
   lightingOutput[froxel] = vec4(local, saturate(sunVisibility));
-  auxOutput[froxel] = vec4(saturate(skyVisibility), newAge / 255.0f, saturate(localSampled || age >= 1.0f ? localVisibility : 1.0f), 0.0f);
+  // A carries the sun visibility for debug views 1 and 6; views 9 and 10 put the share of samples the
+  // surface clamp moved there instead (only the debug view reads A).
+  float auxA = saturate(sunVisibility);
+  if (args.apDebugView == kApDebugViewSurfaceClamp || args.apDebugView == kApDebugViewSurfaceGuard) {
+    const float moved = (args.apDebugView == kApDebugViewSurfaceClamp ? depthClamped : guardMoved) ? 1.0f : 0.0f;
+    auxA = age < 1.0f ? moved : lerp(saturate(previousAux.a), moved, weight);
+  }
+  auxOutput[froxel] = vec4(saturate(skyVisibility), newAge / 255.0f, saturate(localSampled || age >= 1.0f ? localVisibility : 1.0f),
+                           auxA);
 }
