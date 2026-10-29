@@ -2028,6 +2028,9 @@ void Renderer::Impl::dispatchAerialPerspective(PassRecorder& rec) {
     if (m_apFarUsagePending[i] && rec.gpu().readBuffer(m_apFarUsageReadback[i].handle, usage, sizeof(usage))) {
       m_apFarUsagePending[i] = false;
       m_apFarIdleFrames = usage[0] == 0u ? std::min(m_apFarIdleFrames + 1u, kApFarIdleFrames) : 0u;
+      if (m_settings.cloudProfilingLog && m_inputs.frameIndex % 120u == 0u) {
+        logInfo(format("[AP far] columns=", usage[0], " idleFrames=", m_apFarIdleFrames));
+      }
     }
   }
   if (m_apFarUsageCounted) {
