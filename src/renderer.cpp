@@ -1965,7 +1965,7 @@ void Renderer::Impl::ensureAerialPerspectiveResources(PassRecorder& rec, const A
     m_apFarValid = false;
   }
   if (!m_apFarUsage.isValid()) {
-    replaceBuffer(rec, m_apFarUsage, createBuffer(rec, "Atmosphere AP Far Usage", BufferUsage::Structured, 16u));
+    replaceBuffer(rec, m_apFarUsage, createBuffer(rec, "Atmosphere AP Far Usage", BufferUsage::Structured, 32u));
     for (Buffer& readback : m_apFarUsageReadback) {
       replaceBuffer(rec, readback, createBuffer(rec, "Atmosphere AP Far Usage Readback", BufferUsage::Readback, 16u));
     }
@@ -2019,13 +2019,31 @@ void Renderer::Impl::dispatchAerialPerspective(PassRecorder& rec) {
   const GpuHandle cloudSampler = sampler(rec.gpu(), Filter::Linear, Filter::Nearest, AddressMode::Repeat, 0.0f);
 
   // ---- far field ----
-  // Takes in the far-field counts of earlier frames that have come back.
+  // Takes in the far-field counts of earlier frames that have come back. The last frame's count is
+  // copied out and the counter cleared here rather than after the integration, so the transfers land
+  // among this frame's bakes instead of between the screen passes. Without a free readback slot, that
+  // count is dropped.
   for (uint32_t i = 0; i < kApFarUsageSlots; ++i) {
     uint32_t usage[4];
     if (m_apFarUsagePending[i] && rec.gpu().readBuffer(m_apFarUsageReadback[i].handle, usage, sizeof(usage))) {
       m_apFarUsagePending[i] = false;
       m_apFarIdleFrames = usage[0] == 0u ? std::min(m_apFarIdleFrames + 1u, kApFarIdleFrames) : 0u;
     }
+  }
+  if (m_apFarUsageCounted) {
+    m_apFarUsageCounted = false;
+    for (uint32_t i = 0; i < kApFarUsageSlots; ++i) {
+      if (!m_apFarUsagePending[i]) {
+        rec.gpu().copyBuffer(m_apFarUsageReadback[i].handle, 0, m_apFarUsage.handle, 0, 16u);
+        m_apFarUsagePending[i] = true;
+        break;
+      }
+    }
+  }
+  {
+    // A partial write (the buffer has a tail pad), so a host may update it in place.
+    const uint32_t zero[4] = { 0u, 0u, 0u, 0u };
+    rec.gpu().updateBuffer(m_apFarUsage.handle, 0, sizeof(zero), zero);
   }
   // A far field nothing has read for a while is refreshed every kApFarIdlePeriod frames, so the
   // view that next needs it starts from one at most that old and is current again once the count
@@ -2135,20 +2153,8 @@ void Renderer::Impl::dispatchAerialPerspectiveNear(PassRecorder& rec, GpuHandle 
   rec.barrier();
 
   // ---- froxel integration ----
-  // The integration also counts the columns whose pixels take the far field. Without a free readback
-  // slot, this frame's count is dropped.
-  uint32_t usageSlot = kApFarUsageSlots;
-  for (uint32_t i = 0; i < kApFarUsageSlots; ++i) {
-    if (!m_apFarUsagePending[i]) {
-      usageSlot = i;
-      break;
-    }
-  }
-  {
-    const uint32_t zero[4] = { 0u, 0u, 0u, 0u };
-    rec.gpu().updateBuffer(m_apFarUsage.handle, 0, sizeof(zero), zero);
-    rec.barrier();
-  }
+  // The integration also counts the columns whose pixels take the far field. The next beginFrame
+  // copies the count out and clears the counter (dispatchAerialPerspective).
   {
     GpuZone inner(rec.gpu(), "Atmosphere AP Froxel Integration");
     rec.bindConstants(AP_INTEGRATE_ATMOSPHERE_ARGS, &args, sizeof(AtmosphereArgs));
@@ -2167,11 +2173,7 @@ void Renderer::Impl::dispatchAerialPerspectiveNear(PassRecorder& rec, GpuHandle 
     rec.setPass(PassId::aerial_perspective_froxel_integrate);
     rec.dispatch((grid.x + 7u) / 8u, (grid.y + 7u) / 8u, 1u);
   }
-  if (usageSlot < kApFarUsageSlots) {
-    rec.barrier();
-    rec.gpu().copyBuffer(m_apFarUsageReadback[usageSlot].handle, 0, m_apFarUsage.handle, 0, 16u);
-    m_apFarUsagePending[usageSlot] = true;
-  }
+  m_apFarUsageCounted = true;
 
   m_apHistoryIndex = current;
   m_apHistoryValid = true;

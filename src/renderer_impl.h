@@ -299,6 +299,7 @@ struct Renderer::Impl {
   uint32_t m_apFarIdleFrames = 0u;      // consecutive read-back frames without a far-field pixel
   uint32_t m_apFarUpdateFrame = 0u;     // frame index of the last far-field update
   bool     m_apFarValid = false;        // the far field holds a complete update
+  bool     m_apFarUsageCounted = false; // the last integration counted into m_apFarUsage
 
   Texture m_cloudSkyTransmittanceLut;
   // Cloud sun-space shadow map and the state it was baked for (updateCloudShadowMap).
