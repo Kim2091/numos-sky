@@ -266,6 +266,14 @@ threads; atmosphere only, planet shadow, sun transmittance, Psi_ms, and the clou
 It depends on sun, altitude and clouds, so it is rebuilt every frame; at ~0.8 M medium evaluations
 it costs a small fraction of the old volume.
 
+Only the host's composite reads it, and only for pixels that miss or lie past the froxel range. The
+integration pass counts the froxel columns whose screen tile holds such a pixel (`apTileSurfaceForward`
+beyond `apFroxelRange`) and the count comes back through a three-slot readback ring. After 30 read-back
+frames without one (an interior, or a view at the ground) the LUT is rebuilt only every 8th frame, and
+every frame again as soon as a count is non-zero. The view that next needs it therefore starts from a
+LUT at most 8 frames old, for the two or three frames the readback takes, which the far field's
+kilometre scales do not show.
+
 Height fog is not in this LUT. Its density is exponential in height, so optical depth along any
 ray has a closed form and its in-scatter, lit by the sun and Psi_ms at the fog base, is
 `J * (1 - T)`; it is evaluated per lookup. That keeps sky pixels fogged out to the horizon without

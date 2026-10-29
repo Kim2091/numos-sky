@@ -58,6 +58,12 @@ Texture2D<float> sceneLinearViewZ;
 layout(binding = AP_INTEGRATE_SURFACE_ARGS)
 ConstantBuffer<ApSurfaceArgs> surfaceArgs;
 
+// [0]: the number of columns whose screen tile shows the sky or a surface past the froxel range, the
+// pixels the composite takes the far field for. The renderer reads it back to skip far-field updates
+// nothing reads.
+layout(binding = AP_INTEGRATE_FAR_USAGE)
+RWStructuredBuffer<uint> farUsage;
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint2 column : SV_DispatchThreadID) {
@@ -77,7 +83,11 @@ void main(uint2 column : SV_DispatchThreadID) {
   const uint slices = max(args.apFroxelSlices, 1u);
   float startWorld = 0.0f;
   const float debugVisibility = apDebugZeroesSunAndSky(args) ? 0.0f : 1.0f;
-  const float tileLimit = apSurfaceSampleLimit(apTileSurfaceForward(sceneLinearViewZ, surfaceArgs, column, args), args);
+  const float tileForward = apTileSurfaceForward(sceneLinearViewZ, surfaceArgs, column, args);
+  if (tileForward > args.apFroxelRange) {
+    InterlockedAdd(farUsage[0], 1u);
+  }
+  const float tileLimit = apSurfaceSampleLimit(tileForward, args);
   float sunVisibility = 1.0f;
   float skyVisibility = 1.0f;
   for (uint slice = 0u; slice < slices; ++slice) {

@@ -17,6 +17,8 @@ constexpr float    NUMOS_NO_MIN = -3.402823466e+38f;
 constexpr float    NUMOS_NO_MAX = 3.402823466e+38f;
 // Deprecated setting: still read from configs (and migrated), never written back.
 constexpr uint32_t NUMOS_SETTING_NO_SAVE = 1u << 0;
+// A setting of the machine rather than of the look (a GPU cost level): seeds neither carry nor apply it.
+constexpr uint32_t NUMOS_SETTING_NO_SEED = 1u << 1;
 
 constexpr uint32_t kMaxMoons = 4;
 

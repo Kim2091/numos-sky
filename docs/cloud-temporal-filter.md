@@ -137,6 +137,11 @@ Auto takes the largest k passing both. Results at the defaults:
 This matches the visual verdict without being fitted to it: the anchor is the host's upscale range and the
 filter's own fast-history length.
 
+`rtx.atmosphere.qualityLevel` Medium and Low (1 and 2) keep only the motion test, so Auto takes the quarter march
+at every resolution and upscale. That is the cost level for GPUs that cannot afford the full-rate march at
+Balanced and below: it trades the softer, noisier motion described above for about a quarter of the march. A
+fixed rate (1 to 3) is kept at every quality level.
+
 The host reports the output size in `FrameInputs::outputWidth / outputHeight` (0 = no upscaling). Remix passes
 its final output extent.
 

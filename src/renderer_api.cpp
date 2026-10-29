@@ -57,6 +57,7 @@ void Renderer::Impl::beginFrame(IGpu& gpu, const FrameInputs& inputs) {
   if (inputs.weather) {
     applyWeather(*inputs.weather, m_settings);
   }
+  applyQualityLevel();
   PassRecorder rec(gpu);
   updateFrame(rec, inputs.deltaSeconds);
   publishOutputs();

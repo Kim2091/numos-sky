@@ -1962,6 +1962,13 @@ void Renderer::Impl::ensureAerialPerspectiveResources(PassRecorder& rec, const A
       Format::RGBA16Float, kApFarSizeX, kApFarSizeY, kApFarSlices, 1));
     replaceTexture(rec, m_apFarTransmittance, createTexture(rec, "Atmosphere AP Far Transmittance", TextureType::Tex3D,
       Format::RGBA16Float, kApFarSizeX, kApFarSizeY, kApFarSlices, 1));
+    m_apFarValid = false;
+  }
+  if (!m_apFarUsage.isValid()) {
+    replaceBuffer(rec, m_apFarUsage, createBuffer(rec, "Atmosphere AP Far Usage", BufferUsage::Structured, 16u));
+    for (Buffer& readback : m_apFarUsageReadback) {
+      replaceBuffer(rec, readback, createBuffer(rec, "Atmosphere AP Far Usage Readback", BufferUsage::Readback, 16u));
+    }
   }
 
   const Texture& near = m_apNearScatter;
@@ -2012,8 +2019,22 @@ void Renderer::Impl::dispatchAerialPerspective(PassRecorder& rec) {
   const GpuHandle cloudSampler = sampler(rec.gpu(), Filter::Linear, Filter::Nearest, AddressMode::Repeat, 0.0f);
 
   // ---- far field ----
-  {
+  // Takes in the far-field counts of earlier frames that have come back.
+  for (uint32_t i = 0; i < kApFarUsageSlots; ++i) {
+    uint32_t usage[4];
+    if (m_apFarUsagePending[i] && rec.gpu().readBuffer(m_apFarUsageReadback[i].handle, usage, sizeof(usage))) {
+      m_apFarUsagePending[i] = false;
+      m_apFarIdleFrames = usage[0] == 0u ? std::min(m_apFarIdleFrames + 1u, kApFarIdleFrames) : 0u;
+    }
+  }
+  // A far field nothing has read for a while is refreshed every kApFarIdlePeriod frames, so the
+  // view that next needs it starts from one at most that old and is current again once the count
+  // comes back.
+  const bool farIdle = m_apFarValid && m_apFarIdleFrames >= kApFarIdleFrames && !m_inputs.cameraCut;
+  if (!farIdle || m_inputs.frameIndex - m_apFarUpdateFrame >= kApFarIdlePeriod) {
     GpuZone inner(rec.gpu(), "Atmosphere AP Far LUT");
+    m_apFarUpdateFrame = m_inputs.frameIndex;
+    m_apFarValid = true;
     rec.bindConstants(AP_FAR_ATMOSPHERE_ARGS, &args, sizeof(AtmosphereArgs));
     rec.bindTexture(AP_FAR_TRANSMITTANCE_INPUT, m_transmittanceLut);
     rec.bindTexture(AP_FAR_MULTISCATTERING_INPUT, m_multiscatteringLut);
@@ -2114,6 +2135,20 @@ void Renderer::Impl::dispatchAerialPerspectiveNear(PassRecorder& rec, GpuHandle 
   rec.barrier();
 
   // ---- froxel integration ----
+  // The integration also counts the columns whose pixels take the far field. Without a free readback
+  // slot, this frame's count is dropped.
+  uint32_t usageSlot = kApFarUsageSlots;
+  for (uint32_t i = 0; i < kApFarUsageSlots; ++i) {
+    if (!m_apFarUsagePending[i]) {
+      usageSlot = i;
+      break;
+    }
+  }
+  {
+    const uint32_t zero[4] = { 0u, 0u, 0u, 0u };
+    rec.gpu().updateBuffer(m_apFarUsage.handle, 0, sizeof(zero), zero);
+    rec.barrier();
+  }
   {
     GpuZone inner(rec.gpu(), "Atmosphere AP Froxel Integration");
     rec.bindConstants(AP_INTEGRATE_ATMOSPHERE_ARGS, &args, sizeof(AtmosphereArgs));
@@ -2128,8 +2163,14 @@ void Renderer::Impl::dispatchAerialPerspectiveNear(PassRecorder& rec, GpuHandle 
     rec.bindTexture(AP_INTEGRATE_OUTPUT, m_apNearScatter);
     rec.bindTexture(AP_INTEGRATE_LINEAR_VIEW_Z, depth);
     rec.bindConstants(AP_INTEGRATE_SURFACE_ARGS, surfaceArgs, sizeof(surfaceArgs));
+    rec.bindBuffer(AP_INTEGRATE_FAR_USAGE, m_apFarUsage);
     rec.setPass(PassId::aerial_perspective_froxel_integrate);
     rec.dispatch((grid.x + 7u) / 8u, (grid.y + 7u) / 8u, 1u);
+  }
+  if (usageSlot < kApFarUsageSlots) {
+    rec.barrier();
+    rec.gpu().copyBuffer(m_apFarUsageReadback[usageSlot].handle, 0, m_apFarUsage.handle, 0, 16u);
+    m_apFarUsagePending[usageSlot] = true;
   }
 
   m_apHistoryIndex = current;
@@ -3142,6 +3183,27 @@ void Renderer::Impl::traceCloudPlacement(const AtmosphereArgs& args) {
     " cloudEnabled=", args.cloudEnabled, " coverage=", args.cloudCoverageMean));
 }
 
+// The quality level scales the settings the host chose rather than replacing them, so a game's own
+// froxel size or sample cap keeps its relative weight at every level. The quarter march of Medium and
+// Low is resolved in cloudMarchStride.
+void Renderer::Impl::applyQualityLevel() {
+  const int32_t level = std::clamp(m_settings.qualityLevel, 0, 2);
+  if (level == 0) {
+    return;
+  }
+  Settings& s = m_settings;
+  const float froxelSizeScale = level == 1 ? 1.5f : 2.0f;
+  const float froxelSliceScale = level == 1 ? 2.0f / 3.0f : 0.5f;
+  s.aerialPerspectiveFroxelSizePixels = std::clamp(
+    static_cast<int32_t>(std::lround(float(s.aerialPerspectiveFroxelSizePixels) * froxelSizeScale)), 2, 64);
+  s.aerialPerspectiveFroxelDepthSlices = std::clamp(
+    static_cast<int32_t>(std::lround(float(s.aerialPerspectiveFroxelDepthSlices) * froxelSliceScale)), 16, 256);
+  if (level >= 2) {
+    s.cloudPerformancePreset = 1;
+    s.cloudViewSamplesMax = std::max(s.cloudViewSamplesMax / 2u, 2u);
+  }
+}
+
 // The screen march rate (docs/cloud-temporal-filter.md, "Choosing the march rate"). The sparse rates run in
 // the screen pass's temporal-filter path: the filter on, the normal profiling mode.
 //
@@ -3189,6 +3251,11 @@ uint32_t Renderer::Impl::cloudMarchStride() const {
         && renderHeight / kf >= kMinEquivalentLines) {
       stride = k;
     }
+  }
+  // Medium and Low drop the magnification tests: the quarter march then runs at any resolution, as
+  // long as the history holds enough of a pixel's own marches.
+  if (m_settings.qualityLevel >= 1 && movingFrames / 4.0f >= kFastSamples) {
+    stride = std::max(stride, 2u);
   }
   return stride;
 }

@@ -192,7 +192,10 @@ struct Renderer::Impl {
   void updateCloudLayer2Map(PassRecorder& rec);
   void dispatchCloudRender(PassRecorder& rec, GpuHandle linearViewZ);
   void dispatchCloudDenoise(PassRecorder& rec);
-  // The screen march stride this frame (1, 2 or 4): cloudMarchRate, Auto resolved from the resolutions.
+  // Scales this frame's effective settings by rtx.atmosphere.qualityLevel. High leaves them unchanged.
+  void applyQualityLevel();
+  // The screen march stride this frame (1, 2 or 4): cloudMarchRate, Auto resolved from the resolutions
+  // and the quality level.
   uint32_t cloudMarchStride() const;
   bool cloudQuarterMarchActive() const { return cloudMarchStride() >= 2u; }
   bool cloudSixteenthMarchActive() const { return cloudMarchStride() >= 4u; }
@@ -284,6 +287,18 @@ struct Renderer::Impl {
   uint32_t m_apLightCapacity = 0u;
   uint32_t m_apLightCount = 0u;
   uint32_t m_apLightClusterCapacity = 0u;
+  // Far-field use (dispatchAerialPerspective): the integration counts the columns whose pixels take
+  // the far field, and the count comes back through a readback ring a few frames later. While no
+  // pixel has read it for kApFarIdleFrames, the far field updates only every kApFarIdlePeriod frames.
+  static constexpr uint32_t kApFarUsageSlots = 3u;
+  static constexpr uint32_t kApFarIdleFrames = 30u;
+  static constexpr uint32_t kApFarIdlePeriod = 8u;
+  Buffer   m_apFarUsage;
+  Buffer   m_apFarUsageReadback[kApFarUsageSlots];
+  bool     m_apFarUsagePending[kApFarUsageSlots] = {};
+  uint32_t m_apFarIdleFrames = 0u;      // consecutive read-back frames without a far-field pixel
+  uint32_t m_apFarUpdateFrame = 0u;     // frame index of the last far-field update
+  bool     m_apFarValid = false;        // the far field holds a complete update
 
   Texture m_cloudSkyTransmittanceLut;
   // Cloud sun-space shadow map and the state it was baked for (updateCloudShadowMap).

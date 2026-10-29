@@ -138,7 +138,7 @@ std::string encodeSeed(const Settings& settings, const WeatherSnapshot* weather,
   const uint8_t* def = reinterpret_cast<const uint8_t*>(&defaults);
   std::vector<const SettingInfo*> changed;
   for (const SettingInfo& info : settingInfos()) {
-    if ((info.flags & NUMOS_SETTING_NO_SAVE) == 0
+    if ((info.flags & (NUMOS_SETTING_NO_SAVE | NUMOS_SETTING_NO_SEED)) == 0
         && std::memcmp(now + info.offset, def + info.offset, valueSize(info.type)) != 0) {
       changed.push_back(&info);
     }
@@ -219,6 +219,9 @@ bool decodeSeed(std::string_view seed, SeedContents& out, std::string* error) {
     }
     if (!hit || hit->type != type) {
       ++c.unknownEntries;  // removed, renamed or retyped since the seed was made
+      continue;
+    }
+    if ((hit->flags & NUMOS_SETTING_NO_SEED) != 0) {
       continue;
     }
     std::memcpy(dst + hit->offset, value, valueSize(type));

@@ -49,3 +49,4 @@
 #define AP_INTEGRATE_OUTPUT              9
 #define AP_INTEGRATE_LINEAR_VIEW_Z       10
 #define AP_INTEGRATE_SURFACE_ARGS        11
+#define AP_INTEGRATE_FAR_USAGE           12

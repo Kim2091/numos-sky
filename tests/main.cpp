@@ -42,7 +42,7 @@ using namespace numos;
 
 static void testInfos() {
   const auto& infos = settingInfos();
-  CHECK(infos.size() == 198 + 7 * kMaxMoons);
+  CHECK(infos.size() == 199 + 7 * kMaxMoons);
   CHECK(findSetting("rtx.atmosphere.sunSize") != nullptr);
   CHECK(findSetting("rtx.atmosphere.moon3.rotation") != nullptr);
   CHECK(findSetting("rtx.atmosphere.nope") == nullptr);
@@ -966,6 +966,16 @@ static void testMarchRate() {
   Settings off = s;
   off.cloudTemporalHistoryWeight = 0.0f;
   CHECK(stride(off, 1080, 1080) == 1);   // no temporal filter, no sparse march
+  Settings medium = s;
+  medium.qualityLevel = 1;
+  CHECK(stride(medium, 626, 1080) == 2);   // Medium: quarter march below 720 lines and past 1.5x
+  CHECK(stride(medium, 1080, 1080) == 2);
+  Settings mediumFull = medium;
+  mediumFull.cloudMarchRate = 1;
+  CHECK(stride(mediumFull, 626, 1080) == 1);  // an explicit rate wins over the quality level
+  Settings mediumOff = medium;
+  mediumOff.cloudTemporalHistoryWeight = 0.0f;
+  CHECK(stride(mediumOff, 626, 1080) == 1);
 }
 
 // Night gain: none by day or at 0 stops, the full gain at night, and the sky never brightens while the
@@ -1125,6 +1135,11 @@ static void testSeed() {
   std::string error;
   CHECK(!decodeSeed(bad, c, &error) && !error.empty());
   CHECK(!decodeSeed("hello", c));
+  // The quality level belongs to the machine: a seed neither carries nor applies it.
+  Settings low;
+  low.qualityLevel = 2;
+  CHECK(encodeSeed(low) == plain);
+  CHECK(decodeSeed(encodeSeed(low), c) && c.settings.qualityLevel == 0);
 }
 
 int main(int argc, char** argv) {
