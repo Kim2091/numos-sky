@@ -1525,40 +1525,21 @@ void marchCloudSlab(vec3   viewDirYUp,
   bool adaptiveMarch = args.nubis3AdaptiveStepKm > 1e-4f
                     && args.cloudViewStepKm > 0.001f;
 
-  if (!adaptiveMarch) {
-    // ---- Fixed-length lattice march ----
-    for (uint i = 0u; i < effSampleCount; ++i) {
-      if (viewTransmittance < kCloudExitTransmittance) {
-        cloudNoteExit(tEntry + stepLen * float(i));  // the start of the segment not marched
-        break;
-      }
-
-      float t = tEntry + stepLen * (float(i) + pixelJitter);
-      float rayFrac = (float(i) + pixelJitter) / float(effSampleCount);
-      float sdfStepKm;
-      ++g_cloudMarchSamples;
-      bool sampled = integrateCloudSample(t, stepLen, rayFrac, viewDirYUp, slab,
-                                          typeNoiseEntry, typeNoiseExit,
-                                          coverageNoiseEntry, coverageNoiseExit,
-                                          ctx, args, accumColor, viewTransmittance,
-                                          sdfStepKm, sumWeightedDistKm, sumWeight, entryDistanceKm);
-      // SDF empty-space skip. The sampler reports a radius around this sample that is guaranteed
-      // empty, so the loop index jumps to land the next sample just inside it. Whole-index jumps
-      // keep every sample on the jittered stratified lattice, so the temporal behaviour does not
-      // change. nvdfStepScale is a safety factor on top (0 disables the skip), and the advance is
-      // capped because the loop bound comes from the constant buffer.
-      if (!sampled && args.nvdfStepScale > 0.0f) {
-        float skipKm = sdfStepKm * args.nvdfStepScale;
-        if (skipKm > stepLen) {
-          uint advance = uint(min(floor(skipKm / stepLen), 4096.0f));
-          i += advance - 1u;  // the loop's ++i completes the advance
-        }
-      }
-    }
-    return;
-  }
-
-  // ---- sqrt-adaptive hybrid march (Nubis pp. 172, 174) ----
+  // Three kinds of step, all through the one integrateCloudSample call below: the shader then holds
+  // one copy of the sample and its lighting instead of one per kind, which the driver's compile time
+  // scales with.
+  //   kStepLattice:  the fixed-length lattice march (adaptiveMarch off).
+  //   kStepAdaptive: the sqrt-adaptive hybrid march (Nubis pp. 172, 174).
+  //   kStepTail:     the coarse tail after the adaptive march runs out of budget.
+  //
+  // ---- Fixed-length lattice march ----
+  // SDF empty-space skip. The sampler reports a radius around each sample that is guaranteed empty,
+  // so the loop index jumps to land the next sample just inside it. Whole-index jumps keep every
+  // sample on the jittered stratified lattice, so the temporal behaviour does not change.
+  // nvdfStepScale is a safety factor on top (0 disables the skip), and the advance is capped because
+  // the loop bound comes from the constant buffer.
+  //
+  // ---- sqrt-adaptive hybrid march ----
   // A fixed step length caps the detail: 100 m steps cannot resolve the sub-200 m content of the
   // detail volume. The paper marches
   //   step = max(SDF distance, adaptive),  adaptive = sqrt(dist) * k,
@@ -1568,13 +1549,26 @@ void marchCloudSlab(vec3   viewDirYUp,
   //                       nubis3AdaptiveStepKm, 4 * cloudViewStepKm)
   // which gives 100 m at 12 km, ~30 m at a 1.3 km deck base, the floor (default 25 m) when flying
   // through, and ~400 m at the far horizon. Sample positions are jittered inside each cell; the
-  // cursor is not. A ray that runs out of budget gets the coarse tail integration below.
+  // cursor is not. A ray that runs out of budget gets the coarse tail integration.
+  //
+  // ---- Budget-exhausted tail ----
+  // Near the deck a ray can spend its whole budget on the fine adaptive steps through the cloud in
+  // front of it and reach iterCap a few km out. Dropping the rest of the ray would cut the cloud off
+  // along a hard line across the sky, since the exhaustion distance is about the same for every ray
+  // in a direction. The cap should cost detail, not cloud, so the remainder is integrated coarsely:
+  // four long Beer-Lambert segments over [t, tExit]. One segment would let a single dense hit turn
+  // the whole remaining span opaque, a hard dark line instead of a bright one. Only rays that
+  // exhausted the budget pay, four samples on top of the cap.
+  const uint kStepLattice = 0u;
+  const uint kStepAdaptive = 1u;
+  const uint kStepTail = 2u;
   const float kAdaptiveRefDistKm = 12.0f;  // adaptive == cloudViewStepKm here
   // Animated by default so sampling error does not become a fixed screen-space pattern.
   const float kJitterAnimateKm   = args.nubis3JitterAnimateKm;
+  const uint  kTailSamples = 4u;
   float adaptiveCeilKm = max(4.0f * args.cloudViewStepKm, args.nubis3AdaptiveStepKm);
   uint  iterCap = max(uint(args.cloudViewSamplesMax), 2u);
-  float t = tEntry;
+  float t = tEntry;  // the adaptive march's cursor; the tail starts where it stopped
   float sdfStepKm = 0.0f;  // previous sample's conservative empty radius
   // Far end of the previous sample's guaranteed-empty interval, as a distance along the ray (see
   // the skip below). tEntry means nothing is proven yet, so the first iteration takes the adaptive
@@ -1584,86 +1578,122 @@ void marchCloudSlab(vec3   viewDirYUp,
   const float latticePhase = g_cloudLightJitterSeed >= 0.0f
     ? frac(g_cloudLightJitterSeed + 0.7548776662f) : 1.0f;
   bool latticeRestart = true;
-  for (uint iter = 0u; iter < iterCap && t < tExit; ++iter) {
-    if (viewTransmittance < kCloudExitTransmittance) {  // transmittance-limit exit (p.174)
-      cloudNoteExit(t);
-      break;
-    }
-
-    float stepKm = clamp(args.cloudViewStepKm * sqrt(t * (1.0f / kAdaptiveRefDistKm)),
-                         args.nubis3AdaptiveStepKm, adaptiveCeilKm);
-    // Lattice restart. Each skip through empty air ends at the body's bounding surface and the
-    // fixed steps start from there, so without this the cells would sit at the same offsets from
-    // the real (billow-displaced) surface every frame: the sample jitter moves a sample within its
-    // cell, never the cells, and the cells' quadrature error would draw the displacement's contours
-    // as ribs. Shortening the first fixed step after a skip by a per-frame random phase spreads the
-    // cells over all offsets, and the temporal filter averages the error flat. Only the step where a
-    // skip meets a surface is shortened (the last sample's empty radius has fallen below a step);
-    // shortening every step through clear air would double the march's iterations.
-    const float adaptiveKm = clamp(args.cloudViewStepKm * sqrt(t * (1.0f / kAdaptiveRefDistKm)),
-                                   args.nubis3AdaptiveStepKm, adaptiveCeilKm);
-    if (sdfStepKm > 2.0f * adaptiveKm) {
-      latticeRestart = true;
-    } else if (latticeRestart && sdfStepKm < adaptiveKm) {
-      latticeRestart = false;
-      stepKm *= max(latticePhase, 0.05f);
-    }
-    stepKm = min(stepKm, tExit - t);  // final-segment Beer length stays exact
-    if (stepKm <= 1e-5f) break;       // FP guard: t += denormal would stall
-
-    float hash    = t < kJitterAnimateKm ? pixelJitter : pixelJitterStatic;
-    float tSample = t + hash * stepKm;
-    // Decorrelated from the view jitter, and different for each sample along the ray. A golden-
-    // ratio shift keeps a blue-noise seed blue, so neighbouring pixels' errors cancel in the
-    // temporal filter's 3x3 tent; scaling the seed (hash * 7.31, the fallback) makes it white noise.
-    const float lightSeed = g_cloudLightJitterSeed >= 0.0f ? g_cloudLightJitterSeed : frac(hash * 7.31f);
-    g_cloudLightJitter = frac(lightSeed + float(iter) * 0.6180339887f);
-    float rayFrac = saturate((tSample - tEntry) / (tExit - tEntry));
-    ++g_cloudMarchSamples;
-    integrateCloudSample(tSample, stepKm, rayFrac, viewDirYUp, slab,
-                         typeNoiseEntry, typeNoiseExit,
-                         coverageNoiseEntry, coverageNoiseExit,
-                         ctx, args, accumColor, viewTransmittance,
-                         sdfStepKm, sumWeightedDistKm, sumWeight, entryDistanceKm);
-    // The interval this sample proved empty, in ray distance; the next iteration skips to it
-    // from wherever its cursor is (see above).
-    tEmptyUntilKm = tSample + sdfStepKm;
-    t += stepKm;
-    // Advance only through the remainder of the sample-anchored empty interval.
-    // Feeding this distance into a jittered sample instead re-evaluates known empty air.
-    const float emptyAdvanceKm = max(tEmptyUntilKm - t, 0.0f) * saturate(args.nvdfStepScale);
-    t = min(t + emptyAdvanceKm, tExit);
-  }
-
-  // Budget-exhausted tail. Near the deck a ray can spend its whole budget on the fine adaptive steps
-  // through the cloud in front of it and reach iterCap a few km out. Dropping the rest of the ray
-  // would cut the cloud off along a hard line across the sky, since the exhaustion distance is about
-  // the same for every ray in a direction. The cap should cost detail, not cloud, so the remainder
-  // is integrated coarsely: four long Beer-Lambert segments over [t, tExit]. One segment would let a
-  // single dense hit turn the whole remaining span opaque, a hard dark line instead of a bright one.
-  // Only rays that exhausted the budget pay, four samples on top of the cap.
-  if (t < tExit && viewTransmittance <= kCloudExitTransmittance) {
-    cloudNoteExit(t);  // opaque when the budget ran out: the tail below is skipped
-  }
-  if (t < tExit && viewTransmittance > kCloudExitTransmittance) {
-    const uint  kTailSamples = 4u;
-    const float tailStepKm   = (tExit - t) / float(kTailSamples);
-    if (tailStepKm > 1e-5f) {
-      for (uint tail = 0u; tail < kTailSamples; ++tail) {
-        if (viewTransmittance < kCloudExitTransmittance) {
-          cloudNoteExit(t + float(tail) * tailStepKm);
+  float tailStepKm = 0.0f;
+  uint kind = adaptiveMarch ? kStepAdaptive : kStepLattice;
+  // The lattice index, the adaptive iteration or the tail segment, by kind.
+  uint i = 0u;
+  for (;;) {
+    float tSample;
+    float segKm;
+    float rayFrac;
+    if (kind == kStepLattice) {
+      if (i >= effSampleCount) {
+        break;
+      }
+      if (viewTransmittance < kCloudExitTransmittance) {
+        cloudNoteExit(tEntry + stepLen * float(i));  // the start of the segment not marched
+        break;
+      }
+      tSample = tEntry + stepLen * (float(i) + pixelJitter);
+      rayFrac = (float(i) + pixelJitter) / float(effSampleCount);
+      segKm = stepLen;
+    } else if (kind == kStepAdaptive) {
+      bool more = i < iterCap && t < tExit;
+      if (more && viewTransmittance < kCloudExitTransmittance) {  // transmittance-limit exit (p.174)
+        cloudNoteExit(t);
+        more = false;
+      }
+      float stepKm = 0.0f;
+      if (more) {
+        stepKm = clamp(args.cloudViewStepKm * sqrt(t * (1.0f / kAdaptiveRefDistKm)),
+                       args.nubis3AdaptiveStepKm, adaptiveCeilKm);
+        // Lattice restart. Each skip through empty air ends at the body's bounding surface and the
+        // fixed steps start from there, so without this the cells would sit at the same offsets
+        // from the real (billow-displaced) surface every frame: the sample jitter moves a sample
+        // within its cell, never the cells, and the cells' quadrature error would draw the
+        // displacement's contours as ribs. Shortening the first fixed step after a skip by a
+        // per-frame random phase spreads the cells over all offsets, and the temporal filter
+        // averages the error flat. Only the step where a skip meets a surface is shortened (the
+        // last sample's empty radius has fallen below a step); shortening every step through clear
+        // air would double the march's iterations.
+        const float adaptiveKm = clamp(args.cloudViewStepKm * sqrt(t * (1.0f / kAdaptiveRefDistKm)),
+                                       args.nubis3AdaptiveStepKm, adaptiveCeilKm);
+        if (sdfStepKm > 2.0f * adaptiveKm) {
+          latticeRestart = true;
+        } else if (latticeRestart && sdfStepKm < adaptiveKm) {
+          latticeRestart = false;
+          stepKm *= max(latticePhase, 0.05f);
+        }
+        stepKm = min(stepKm, tExit - t);  // final-segment Beer length stays exact
+        if (stepKm <= 1e-5f) {            // FP guard: t += denormal would stall
+          more = false;
+        }
+      }
+      if (more) {
+        float hash = t < kJitterAnimateKm ? pixelJitter : pixelJitterStatic;
+        tSample = t + hash * stepKm;
+        // Decorrelated from the view jitter, and different for each sample along the ray. A
+        // golden-ratio shift keeps a blue-noise seed blue, so neighbouring pixels' errors cancel in
+        // the temporal filter's 3x3 tent; scaling the seed (hash * 7.31, the fallback) makes it
+        // white noise.
+        const float lightSeed = g_cloudLightJitterSeed >= 0.0f ? g_cloudLightJitterSeed : frac(hash * 7.31f);
+        g_cloudLightJitter = frac(lightSeed + float(i) * 0.6180339887f);
+        rayFrac = saturate((tSample - tEntry) / (tExit - tEntry));
+        segKm = stepKm;
+      } else {
+        // The adaptive march is over: the tail, if the budget ran out short of the exit.
+        if (t < tExit && viewTransmittance <= kCloudExitTransmittance) {
+          cloudNoteExit(t);  // opaque when the budget ran out: the tail is skipped
+        }
+        if (!(t < tExit && viewTransmittance > kCloudExitTransmittance)) {
           break;
         }
-        const float tSample = t + (float(tail) + 0.5f) * tailStepKm;
-        const float rayFrac = saturate((tSample - tEntry) / max(tExit - tEntry, 1e-6f));
-        ++g_cloudMarchSamples;
-        integrateCloudSample(tSample, tailStepKm, rayFrac, viewDirYUp, slab,
-                             typeNoiseEntry, typeNoiseExit,
-                             coverageNoiseEntry, coverageNoiseExit,
-                             ctx, args, accumColor, viewTransmittance,
-                             sdfStepKm, sumWeightedDistKm, sumWeight, entryDistanceKm);
+        tailStepKm = (tExit - t) / float(kTailSamples);
+        if (!(tailStepKm > 1e-5f)) {
+          break;
+        }
+        kind = kStepTail;
+        i = 0u;
       }
     }
+    if (kind == kStepTail) {
+      if (i >= kTailSamples) {
+        break;
+      }
+      if (viewTransmittance < kCloudExitTransmittance) {
+        cloudNoteExit(t + float(i) * tailStepKm);
+        break;
+      }
+      tSample = t + (float(i) + 0.5f) * tailStepKm;
+      rayFrac = saturate((tSample - tEntry) / max(tExit - tEntry, 1e-6f));
+      segKm = tailStepKm;
+    }
+
+    ++g_cloudMarchSamples;
+    const bool sampled = integrateCloudSample(tSample, segKm, rayFrac, viewDirYUp, slab,
+                                              typeNoiseEntry, typeNoiseExit,
+                                              coverageNoiseEntry, coverageNoiseExit,
+                                              ctx, args, accumColor, viewTransmittance,
+                                              sdfStepKm, sumWeightedDistKm, sumWeight, entryDistanceKm);
+    if (kind == kStepLattice) {
+      if (!sampled && args.nvdfStepScale > 0.0f) {
+        float skipKm = sdfStepKm * args.nvdfStepScale;
+        if (skipKm > stepLen) {
+          uint advance = uint(min(floor(skipKm / stepLen), 4096.0f));
+          i += advance - 1u;  // the ++i below completes the advance
+        }
+      }
+    } else if (kind == kStepAdaptive) {
+      // The interval this sample proved empty, in ray distance; the next iteration skips to it
+      // from wherever its cursor is (see above).
+      tEmptyUntilKm = tSample + sdfStepKm;
+      t += segKm;
+      // Advance only through the remainder of the sample-anchored empty interval.
+      // Feeding this distance into a jittered sample instead re-evaluates known empty air.
+      const float emptyAdvanceKm = max(tEmptyUntilKm - t, 0.0f) * saturate(args.nvdfStepScale);
+      t = min(t + emptyAdvanceKm, tExit);
+    }
+    ++i;
   }
 }
 

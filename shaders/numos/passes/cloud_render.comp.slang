@@ -668,19 +668,9 @@ struct CloudResolved {
 
 // A pixel's output from its neighbourhood and its history. `spacing`: the sample lattice's (1 at full
 // rate). `marchSamples`: the density evaluation count for depth.w. A pixel no sample sees (a
-// silhouette) is marched here.
+// silhouette) is marched by the caller and its march added to nb.
 CloudResolved cloudResolvePixel(uint2 pixelCoord, uint2 outputDim, float tSurfaceKm, CloudNeighbourhood nb,
                                 float spacing, float marchSamples, CloudShadeContext ctx, AtmosphereArgs args) {
-  if (nb.interpWeight <= 1e-4f && nb.wideWeight <= 1e-4f) {
-    const CameraDirections ray = cloudPixelRay(pixelCoord, outputDim,
-                                               cloudSubpixelOffset(pixelCoord, args.cloudRenderFrameIdx));
-    const vec3 viewDirYUp = worldToAtmosphereYUp(ray.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0);
-    const CloudPixelResult marched = marchCloudPixel(pixelCoord, viewDirYUp, tSurfaceKm, args.cloudRenderFrameIdx,
-                                                     ctx, args);
-    cloudNeighbourhoodAdd(nb, marched.color, marched.depth, g_cloudFlashAccum, g_cloudLayer2Share, vec2(0.0f),
-                          spacing);
-    marchSamples = marched.depth.w;
-  }
   const bool hasInterp = nb.interpWeight > 1e-4f;
   const vec4 wideColor = nb.wideWeight > 1e-4f ? nb.wide / nb.wideWeight : nb.interp / nb.interpWeight;
   const vec4 interpColor = hasInterp ? nb.interp / nb.interpWeight : wideColor;
@@ -818,200 +808,166 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
   CloudShadeContext ctx = buildCloudShadeContextGroup(args, groupThreadId.y * CLOUD_GROUP_X + groupThreadId.x);
 
 #ifdef CLOUD_TEMPORAL_FILTER
-  if (period == 1u && (args.cloudScreenInterleave & 0xC0000u) == 0xC0000u) {
-    // Cell march: cells of 2x2 pixels (quarter march) or 4x4 (sixteenth march, bit 19), in two
-    // dispatches. The march pass (one lane per cell) marches one pixel of every cell, cycling through
-    // all of them, into the fresh-sample buffers; the rebuild pass (bit 20, one lane per pixel)
-    // rebuilds every pixel from the fresh samples of the cells around it plus the temporal history.
-    // Two passes let each pixel see cells outside its workgroup; in one pass every group would
-    // rebuild its tile alone and the tiles would show as blocks.
-    const bool sixteenth = (args.cloudScreenInterleave & 0x80000u) != 0u;
-    const int cellSize = sixteenth ? 4 : 2;
-    const int2 phase = int2(sixteenth ? cloudSixteenthPhase(args.cloudRenderFrameIdx)
+  if (period == 1u) {
+    // Three schedules share this code:
+    //   * Cell march (bits 18 and 19 both set): cells of 2x2 pixels (quarter march) or 4x4
+    //     (sixteenth march, bit 19), in two dispatches. The march pass (one lane per cell) marches one
+    //     pixel of every cell, cycling through all of them, into the fresh-sample buffers; the rebuild
+    //     pass (bit 20, one lane per pixel) rebuilds every pixel from the fresh samples of the cells
+    //     around it plus the temporal history. Two passes let each pixel see cells outside its
+    //     workgroup; in one pass every group would rebuild its tile alone and the tiles would show as
+    //     blocks.
+    //   * Quarter march (bit 18 alone): one 2x2 cell per lane, its group grid shifted every frame
+    //     like the full-rate path.
+    //   * Full rate: one pixel per lane. The 3x3 neighbourhood stops at the group edge, so the group
+    //     grid shifts every frame (the host dispatches one extra group per axis) and its seams
+    //     average out instead of showing.
+    // The quarter and full-rate schedules share fresh samples through groupshared memory, so every
+    // lane reaches their barrier, in bounds or not.
+    //
+    // Step 0 is the lane's fresh march (not in the rebuild pass); steps 1 to subCount resolve the
+    // rebuild pass's pixel, the quarter cell's four pixels or the full-rate pixel, marching a pixel
+    // no fresh sample sees (a silhouette). Every march goes through the one marchCloudPixel call in
+    // the loop, so the shader holds a single copy of the march.
+    const bool cellSchedule = (args.cloudScreenInterleave & 0xC0000u) == 0xC0000u;
+    const bool cellRebuild = cellSchedule && (args.cloudScreenInterleave & 0x100000u) != 0u;
+    const bool quarter = !cellSchedule && (args.cloudScreenInterleave & 0x40000u) != 0u;
+    const bool fullRate = !cellSchedule && !quarter;
+    const bool sixteenth = cellSchedule && (args.cloudScreenInterleave & 0x80000u) != 0u;
+    // Pixels per cell side: the sample lattice's spacing.
+    const int cellSize = sixteenth ? 4 : (fullRate ? 1 : 2);
+    const int2 phase = fullRate ? int2(0)
+                     : int2(sixteenth ? cloudSixteenthPhase(args.cloudRenderFrameIdx)
                                       : cloudQuarterPhase(args.cloudRenderFrameIdx));
     // A pixel's own marches are its cell's every 4th (16th) frame: this is the pixel's own count.
-    const uint ownIndex = args.cloudRenderFrameIdx >> (sixteenth ? 4u : 2u);
+    const uint ownIndex = fullRate ? args.cloudRenderFrameIdx : args.cloudRenderFrameIdx >> (sixteenth ? 4u : 2u);
     const int2 cellsDim = (int2(outputDim) + int2(cellSize - 1)) / cellSize;
-    if ((args.cloudScreenInterleave & 0x100000u) == 0u) {
-      const int2 cell = int2(dispatchId.xy);
-      if (any(cell >= cellsDim)) {
-        return;
-      }
-      const int2 freshPixel = cell * cellSize + phase;
-      CloudPixelResult fresh;
-      fresh.color = vec4(0.0f, 0.0f, 0.0f, 1.0f);
-      fresh.depth = vec4(-1.0f, 0.0f, kNoSurfaceKm, -1.0f);  // w < 0: no sample
-      vec2 aux = vec2(0.0f);
-      if (all(freshPixel < int2(outputDim))) {
-        const uint2 pixelCoord = uint2(freshPixel);
-        const CameraDirections cloudRay = cloudPixelRay(pixelCoord, outputDim, cloudSubpixelOffset(pixelCoord, ownIndex));
-        const float tSurfaceKm = cloudSurfaceDistanceKm(pixelCoord, cloudRay, args);
-        const vec3 viewDirYUp = worldToAtmosphereYUp(cloudRay.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0);
-        fresh = marchCloudPixel(pixelCoord, viewDirYUp, tSurfaceKm, ownIndex, ctx, args);
-        aux = vec2(g_cloudFlashAccum, g_cloudLayer2Share);
-      }
-      cloudFreshColor[uint2(cell)] = fresh.color;
-      cloudFreshDepth[uint2(cell)] = fresh.depth;
-      cloudFreshAux[uint2(cell)] = aux;
-      return;
-    }
-
-    const int2 q = int2(dispatchId.xy);
-    if (any(q >= int2(outputDim))) {
-      return;
-    }
-    const int2 cell = q / cellSize;
-    const uint2 pixelCoord = uint2(q);
-    const float tSurfaceKm = cloudSurfaceDistanceKm(pixelCoord, cloudPixelRay(pixelCoord, outputDim, vec2(0.0f)), args);
-    CloudNeighbourhood nb = cloudNeighbourhoodEmpty();
-    [unroll]
-    for (int dy = -1; dy <= 1; ++dy) {
-      [unroll]
-      for (int dx = -1; dx <= 1; ++dx) {
-        const int2 c = cell + int2(dx, dy);
-        if (any(c < int2(0)) || any(c >= cellsDim)) {
-          continue;
-        }
-        const vec4 d = cloudFreshDepth[uint2(c)];
-        const vec4 v = cloudFreshColor[uint2(c)];
-        if (d.w < 0.0f || !cloudSameSurface(tSurfaceKm, v, d, args)) {
-          continue;
-        }
-        const vec2 a = cloudFreshAux[uint2(c)];
-        cloudNeighbourhoodAdd(nb, v, d, a.x, a.y, vec2(c * cellSize + phase - q), float(cellSize));
-      }
-    }
-    // .w: the density evaluations of this cell's march, for the sample statistics and debug views.
-    const CloudResolved r = cloudResolvePixel(pixelCoord, outputDim, tSurfaceKm, nb, float(cellSize),
-                                              cloudFreshDepth[uint2(cell)].w, ctx, args);
-    cloudRenderOutput[pixelCoord] = r.color;
-    cloudDepthOutput[pixelCoord] = r.depth;
-    cloudStateOutput[pixelCoord] = r.state;
-    return;
-  }
-
-  if (period == 1u && (args.cloudScreenInterleave & 0x40000u) != 0u) {
-    // Quarter march: one 2x2 cell per lane, its group grid shifted every frame like the full-rate
-    // path below. Every lane reaches the barrier, in bounds or not.
     const int2 tileShift = int2((args.cloudRenderFrameIdx * 5u) % uint(CLOUD_GROUP_X),
                                 (args.cloudRenderFrameIdx * 3u) % uint(CLOUD_GROUP_Y));
-    const int2 cell = int2(dispatchId.xy) - tileShift;
-    const int2 phase = int2(cloudQuarterPhase(args.cloudRenderFrameIdx));
-    const uint ownIndex = args.cloudRenderFrameIdx >> 2u;
-    const int2 freshPixel = cell * 2 + phase;
-    const bool freshInBounds = all(cell >= int2(0)) && all(freshPixel < int2(outputDim));
+    // This lane's cell (its pixel at full rate).
+    const int2 cell = cellSchedule ? int2(dispatchId.xy) : int2(dispatchId.xy) - tileShift;
+    if (cellSchedule && !cellRebuild && any(cell >= cellsDim)) {
+      return;
+    }
+    const int2 freshPixel = cell * cellSize + phase;
+    const bool freshInBounds = !cellRebuild && all(cell >= int2(0)) && all(freshPixel < int2(outputDim));
+    float freshSurfaceKm = kNoSurfaceKm;
     CloudPixelResult fresh;
     fresh.color = vec4(0.0f, 0.0f, 0.0f, 1.0f);
     fresh.depth = vec4(-1.0f, 0.0f, kNoSurfaceKm, -1.0f);  // w < 0: no sample
     float freshFlash = 0.0f;
     float freshLayer2 = 0.0f;
-    if (freshInBounds) {
-      const uint2 pixelCoord = uint2(freshPixel);
-      const CameraDirections cloudRay = cloudPixelRay(pixelCoord, outputDim, cloudSubpixelOffset(pixelCoord, ownIndex));
-      const float tSurfaceKm = cloudSurfaceDistanceKm(pixelCoord, cloudRay, args);
-      const vec3 viewDirYUp = worldToAtmosphereYUp(cloudRay.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0);
-      fresh = marchCloudPixel(pixelCoord, viewDirYUp, tSurfaceKm, ownIndex, ctx, args);
-      freshFlash = g_cloudFlashAccum;
-      freshLayer2 = g_cloudLayer2Share;
-    }
-    gs_cloudFresh[groupThreadId.y][groupThreadId.x] = fresh.color;
-    gs_cloudFreshDepth[groupThreadId.y][groupThreadId.x] = fresh.depth;
-    gs_cloudFreshFlash[groupThreadId.y][groupThreadId.x] = freshFlash;
-    gs_cloudFreshLayer2[groupThreadId.y][groupThreadId.x] = freshLayer2;
-    GroupMemoryBarrierWithGroupSync();
-    if (any(cell < int2(0))) {
-      return;
-    }
-    for (uint sub = 0u; sub < 4u; ++sub) {
-      const int2 q = cell * 2 + int2(int(sub & 1u), int(sub >> 1u));
-      if (any(q >= int2(outputDim))) {
+
+    const uint subCount = quarter ? 4u : 1u;
+    for (uint step = cellRebuild ? 1u : 0u; step <= subCount; ++step) {
+      if (step == 1u && !cellSchedule) {
+        gs_cloudFresh[groupThreadId.y][groupThreadId.x] = fresh.color;
+        gs_cloudFreshDepth[groupThreadId.y][groupThreadId.x] = fresh.depth;
+        gs_cloudFreshFlash[groupThreadId.y][groupThreadId.x] = freshFlash;
+        gs_cloudFreshLayer2[groupThreadId.y][groupThreadId.x] = freshLayer2;
+        GroupMemoryBarrierWithGroupSync();
+        if (any(cell < int2(0)) || (fullRate && !freshInBounds)) {
+          return;
+        }
+      }
+      const uint sub = step - 1u;
+      const int2 q = step == 0u ? freshPixel
+                   : (cellRebuild ? int2(dispatchId.xy)
+                                  : (quarter ? cell * 2 + int2(int(sub & 1u), int(sub >> 1u)) : freshPixel));
+      if (step != 0u && any(q >= int2(outputDim))) {
+        if (cellRebuild) {
+          return;
+        }
         continue;
       }
       const uint2 pixelCoord = uint2(q);
-      const float tSurfaceKm = cloudSurfaceDistanceKm(pixelCoord, cloudPixelRay(pixelCoord, outputDim, vec2(0.0f)), args);
+      // The march cell this pixel belongs to (the rebuild pass's lane covers one pixel).
+      const int2 qCell = cellRebuild ? q / cellSize : cell;
+      // The fresh march, and at full rate the resolve, see the pixel through its jittered ray; the
+      // cell schedules resolve every pixel of a cell through its centre.
+      float tSurfaceKm = freshSurfaceKm;
       CloudNeighbourhood nb = cloudNeighbourhoodEmpty();
-      [unroll]
-      for (int dy = -1; dy <= 1; ++dy) {
-        [unroll]
-        for (int dx = -1; dx <= 1; ++dx) {
-          const int2 g = int2(groupThreadId.xy) + int2(dx, dy);
-          if (any(g < int2(0)) || g.x >= CLOUD_GROUP_X || g.y >= CLOUD_GROUP_Y) {
-            continue;
-          }
-          const vec4 d = gs_cloudFreshDepth[g.y][g.x];
-          const vec4 v = gs_cloudFresh[g.y][g.x];
-          if (d.w < 0.0f || !cloudSameSurface(tSurfaceKm, v, d, args)) {
-            continue;
-          }
-          cloudNeighbourhoodAdd(nb, v, d, gs_cloudFreshFlash[g.y][g.x], gs_cloudFreshLayer2[g.y][g.x],
-                                vec2((cell + int2(dx, dy)) * 2 + phase - q), 2.0f);
+      bool march = freshInBounds;
+      if (step != 0u) {
+        if (!fullRate) {
+          tSurfaceKm = cloudSurfaceDistanceKm(pixelCoord, cloudPixelRay(pixelCoord, outputDim, vec2(0.0f)), args);
         }
+        [unroll]
+        for (int dy = -1; dy <= 1; ++dy) {
+          [unroll]
+          for (int dx = -1; dx <= 1; ++dx) {
+            // The rebuild pass reads every cell's fresh sample from the fresh-sample buffers; the
+            // others read their group's from groupshared memory.
+            const int2 c = qCell + int2(dx, dy);
+            const int2 g = int2(groupThreadId.xy) + int2(dx, dy);
+            vec4 d, v;
+            vec2 a;
+            if (cellRebuild) {
+              if (any(c < int2(0)) || any(c >= cellsDim)) {
+                continue;
+              }
+              d = cloudFreshDepth[uint2(c)];
+              v = cloudFreshColor[uint2(c)];
+            } else {
+              if (any(g < int2(0)) || g.x >= CLOUD_GROUP_X || g.y >= CLOUD_GROUP_Y) {
+                continue;
+              }
+              d = gs_cloudFreshDepth[g.y][g.x];
+              v = gs_cloudFresh[g.y][g.x];
+            }
+            if (d.w < 0.0f || !cloudSameSurface(tSurfaceKm, v, d, args)) {
+              continue;
+            }
+            a = cellRebuild ? cloudFreshAux[uint2(c)] : vec2(gs_cloudFreshFlash[g.y][g.x], gs_cloudFreshLayer2[g.y][g.x]);
+            cloudNeighbourhoodAdd(nb, v, d, a.x, a.y, vec2(c * cellSize + phase - q), float(cellSize));
+          }
+        }
+        // A pixel no fresh sample sees (a silhouette) is marched itself.
+        march = nb.interpWeight <= 1e-4f && nb.wideWeight <= 1e-4f;
       }
-      // .w: the density evaluations of this cell's march (each pixel is marched one frame in four).
-      const CloudResolved r = cloudResolvePixel(pixelCoord, outputDim, tSurfaceKm, nb, 2.0f,
-                                                gs_cloudFreshDepth[groupThreadId.y][groupThreadId.x].w, ctx, args);
+
+      CloudPixelResult marched;
+      if (march) {
+        // The fresh march walks the pixel's own sample sequence; a silhouette march, the frame's.
+        const uint marchIndex = step == 0u ? ownIndex : args.cloudRenderFrameIdx;
+        const CameraDirections cloudRay = cloudPixelRay(pixelCoord, outputDim, cloudSubpixelOffset(pixelCoord, marchIndex));
+        if (step == 0u) {
+          tSurfaceKm = cloudSurfaceDistanceKm(pixelCoord, cloudRay, args);
+        }
+        const vec3 viewDirYUp = worldToAtmosphereYUp(cloudRay.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0);
+        marched = marchCloudPixel(pixelCoord, viewDirYUp, tSurfaceKm, marchIndex, ctx, args);
+      }
+
+      if (step == 0u) {
+        if (march) {
+          freshSurfaceKm = tSurfaceKm;
+          fresh = marched;
+          freshFlash = g_cloudFlashAccum;
+          freshLayer2 = g_cloudLayer2Share;
+        }
+        if (cellSchedule) {
+          cloudFreshColor[uint2(cell)] = fresh.color;
+          cloudFreshDepth[uint2(cell)] = fresh.depth;
+          cloudFreshAux[uint2(cell)] = vec2(freshFlash, freshLayer2);
+          return;
+        }
+        continue;
+      }
+
+      // .w: the density evaluations of this cell's march, or of the silhouette march.
+      float marchSamples = cellRebuild ? cloudFreshDepth[uint2(qCell)].w
+                         : gs_cloudFreshDepth[groupThreadId.y][groupThreadId.x].w;
+      if (march) {
+        cloudNeighbourhoodAdd(nb, marched.color, marched.depth, g_cloudFlashAccum, g_cloudLayer2Share, vec2(0.0f),
+                              float(cellSize));
+        marchSamples = marched.depth.w;
+      }
+      const CloudResolved r = cloudResolvePixel(pixelCoord, outputDim, tSurfaceKm, nb, float(cellSize),
+                                                marchSamples, ctx, args);
       cloudRenderOutput[pixelCoord] = r.color;
       cloudDepthOutput[pixelCoord] = r.depth;
       cloudStateOutput[pixelCoord] = r.state;
     }
-    return;
-  }
-
-  // One pixel per lane. Every lane reaches the barrier, in bounds or not.
-  if (period == 1u) {
-    // The 3x3 neighbourhood stops at the group edge, so the group grid shifts every frame (the
-    // host dispatches one extra group per axis) and its seams average out instead of showing.
-    const int2 tileShift = int2((args.cloudRenderFrameIdx * 5u) % uint(CLOUD_GROUP_X),
-                                (args.cloudRenderFrameIdx * 3u) % uint(CLOUD_GROUP_Y));
-    const int2 shifted = int2(dispatchId.xy) - tileShift;
-    const bool pixelInBounds = all(shifted >= int2(0)) && all(shifted < int2(outputDim));
-    const uint2 pixelCoord = uint2(max(shifted, int2(0)));
-    float tSurfaceKm = kNoSurfaceKm;
-    CloudPixelResult fresh;
-    fresh.color = vec4(0.0f, 0.0f, 0.0f, 1.0f);
-    fresh.depth = vec4(-1.0f, 0.0f, kNoSurfaceKm, -1.0f);  // w < 0: no sample
-    float freshFlash = 0.0f;
-    float freshLayer2 = 0.0f;
-    if (pixelInBounds) {
-      const CameraDirections cloudRay = cloudPixelRay(pixelCoord, outputDim,
-                                                      cloudSubpixelOffset(pixelCoord, args.cloudRenderFrameIdx));
-      tSurfaceKm = cloudSurfaceDistanceKm(pixelCoord, cloudRay, args);
-      const vec3 viewDirYUp = worldToAtmosphereYUp(
-        cloudRay.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0);
-      fresh = marchCloudPixel(pixelCoord, viewDirYUp, tSurfaceKm, args.cloudRenderFrameIdx, ctx, args);
-      freshFlash = g_cloudFlashAccum;
-      freshLayer2 = g_cloudLayer2Share;
-    }
-    gs_cloudFresh[groupThreadId.y][groupThreadId.x] = fresh.color;
-    gs_cloudFreshDepth[groupThreadId.y][groupThreadId.x] = fresh.depth;
-    gs_cloudFreshFlash[groupThreadId.y][groupThreadId.x] = freshFlash;
-    gs_cloudFreshLayer2[groupThreadId.y][groupThreadId.x] = freshLayer2;
-    GroupMemoryBarrierWithGroupSync();
-    if (!pixelInBounds) {
-      return;
-    }
-    CloudNeighbourhood nb = cloudNeighbourhoodEmpty();
-    [unroll]
-    for (int dy = -1; dy <= 1; ++dy) {
-      [unroll]
-      for (int dx = -1; dx <= 1; ++dx) {
-        const int2 g = int2(groupThreadId.xy) + int2(dx, dy);
-        if (any(g < int2(0)) || g.x >= CLOUD_GROUP_X || g.y >= CLOUD_GROUP_Y) {
-          continue;
-        }
-        const vec4 d = gs_cloudFreshDepth[g.y][g.x];
-        const vec4 v = gs_cloudFresh[g.y][g.x];
-        if (d.w < 0.0f || !cloudSameSurface(tSurfaceKm, v, d, args)) {
-          continue;
-        }
-        cloudNeighbourhoodAdd(nb, v, d, gs_cloudFreshFlash[g.y][g.x], gs_cloudFreshLayer2[g.y][g.x],
-                              vec2(dx, dy), 1.0f);
-      }
-    }
-    const CloudResolved r = cloudResolvePixel(pixelCoord, outputDim, tSurfaceKm, nb, 1.0f, fresh.depth.w, ctx, args);
-    cloudRenderOutput[pixelCoord] = r.color;
-    cloudDepthOutput[pixelCoord] = r.depth;
-    cloudStateOutput[pixelCoord] = r.state;
     return;
   }
 #endif
