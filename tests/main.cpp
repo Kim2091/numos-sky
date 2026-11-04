@@ -42,7 +42,7 @@ using namespace numos;
 
 static void testInfos() {
   const auto& infos = settingInfos();
-  CHECK(infos.size() == 206 + 7 * kMaxMoons);
+  CHECK(infos.size() == 207 + 7 * kMaxMoons);
   CHECK(findSetting("rtx.atmosphere.sunSize") != nullptr);
   CHECK(findSetting("rtx.atmosphere.moon3.rotation") != nullptr);
   CHECK(findSetting("rtx.atmosphere.nope") == nullptr);

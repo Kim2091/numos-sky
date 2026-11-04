@@ -409,7 +409,7 @@ struct AtmosphereArgs {
   float cloudCirrusShadowCenterX;  // km, the window's centre on the sheet, world Y-up
 
   float cloudCirrusShadowCenterZ;
-  float padCirrus0;
+  float cloudCirrusHaloStrength;   // the 22 degree halo; 0: none
   float padCirrus1;
   float padCirrus2;
 
