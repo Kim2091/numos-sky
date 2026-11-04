@@ -39,6 +39,7 @@ namespace {
 
   const char* const kPresetNames[] = {
     "Clear", "Fair", "PartlyCloudy", "Cloudy", "Overcast", "Haze", "Fog", "Storm", "Drizzle", "Altostratus",
+    "Cirrus",
   };
   static_assert(sizeof(kPresetNames) / sizeof(kPresetNames[0]) == size_t(WeatherPreset::Count),
                 "one name per preset");
@@ -85,6 +86,17 @@ namespace {
     off.cloudLayer2DensityScale = on.cloudLayer2DensityScale;
   }
 
+  bool cirrusActive(const WeatherSnapshot& w) {
+    return w.cloudCirrusEnable > 0.5f && w.cloudCirrusCoverageMean > 0.0f;
+  }
+
+  // Likewise for cirrus.
+  void holdCirrus(WeatherSnapshot& off, const WeatherSnapshot& on) {
+    off.cloudCirrusCoverageMean = 0.0f;
+    off.cloudCirrusBaseHeightMeters = on.cloudCirrusBaseHeightMeters;
+    off.cloudCirrusOpticalDepth = on.cloudCirrusOpticalDepth;
+  }
+
 } // namespace
 
 WeatherSnapshot blendWeather(const WeatherSnapshot& aIn, const WeatherSnapshot& bIn, float t) {
@@ -101,6 +113,11 @@ WeatherSnapshot blendWeather(const WeatherSnapshot& aIn, const WeatherSnapshot& 
     holdLayer2(a, b);
   } else if (layer2Active(a) && !layer2Active(b)) {
     holdLayer2(b, a);
+  }
+  if (!cirrusActive(a) && cirrusActive(b)) {
+    holdCirrus(a, b);
+  } else if (cirrusActive(a) && !cirrusActive(b)) {
+    holdCirrus(b, a);
   }
   WeatherSnapshot r;
   for (const WeatherFieldInfo& f : kFields) {
@@ -147,6 +164,7 @@ bool weatherPresetFromName(const char* name, WeatherPreset& preset) {
 // its base (cloudDensity 20 /km x 0.5) and thins upward, over the preset's lighter height fog. In the
 // others it is a thin grey sheet high up. Only Fog's low deck (75 %) reaches into the closed-deck
 // model (cloudDeckBodyFieldKm, 70-90 % coverage); the grey-sky presets use broken cloud instead.
+// Cirrus is off in every preset but its own.
 namespace {
 // Overcast, Storm and Drizzle: towering cumulus (type 1, whose bodies keep their lumps down to the
 // base) with small, strongly eroded billows, under a grey layer-2 sheet at 5.5 km. The look is
@@ -176,6 +194,8 @@ WeatherSnapshot weatherPreset(WeatherPreset preset, const Settings& base) {
   w.lightningStrikesPerMinute = 0.0f;
   w.cloudLayer2Enable = 0.0f;
   w.cloudLayer2CoverageMean = 0.0f;
+  w.cloudCirrusEnable = 0.0f;
+  w.cloudCirrusCoverageMean = 0.0f;
   switch (preset) {
   case WeatherPreset::Clear:
     w.cloudCoverageMean = 0.0f;
@@ -270,6 +290,14 @@ WeatherSnapshot weatherPreset(WeatherPreset preset, const Settings& base) {
     w.cloudLayer2DepthMeters = 800.0f;
     w.cloudLayer2TypeMean = 0.0f;
     w.cloudLayer2DensityScale = 0.35f;
+    break;
+  case WeatherPreset::Cirrus:
+    // Thin streaks at 9.5 km, typical of cirrus fibratus, over a few fair-weather cumulus.
+    w.cloudCoverageMean = 0.12f;
+    w.cloudCirrusEnable = 1.0f;
+    w.cloudCirrusCoverageMean = 0.7f;
+    w.cloudCirrusBaseHeightMeters = 9500.0f;
+    w.cloudCirrusOpticalDepth = 0.3f;
     break;
   case WeatherPreset::Count:
     break;

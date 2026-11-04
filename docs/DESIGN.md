@@ -186,6 +186,37 @@ the sun sets (tested over -30..+10 degrees for gains up to 12 stops) and settles
 the sky's level uses the gained sky: NUMOS's pre-exposure (so a boosted night does not overflow) and the
 level where a lightning flash ends.
 
+## Cirrus
+
+Cirrus (`cloudCirrus*`, off by default) is not a third marched layer. It is too thin to have inner
+structure worth marching and too finely streaked for a march's steps to resolve, so it is a textured
+sphere around the planet (`lib/cloud_cirrus.slangh`): one optical depth per direction, from a baked
+tiling map, lit by single scattering on a forward ice lobe, a floor for the higher orders, and the
+sky.
+
+- **Map.** `cloud_cirrus_map` bakes filaments (R) and patches (G) once per seed, with its own wrapping
+  mip chain (`cloud_cirrus_map_mip`). Coverage, height and wind are applied where it is read, so weather
+  never re-bakes it. It uses gradient noise: value noise changes every row at the same lattice lines,
+  which the map's sharpening draws as straight edges across the streaks.
+- **Camera rays.** `cloud_cirrus_composite` runs after the cloud filters and layers the cirrus with
+  their result into its own texture, which `outputs().cloudRender` then returns. Hosts need no new
+  bindings or shader changes, and the streaks stay out of the temporal history. `m_cloudRenderRT` is
+  never written: it is next frame's history. Off, the pass does not run and the handle is unchanged.
+- **Other rays.** `cloud_secondary_lut` adds it to the dome, so reflections and environment bakes see it.
+- **Order.** Behind every other cloud and the scene, unless the eye is above the sheet, where it lies
+  in front of what is below it.
+- **Sun.** `cloud_cirrus_shadow` writes the beam's optical depth over a 40 km window of the sheet into
+  the cloud shadow map's last layer, so `sampleCloudGroundShadowFromMap`, and through it every host,
+  shades lights by it with no new binding. Past the window, and for clouds below the sheet, the sheet's
+  mean stands in. The beam loses only the delta-scaled depth (`kCirrusBeamDepthScale`), because a strong
+  forward peak stays in the beam. A camera ray sees the sun's disc through the full depth, in the alpha
+  of `cloudRender`.
+- **Sky light.** `cloud_sky_transmittance_lut` reduces the dome, so it holds the cirrus already.
+- **Halo.** `cirrusPhase` adds the 22 degree ring to the ice phase function, per channel for its red inner
+  edge, with darker sky inside it. It scales the sheet's light, so it shows only where there is cirrus, in
+  the dome as on screen. Crystal shape and orientation are not modelled: there is no 46 degree halo, no
+  sun dogs and no arcs.
+
 ## Rules
 
 1. **No host types cross the boundary.** No DXVK, Vulkan, D3D or ImGui types in public headers except the optional backends.

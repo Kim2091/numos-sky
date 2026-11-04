@@ -18,7 +18,9 @@
 // kCloudShadowMapSlots slots stacked along the texture's depth axis (kCloudShadowMapSlices layers
 // each; reads clamp inside a slot). The spare slot is where a cascade is re-baked, a few rows per
 // frame, while lookups keep reading its old slot; each cascade therefore has its own baked
-// direction and window (AtmosphereArgs.cloudShadow*), and they can differ slightly.
+// direction and window (AtmosphereArgs.cloudShadow*), and they can differ slightly. One last layer
+// holds the cirrus's shadow (cloud_cirrus_shadow.comp); the horizon map has it too, unused, so both
+// share cloudShadowMapCoord.
 //
 // The horizon map is the same thing for the horizontal direction toward the sun's azimuth (one
 // channel, body density): the cloud the sunward and anti-sunward horizon light crosses. Its U axis
@@ -34,6 +36,9 @@ static const uint kCloudShadowMapSize = 256u;
 static const uint kCloudShadowMapSlices = 32u;
 static const uint kCloudShadowMapCascades = 4u;
 static const uint kCloudShadowMapSlots = kCloudShadowMapCascades + 1u;
+// Must match Renderer::Impl::kCloudShadowMapLayers in src/renderer_impl.h.
+static const uint kCloudShadowMapCirrusLayer = kCloudShadowMapSlices * kCloudShadowMapSlots;
+static const uint kCloudShadowMapLayers = kCloudShadowMapCirrusLayer + 1u;
 // The shrinks the vertical optical-depth volume is baked at, one per channel (cloud_vertical_od.comp).
 // They span the dominant hex tile's blend-zone shrink (up to 1 km); a tile shrunk further fades out
 // by twice the last level.
@@ -89,7 +94,7 @@ vec3 cloudShadowMapCoord(vec2 uv, float w, uint slot) {
   uv = clamp(uv, vec2(halfTexel), vec2(1.0f - halfTexel));
   const float layer = float(slot * kCloudShadowMapSlices) + saturate(w) * float(kCloudShadowMapSlices - 1u)
                     + 0.5f;
-  return vec3(uv, layer / float(kCloudShadowMapSlices * kCloudShadowMapSlots));
+  return vec3(uv, layer / float(kCloudShadowMapLayers));
 }
 
 // Map `map` (0 = sun, 1 = horizon), cascade `k`: the direction it was baked for and its slot.
@@ -224,4 +229,43 @@ float cloudShadowMapSunOpticalDepth(Texture3D<float2> map, SamplerState linearSa
     w = cloudShadowDepthFraction(max(t1, 0.0f), max(dAnti, 0.0f));
   }
   return sampleCloudShadowMap(map, linearSampler, posKm, w, args).x;
+}
+
+// The sun beam's optical depth through the cirrus from any point (world Y-up km): none above the
+// sheet, and past the shadow layer's window the sheet's mean, faded into over the window's outer 10%.
+float cirrusShadowMapSunOpticalDepth(Texture3D<float2> map, SamplerState linearSampler, vec3 posKm,
+                                     vec3 planetCenterWorldKm, AtmosphereArgs args) {
+  if (args.cloudCirrusShadowLive == 0u) {
+    return 0.0f;
+  }
+  const vec3 rel = posKm - planetCenterWorldKm;
+  const float rho = length(rel);
+  const float radiusKm = args.planetRadius + args.cloudCirrusAltitude;
+  if (rho >= radiusKm) {
+    return 0.0f;
+  }
+  const vec3 toSun = vec3(args.cloudCirrusShadowDirX, args.cloudCirrusShadowDirY, args.cloudCirrusShadowDirZ);
+  float t0, t1;
+  cloudShadowSphereRoots(rho, dot(toSun, rel / rho), radiusKm, t0, t1);
+  const vec2 hit = posKm.xz + toSun.xz * t1;
+  const vec2 d = (hit - vec2(args.cloudCirrusShadowCenterX, args.cloudCirrusShadowCenterZ)) / args.cloudCirrusShadowHalfKm;
+  const float edge = max(abs(d.x), abs(d.y));
+  if (edge >= 1.0f) {
+    return args.cloudCirrusSunMeanDepth;
+  }
+  const float halfTexel = 0.5f / float(kCloudShadowMapSize);
+  const vec2 uv = clamp(d * 0.5f + 0.5f, vec2(halfTexel), vec2(1.0f - halfTexel));
+  const float layer = (float(kCloudShadowMapCirrusLayer) + 0.5f) / float(kCloudShadowMapLayers);
+  const float depth = map.SampleLevel(linearSampler, vec3(uv, layer), 0).x;
+  return lerp(args.cloudCirrusSunMeanDepth, depth, saturate((1.0f - edge) * 10.0f));
+}
+
+// What the cirrus leaves of the sun for a cloud below it. The sheet's fine streaks are lost on a
+// cloud's soft lighting, so this takes the sheet's mean.
+float cirrusSunMeanKeep(vec3 posKm, vec3 planetCenterWorldKm, AtmosphereArgs args) {
+  if (args.cloudCirrusSunMeanDepth <= 0.0f
+      || length(posKm - planetCenterWorldKm) >= args.planetRadius + args.cloudCirrusAltitude) {
+    return 1.0f;
+  }
+  return exp(-args.cloudCirrusSunMeanDepth);
 }

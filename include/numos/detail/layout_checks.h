@@ -14,7 +14,7 @@
 
 namespace numos::detail {
 
-// AtmosphereArgs: 179 members, 1440 bytes in the shader layout
+// AtmosphereArgs: 199 members, 1520 bytes in the shader layout
 static_assert(offsetof(AtmosphereArgs, sunDirection) == 0, "AtmosphereArgs::sunDirection offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, planetRadius) == 12, "AtmosphereArgs::planetRadius offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, sunIlluminance) == 16, "AtmosphereArgs::sunIlluminance offset differs from the shader");
@@ -194,7 +194,27 @@ static_assert(offsetof(AtmosphereArgs, apDebugView) == 1424, "AtmosphereArgs::ap
 static_assert(offsetof(AtmosphereArgs, apDebugRadianceScale) == 1428, "AtmosphereArgs::apDebugRadianceScale offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, padApDebug0) == 1432, "AtmosphereArgs::padApDebug0 offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, padApDebug1) == 1436, "AtmosphereArgs::padApDebug1 offset differs from the shader");
-static_assert(sizeof(AtmosphereArgs) >= 1440, "AtmosphereArgs is smaller than the shader layout");
+static_assert(offsetof(AtmosphereArgs, cloudCirrusEnable) == 1440, "AtmosphereArgs::cloudCirrusEnable offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, cloudCirrusAltitude) == 1444, "AtmosphereArgs::cloudCirrusAltitude offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, cloudCirrusCoverageMean) == 1448, "AtmosphereArgs::cloudCirrusCoverageMean offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, cloudCirrusOpticalDepth) == 1452, "AtmosphereArgs::cloudCirrusOpticalDepth offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, cloudCirrusWindOffsetX) == 1456, "AtmosphereArgs::cloudCirrusWindOffsetX offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, cloudCirrusWindOffsetZ) == 1460, "AtmosphereArgs::cloudCirrusWindOffsetZ offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, cloudCirrusStreakCos) == 1464, "AtmosphereArgs::cloudCirrusStreakCos offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, cloudCirrusStreakSin) == 1468, "AtmosphereArgs::cloudCirrusStreakSin offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, cloudCirrusNoiseSeed) == 1472, "AtmosphereArgs::cloudCirrusNoiseSeed offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, cloudCirrusSunMeanDepth) == 1476, "AtmosphereArgs::cloudCirrusSunMeanDepth offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, cloudCirrusShadowLive) == 1480, "AtmosphereArgs::cloudCirrusShadowLive offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, cloudCirrusShadowHalfKm) == 1484, "AtmosphereArgs::cloudCirrusShadowHalfKm offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, cloudCirrusShadowDirX) == 1488, "AtmosphereArgs::cloudCirrusShadowDirX offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, cloudCirrusShadowDirY) == 1492, "AtmosphereArgs::cloudCirrusShadowDirY offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, cloudCirrusShadowDirZ) == 1496, "AtmosphereArgs::cloudCirrusShadowDirZ offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, cloudCirrusShadowCenterX) == 1500, "AtmosphereArgs::cloudCirrusShadowCenterX offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, cloudCirrusShadowCenterZ) == 1504, "AtmosphereArgs::cloudCirrusShadowCenterZ offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, cloudCirrusHaloStrength) == 1508, "AtmosphereArgs::cloudCirrusHaloStrength offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, padCirrus1) == 1512, "AtmosphereArgs::padCirrus1 offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, padCirrus2) == 1516, "AtmosphereArgs::padCirrus2 offset differs from the shader");
+static_assert(sizeof(AtmosphereArgs) >= 1520, "AtmosphereArgs is smaller than the shader layout");
 
 // MoonParams: 12 members, 96 bytes in the shader layout
 static_assert(offsetof(MoonParams, direction) == 0, "MoonParams::direction offset differs from the shader");

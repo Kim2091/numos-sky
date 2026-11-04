@@ -190,6 +190,9 @@ struct Renderer::Impl {
   void dispatchCloudDetailNoiseMips(PassRecorder& rec, const Texture& volume);
   void updateCloudShadowMap(PassRecorder& rec);
   void updateCloudLayer2Map(PassRecorder& rec);
+  void updateCloudCirrusMap(PassRecorder& rec);
+  void updateCloudCirrusShadow(PassRecorder& rec);
+  void dispatchCloudCirrusComposite(PassRecorder& rec, GpuHandle linearViewZ);
   void dispatchCloudRender(PassRecorder& rec, GpuHandle linearViewZ);
   void dispatchCloudDenoise(PassRecorder& rec);
   // Scales this frame's effective settings by rtx.atmosphere.qualityLevel. High leaves them unchanged.
@@ -239,6 +242,8 @@ struct Renderer::Impl {
   static constexpr uint32_t kCloudShadowMapSlices = 32;
   static constexpr uint32_t kCloudShadowMapCascades = 4;
   static constexpr uint32_t kCloudShadowMapSlots = kCloudShadowMapCascades + 1;  // one spare
+  // One more layer, for the cirrus's shadow.
+  static constexpr uint32_t kCloudShadowMapLayers = kCloudShadowMapSlices * kCloudShadowMapSlots + 1;
   // Layer 2 patch-field map; must match kCloudLayer2Map* in lib/cloud_nubis3_common.slangh.
   static constexpr uint32_t kCloudLayer2MapSize = 1024;
   static constexpr float kCloudLayer2MapCoarseTexelKm = 0.2f;
@@ -314,6 +319,23 @@ struct Renderer::Impl {
     float centerX = 0.0f, centerZ = 0.0f;  // cloud frame, km
     float seed = 0.0f;
   } m_cloudLayer2MapState;
+  // Cirrus map (cloud_cirrus_map.comp) and the seed it holds; must match kCirrusMapSize in
+  // lib/cloud_cirrus.slangh.
+  static constexpr uint32_t kCloudCirrusMapSize = 1024;
+  static constexpr uint32_t kCloudCirrusMapMipLevels = 11;
+  Texture m_cloudCirrusMap;
+  bool    m_cloudCirrusMapBaked = false;
+  float   m_cloudCirrusMapSeed = 0.0f;
+  // The sun beam through the sheet this frame, which getAtmosphereArgs publishes. The window spans
+  // kCloudShadowMapSize of the map's mip 0 texels (kCirrusTileKm / kCloudCirrusMapSize each).
+  static constexpr float kCloudCirrusShadowHalfKm = 20.0f;
+  struct CloudCirrusShadow {
+    bool  live = false;
+    float meanDepth = 0.0f;
+    float dirX = 0.0f, dirY = 0.0f, dirZ = 0.0f;
+    float centerX = 0.0f, centerZ = 0.0f;
+  };
+  CloudCirrusShadow m_cloudCirrusShadow;
   // One cascade of one map, as baked (or being baked).
   struct CloudShadowCascade {
     bool    valid = false;
@@ -378,6 +400,8 @@ struct Renderer::Impl {
   Texture  m_cloudFreshAux;
   Texture  m_cloudDenoisedRT;  // cloudSpatialDenoise output; composited instead of m_cloudRenderRT
   bool     m_cloudDenoisedThisFrame = false;
+  Texture  m_cloudCirrusRT;  // the cloud render with the cirrus behind it; composited when valid this frame
+  bool     m_cloudCirrusThisFrame = false;
   bool     m_cloudTemporalHistoryValid = false;  // survives lighting re-bakes; not camera cuts
   bool     m_cloudCompositeActive = true;
   uint32_t m_cloudLastRenderFrame = 0u;
