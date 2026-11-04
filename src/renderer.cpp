@@ -101,6 +101,7 @@ namespace {
     args.cloudCirrusShadowDirZ       = 0.0f;
     args.cloudCirrusShadowCenterX    = 0.0f;
     args.cloudCirrusShadowCenterZ    = 0.0f;
+    args.cloudCirrusHaloStrength     = 0.0f;
     args.cloudEvolutionOffsetX       = 0.0f;
     args.cloudEvolutionOffsetY       = 0.0f;
     // The detail drift follows the wind direction, so a preset that rotates the wind would
@@ -1284,6 +1285,7 @@ AtmosphereArgs Renderer::Impl::getAtmosphereArgs() const {
     args.cloudCirrusShadowDirZ   = m_cloudCirrusShadow.dirZ;
     args.cloudCirrusShadowCenterX = m_cloudCirrusShadow.centerX;
     args.cloudCirrusShadowCenterZ = m_cloudCirrusShadow.centerZ;
+    args.cloudCirrusHaloStrength = std::max(m_settings.cloudCirrusHaloStrength, 0.0f);
   }
 
   args.cloudLightingLodThreshold = m_settings.cloudLightingLodThreshold;

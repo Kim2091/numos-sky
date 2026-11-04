@@ -212,7 +212,10 @@ sky.
   forward peak stays in the beam. A camera ray sees the sun's disc through the full depth, in the alpha
   of `cloudRender`.
 - **Sky light.** `cloud_sky_transmittance_lut` reduces the dome, so it holds the cirrus already.
-- **Not modelled.** It has no halo.
+- **Halo.** `cirrusPhase` adds the 22 degree ring to the ice phase function, per channel for its red inner
+  edge, with darker sky inside it. It scales the sheet's light, so it shows only where there is cirrus, in
+  the dome as on screen. Crystal shape and orientation are not modelled: there is no 46 degree halo, no
+  sun dogs and no arcs.
 
 ## Rules
 

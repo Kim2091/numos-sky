@@ -425,6 +425,8 @@ NUMOS_SETTING(float, cloudCirrusWindScale, 2.0f, "rtx.atmosphere.cloudCirrusWind
   "How fast the cirrus drifts, as a multiple of Cloud Wind Speed and along Cloud Wind Direction. Winds are faster at this height, but the distance makes the drift look slow.")
 NUMOS_SETTING(float, cloudCirrusNoiseSeed, 1.0f, "rtx.atmosphere.cloudCirrusNoiseSeed", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "Picks a different pattern of streaks. Changing it bakes a new map.")
+NUMOS_SETTING(float, cloudCirrusHaloStrength, 1.0f, "rtx.atmosphere.cloudCirrusHaloStrength", 0.0f, NUMOS_NO_MAX, 0,
+  "The pale ring ice crystals draw 22 degrees from the sun or moon, red on its inner edge, with darker sky just inside it. It shows only where there is cirrus, so broken streaks give a broken ring. 0 removes it.")
 
 NUMOS_MOON_SETTING(bool, enabled, false, "enabled", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "Draws this extra moon, placed by its elevation and rotation, for a game that drives its own moon. Turn rtx.atmosphere.realMoonEnabled off when it replaces the real moon. Its phase, light and earthshine follow from its position and the sun's, like the real moon's.")

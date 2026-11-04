@@ -211,7 +211,7 @@ static_assert(offsetof(AtmosphereArgs, cloudCirrusShadowDirY) == 1492, "Atmosphe
 static_assert(offsetof(AtmosphereArgs, cloudCirrusShadowDirZ) == 1496, "AtmosphereArgs::cloudCirrusShadowDirZ offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, cloudCirrusShadowCenterX) == 1500, "AtmosphereArgs::cloudCirrusShadowCenterX offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, cloudCirrusShadowCenterZ) == 1504, "AtmosphereArgs::cloudCirrusShadowCenterZ offset differs from the shader");
-static_assert(offsetof(AtmosphereArgs, padCirrus0) == 1508, "AtmosphereArgs::padCirrus0 offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, cloudCirrusHaloStrength) == 1508, "AtmosphereArgs::cloudCirrusHaloStrength offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, padCirrus1) == 1512, "AtmosphereArgs::padCirrus1 offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, padCirrus2) == 1516, "AtmosphereArgs::padCirrus2 offset differs from the shader");
 static_assert(sizeof(AtmosphereArgs) >= 1520, "AtmosphereArgs is smaller than the shader layout");
