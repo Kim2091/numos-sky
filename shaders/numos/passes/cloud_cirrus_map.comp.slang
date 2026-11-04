@@ -1,3 +1,4 @@
+// Copyright 2026 Kim2091 (Sparkles)
 // Copyright 2026 Veitaserum4
 // SPDX-License-Identifier: Apache-2.0
 
