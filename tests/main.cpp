@@ -42,7 +42,7 @@ using namespace numos;
 
 static void testInfos() {
   const auto& infos = settingInfos();
-  CHECK(infos.size() == 199 + 7 * kMaxMoons);
+  CHECK(infos.size() == 206 + 7 * kMaxMoons);
   CHECK(findSetting("rtx.atmosphere.sunSize") != nullptr);
   CHECK(findSetting("rtx.atmosphere.moon3.rotation") != nullptr);
   CHECK(findSetting("rtx.atmosphere.nope") == nullptr);
@@ -302,7 +302,7 @@ static void testMigration() {
 }
 
 static void testPasses() {
-  CHECK(passCount() == 26);
+  CHECK(passCount() == 29);
   const PassInfo& p = passInfo(PassId::transmittance_lut);
   CHECK(std::string(p.name) == "transmittance_lut");
   CHECK(p.localSize[0] == 16 && p.localSize[1] == 16);
@@ -1070,6 +1070,31 @@ static void testWeather() {
     CHECK(s.cloudLayer2Enable && s.cloudLayer2DepthMeters == fog.cloudLayer2DepthMeters);
   }
 
+  // Cirrus fades in where its preset puts it, and is off by default and in every other preset.
+  {
+    CHECK(!Settings{}.cloudCirrusEnable);
+    const WeatherSnapshot fair = weatherPreset(WeatherPreset::Fair, base);
+    const WeatherSnapshot cirrus = weatherPreset(WeatherPreset::Cirrus, base);
+    CHECK(fair.cloudCirrusEnable == 0.0f && cirrus.cloudCirrusEnable == 1.0f && cirrus.cloudCirrusCoverageMean > 0.0f);
+    const WeatherSnapshot q = blendWeather(fair, cirrus, 0.25f);
+    CHECK(q.cloudCirrusEnable == 1.0f);
+    CHECK(std::fabs(q.cloudCirrusCoverageMean - 0.25f * cirrus.cloudCirrusCoverageMean) < 1e-6f);
+    CHECK(q.cloudCirrusBaseHeightMeters == cirrus.cloudCirrusBaseHeightMeters
+          && q.cloudCirrusOpticalDepth == cirrus.cloudCirrusOpticalDepth);
+    const WeatherSnapshot back = blendWeather(cirrus, fair, 0.75f);
+    CHECK(back.cloudCirrusEnable == 1.0f && back.cloudCirrusBaseHeightMeters == cirrus.cloudCirrusBaseHeightMeters);
+    CHECK(blendWeather(cirrus, fair, 1.0f).cloudCirrusEnable == 0.0f);
+    Settings s = base;
+    applyWeather(cirrus, s);
+    CHECK(s.cloudCirrusEnable && s.cloudCirrusCoverageMean == cirrus.cloudCirrusCoverageMean);
+    Settings seeded;
+    seeded.cloudCirrusEnable = true;
+    seeded.cloudCirrusStreakDirection = 75.0f;
+    SeedContents decoded;
+    CHECK(decodeSeed(encodeSeed(seeded), decoded));
+    CHECK(decoded.settings.cloudCirrusEnable && decoded.settings.cloudCirrusStreakDirection == 75.0f);
+  }
+
   // Names round-trip, case-insensitively.
   for (uint32_t i = 0; i < uint32_t(WeatherPreset::Count); ++i) {
     WeatherPreset p;
@@ -1093,7 +1118,7 @@ static void testWeather() {
   // otherwise) and is listed once: 28 scalars, then air and aerosol tint RGB.
   size_t n = 0;
   const WeatherFieldInfo* f = weatherFields(n);
-  CHECK(n == 34 && f[0].member == &WeatherSnapshot::cloudCoverageMean && f[33].member == &WeatherSnapshot::aerosolTintB);
+  CHECK(n == 38 && f[0].member == &WeatherSnapshot::cloudCoverageMean && f[37].member == &WeatherSnapshot::aerosolTintB);
 }
 
 // Seeds: a configuration, weather and simulation state survive the trip; damage is rejected.

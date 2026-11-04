@@ -31,7 +31,8 @@ namespace numos {
 // X(name, kind, label). Every name is a float Settings field of the same unit, or a bool (Flag).
 // Layer 2 blends as a unit: while one end has it off (or at zero coverage), that end takes the other
 // end's height, depth, type and density at zero coverage, so the layer fades in or out where it
-// stands instead of sweeping down from wherever the switched-off settings left it.
+// stands instead of sweeping down from wherever the switched-off settings left it. Cirrus does the
+// same.
 #define NUMOS_WEATHER_FIELDS(X)                                                              \
   X(cloudCoverageMean,         WeatherFieldKind::Scalar,     "Cloud coverage")               \
   X(cloudCoverageSpread,       WeatherFieldKind::Scalar,     "Coverage spread")              \
@@ -47,6 +48,10 @@ namespace numos {
   X(cloudLayer2DepthMeters,    WeatherFieldKind::Scalar,     "Layer 2 depth (m)")            \
   X(cloudLayer2TypeMean,       WeatherFieldKind::Scalar,     "Layer 2 type")                 \
   X(cloudLayer2DensityScale,   WeatherFieldKind::Scalar,     "Layer 2 density")              \
+  X(cloudCirrusEnable,         WeatherFieldKind::Flag,       "Cirrus")                       \
+  X(cloudCirrusCoverageMean,   WeatherFieldKind::Scalar,     "Cirrus coverage")              \
+  X(cloudCirrusBaseHeightMeters, WeatherFieldKind::Scalar,   "Cirrus height (m)")            \
+  X(cloudCirrusOpticalDepth,   WeatherFieldKind::Scalar,     "Cirrus optical depth")         \
   X(cloudWindSpeed,            WeatherFieldKind::Scalar,     "Wind speed (km/s)")            \
   X(cloudWindDirection,        WeatherFieldKind::Angle,      "Wind direction (deg)")         \
   X(airDensity,                WeatherFieldKind::Scalar,     "Air density")                  \
@@ -103,6 +108,7 @@ namespace numos {
     Storm,         // dark, dense broken convection under a grey sheet, with lightning
     Drizzle,       // the storm's sky, lighter: thinner broken cloud under a grey sheet, no lightning
     Altostratus,   // a thin high grey sheet the sun shows through, little cloud below
+    Cirrus,        // high ice streaks in a clean sky, a few small cumulus below
     Count
   };
 

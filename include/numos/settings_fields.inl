@@ -413,6 +413,20 @@ NUMOS_SETTING(uint32_t, cloudLayer2StepMax, 32, "rtx.atmosphere.cloudLayer2StepM
   "Deprecated and ignored: layer 2 uses the main deck's step limit (rtx.atmosphere.cloudViewSamplesMax). Save the config again to stop the notice.")
 NUMOS_SETTING(Vector3, cloudLayer2Color, Vector3(0.89f, 0.92f, 1.0f), "rtx.atmosphere.cloudLayer2Color", NUMOS_NO_MIN, NUMOS_NO_MAX, NUMOS_SETTING_NO_SAVE,
   "Deprecated: replaced by rtx.atmosphere.cloudLayer2Albedo. Layer 2 uses the main deck's Cloud Color with its own albedo. An existing value is migrated. Save the config again to stop the notice.")
+NUMOS_SETTING(bool, cloudCirrusEnable, false, "rtx.atmosphere.cloudCirrusEnable", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
+  "Draws cirrus: thin, streaked ice cloud high above the other layers. It is a textured sheet rather than a marched volume, so it costs little, and from below it sits behind every other cloud. It lights up at sunset after the lower clouds have gone dark. It casts no shadow.")
+NUMOS_SETTING(float, cloudCirrusBaseHeightMeters, 9500.0f, "rtx.atmosphere.cloudCirrusBaseHeightMeters", 0.0f, NUMOS_NO_MAX, 0,
+  "The height of the cirrus sheet, in metres. Real cirrus forms from about 6000 to 13000.")
+NUMOS_SETTING(float, cloudCirrusCoverageMean, 0.6f, "rtx.atmosphere.cloudCirrusCoverageMean", 0.0f, 1.0f, 0,
+  "The share of the sky the cirrus patches cover, from 0 to 1. Low values leave a few isolated streaks, high values a sky combed with them.")
+NUMOS_SETTING(float, cloudCirrusOpticalDepth, 0.25f, "rtx.atmosphere.cloudCirrusOpticalDepth", 0.0f, 3.0f, 0,
+  "How opaque the streaks are looking straight up. Thin cirrus is around 0.1, thick cirrus around 1. The path through the sheet lengthens toward the horizon, so they grow more opaque there.")
+NUMOS_SETTING(float, cloudCirrusStreakDirection, 30.0f, "rtx.atmosphere.cloudCirrusStreakDirection", 0.0f, 360.0f, 0,
+  "The compass direction the streaks lie along, in degrees. Real streaks follow the high wind's shear, which can differ from the wind at the lower clouds.")
+NUMOS_SETTING(float, cloudCirrusWindScale, 2.0f, "rtx.atmosphere.cloudCirrusWindScale", 0.0f, NUMOS_NO_MAX, 0,
+  "How fast the cirrus drifts, as a multiple of Cloud Wind Speed and along Cloud Wind Direction. Winds are faster at this height, but the distance makes the drift look slow.")
+NUMOS_SETTING(float, cloudCirrusNoiseSeed, 1.0f, "rtx.atmosphere.cloudCirrusNoiseSeed", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
+  "Picks a different pattern of streaks. Changing it bakes a new map.")
 
 NUMOS_MOON_SETTING(bool, enabled, false, "enabled", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "Draws this extra moon, placed by its elevation and rotation, for a game that drives its own moon. Turn rtx.atmosphere.realMoonEnabled off when it replaces the real moon. Its phase, light and earthshine follow from its position and the sun's, like the real moon's.")

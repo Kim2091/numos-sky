@@ -387,6 +387,22 @@ struct AtmosphereArgs {
   float padApDebug0;
   float padApDebug1;
 
+  // Cirrus (lib/cloud_cirrus.slangh): a thin textured shell above the volumetric layers.
+  uint  cloudCirrusEnable;
+  float cloudCirrusAltitude;       // km
+  float cloudCirrusCoverageMean;   // [0,1]
+  float cloudCirrusOpticalDepth;   // looking straight up
+
+  float cloudCirrusWindOffsetX;    // km, integrated wind times cloudCirrusWindScale
+  float cloudCirrusWindOffsetZ;
+  float cloudCirrusStreakCos;      // the map's long axis in the cloud frame
+  float cloudCirrusStreakSin;
+
+  float cloudCirrusNoiseSeed;      // the map bake's
+  float padCirrus0;
+  float padCirrus1;
+  float padCirrus2;
+
 };
 
 NUMOS_SHARED_END

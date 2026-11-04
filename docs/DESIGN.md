@@ -186,6 +186,28 @@ the sun sets (tested over -30..+10 degrees for gains up to 12 stops) and settles
 the sky's level uses the gained sky: NUMOS's pre-exposure (so a boosted night does not overflow) and the
 level where a lightning flash ends.
 
+## Cirrus
+
+Cirrus (`cloudCirrus*`, off by default) is not a third marched layer. It is too thin to have inner
+structure worth marching and too finely streaked for a march's steps to resolve, so it is a textured
+sphere around the planet (`lib/cloud_cirrus.slangh`): one optical depth per direction, from a baked
+tiling map, lit by single scattering on a forward ice lobe, a floor for the higher orders, and the
+sky.
+
+- **Map.** `cloud_cirrus_map` bakes filaments (R) and patches (G) once per seed, with its own wrapping
+  mip chain (`cloud_cirrus_map_mip`). Coverage, height and wind are applied where it is read, so weather
+  never re-bakes it. It uses gradient noise: value noise changes every row at the same lattice lines,
+  which the map's sharpening draws as straight edges across the streaks.
+- **Camera rays.** `cloud_cirrus_composite` runs after the cloud filters and layers the cirrus with
+  their result into its own texture, which `outputs().cloudRender` then returns. Hosts need no new
+  bindings or shader changes, and the streaks stay out of the temporal history. `m_cloudRenderRT` is
+  never written: it is next frame's history. Off, the pass does not run and the handle is unchanged.
+- **Other rays.** `cloud_secondary_lut` adds it to the dome, so reflections and environment bakes see it.
+- **Order.** Behind every other cloud and the scene, unless the eye is above the sheet, where it lies
+  in front of what is below it.
+- **Not modelled.** It casts no shadow, does not dim the sun on surfaces, adds nothing to the clouds'
+  sky-light LUT, and has no halo.
+
 ## Rules
 
 1. **No host types cross the boundary.** No DXVK, Vulkan, D3D or ImGui types in public headers except the optional backends.
