@@ -11,7 +11,8 @@
 //
 // Reads only what it is handed, so a pass can use it without the march's resources. The screen
 // result is layered with the cloud render (cloud_cirrus_composite.comp), the dome's with its march
-// (cloud_secondary_lut.comp): behind them, unless the eye is above the sheet.
+// (cloud_secondary_lut.comp): behind them, unless the eye is above the sheet. Its shadow goes in the
+// cloud shadow map (cloud_cirrus_shadow.comp, cirrusShadowMapSunOpticalDepth).
 #pragma once
 
 #include "numos/lib/atmosphere_common.slangh"
@@ -33,6 +34,9 @@ static const float kCirrusPhaseForwardWeight = 0.8f;
 static const float kCirrusMultipleScatter = 0.3f;
 // Keeps the slant path finite along a ray that grazes the shell.
 static const float kCirrusMinSlantCos = 0.05f;
+// Of the optical depth the sun's beam crosses, the part that takes light out of it: the forward peak
+// stays in the beam (delta scaling, 1 - g^2). Must match kCirrusBeamDepthScale in src/renderer.cpp.
+static const float kCirrusBeamDepthScale = 1.0f - kCirrusPhaseForwardG * kCirrusPhaseForwardG;
 
 vec2 cirrusRotate(vec2 p, vec2 cosSin) {
   return vec2(p.x * cosSin.x - p.y * cosSin.y, p.x * cosSin.y + p.y * cosSin.x);
@@ -73,6 +77,24 @@ vec3 cirrusSkyRadiance(vec3 dirYUp, Texture2D<float4> skyViewLut, SamplerState l
   return sampleAzimuthWrappedLut(skyViewLut, lutSampler, uv, 0.0f).rgb;
 }
 
+// The share of the sheet's optical depth at a point on it, from the map; `world` is its world
+// position in km, `lod` the map's mip. The wind and streak direction are applied here.
+float cirrusColumnShare(vec2 world, float lod, AtmosphereArgs args, Texture2D<float2> cirrusMap, SamplerState mapSampler) {
+  // World-anchored, drifting with the high wind, turned so the map's long axis lies along the streaks.
+  const vec2 drifted = world - vec2(args.cloudCirrusWindOffsetX, args.cloudCirrusWindOffsetZ);
+  const vec2 uv = cirrusRotate(drifted, vec2(args.cloudCirrusStreakCos, args.cloudCirrusStreakSin)) / kCirrusTileKm;
+  const float filament = cirrusMap.SampleLevel(mapSampler, uv, lod).x;
+  const float detail = cirrusMap.SampleLevel(mapSampler, cirrusRotate(uv, kCirrusDetailRotation) * kCirrusDetailScale,
+                                             lod + log2(kCirrusDetailScale)).x;
+  const float patch = cirrusMap.SampleLevel(mapSampler, cirrusRotate(uv, kCirrusPatchRotation) * kCirrusPatchScale,
+                                            max(lod + log2(kCirrusPatchScale), 0.0f)).y;
+  // Coverage opens the patches; the filaments inside them are the visible cloud.
+  const float threshold = 1.0f - saturate(args.cloudCirrusCoverageMean);
+  const float patchMask = smoothstep(threshold - 0.15f, threshold + 0.2f, patch);
+  const float fibres = smoothstep(0.32f, 0.82f, filament * 0.72f + detail * 0.28f);
+  return patchMask * fibres;
+}
+
 // The eye above the sheet: the cirrus then lies in front of what is below it, not behind.
 bool cirrusEyeAbove(AtmosphereArgs args) {
   return args.cameraWorldPosYUpKm.y >= args.cloudCirrusAltitude;
@@ -107,23 +129,10 @@ vec4 cirrusEvaluate(vec3 viewDirYUp, AtmosphereArgs args, float pixelAngle, Text
   const vec3 hit = viewDirYUp * t;
   const float shellCos = abs(dot(viewDirYUp, (hit - center) / radius));
 
-  // The shell's coordinates: world-anchored, drifting with the high wind, turned so the map's long
-  // axis lies along the streaks.
-  const vec2 world = args.cameraWorldPosYUpKm.xz + hit.xz - vec2(args.cloudCirrusWindOffsetX, args.cloudCirrusWindOffsetZ);
-  const vec2 uv = cirrusRotate(world, vec2(args.cloudCirrusStreakCos, args.cloudCirrusStreakSin)) / kCirrusTileKm;
   const float footprintKm = t * pixelAngle / max(shellCos, kCirrusMinSlantCos);
   const float lod = log2(max(footprintKm * kCirrusMapSize / kCirrusTileKm, 1e-3f));
-
-  const float filament = cirrusMap.SampleLevel(mapSampler, uv, lod).x;
-  const float detail = cirrusMap.SampleLevel(mapSampler, cirrusRotate(uv, kCirrusDetailRotation) * kCirrusDetailScale,
-                                             lod + log2(kCirrusDetailScale)).x;
-  const float patch = cirrusMap.SampleLevel(mapSampler, cirrusRotate(uv, kCirrusPatchRotation) * kCirrusPatchScale,
-                                            max(lod + log2(kCirrusPatchScale), 0.0f)).y;
-  // Coverage opens the patches; the filaments inside them are the visible cloud.
-  const float threshold = 1.0f - saturate(args.cloudCirrusCoverageMean);
-  const float patchMask = smoothstep(threshold - 0.15f, threshold + 0.2f, patch);
-  const float fibres = smoothstep(0.32f, 0.82f, filament * 0.72f + detail * 0.28f);
-  const float tau = args.cloudCirrusOpticalDepth * patchMask * fibres / max(shellCos, kCirrusMinSlantCos);
+  const float column = cirrusColumnShare(args.cameraWorldPosYUpKm.xz + hit.xz, lod, args, cirrusMap, mapSampler);
+  const float tau = args.cloudCirrusOpticalDepth * column / max(shellCos, kCirrusMinSlantCos);
   const float opacity = 1.0f - exp(-tau);
   if (opacity <= 0.0f) {
     return vec4(0.0f);
