@@ -53,6 +53,9 @@ Texture3D<float4> AtmosphereCloudVerticalOd;
 layout(binding = 23)
 Texture3D<float2> AtmosphereCloudLayer2Map;
 #define CLOUD_LAYER2_MAP_AVAILABLE
+// Cirrus map (cloud_cirrus_map.comp): the shell joins the march, in reflections and sky light.
+layout(binding = 30)
+Texture2D<float2> AtmosphereCloudCirrusMap;
 
 layout(binding = 5)
 Texture2DArray<float> BlueNoise;
@@ -83,6 +86,15 @@ Texture2D<float4> AtmosphereTransmittanceLut;
 
 
 #include "numos/lib/cloud_march_common.slangh"
+#include "numos/lib/cloud_cirrus.slangh"
+
+// The cirrus through a dome texel. One texel spans about 2 pi / width.
+vec4 domeCirrus(uint2 pixelCoord, uint2 lutDim, AtmosphereArgs args) {
+  float unusedDistanceKm;
+  return cirrusEvaluate(cloudDomeUvToDir((vec2(pixelCoord) + 0.5f) / vec2(lutDim)), args, 2.0f * kPi / float(lutDim.x),
+                        AtmosphereCloudCirrusMap, AtmosphereCloudNoise3DSampler, AtmosphereTransmittanceLut,
+                        AtmosphereSkyViewLut, AtmosphereSkyViewSampler, unusedDistanceKm);
+}
 
 [shader("compute")]
 [numthreads(4, 4, 1)]
@@ -109,7 +121,8 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint groupIndex : SV_GroupInde
   }
   if (args.cloudEnabled < 0.5f || effectiveCoverageMean < 0.01f || args.cloudViewSamples == 0u) {
     if (inBounds) {
-      cloudSecondaryLutOutput[pixelCoord] = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+      cloudSecondaryLutOutput[pixelCoord] = cirrusLayerWithCloud(vec4(0.0f, 0.0f, 0.0f, 1.0f),
+                                                                 domeCirrus(pixelCoord, lutDim, args), args);
     }
     return;
   }
@@ -154,7 +167,7 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint groupIndex : SV_GroupInde
                    accumColor, viewTransmittance,
                    unusedEntryDistanceKm, unusedMeanCloudDepthKm);
 
-  vec4 domeValue = vec4(accumColor, viewTransmittance);
+  vec4 domeValue = cirrusLayerWithCloud(vec4(accumColor, viewTransmittance), domeCirrus(pixelCoord, lutDim, args), args);
   if (!domeReset) {
     domeValue = lerp(cloudSecondaryLutOutput[pixelCoord], domeValue, kCloudDomeBlend);
   }

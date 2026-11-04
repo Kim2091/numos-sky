@@ -1,0 +1,156 @@
+// Copyright 2026 Veitaserum4
+// SPDX-License-Identifier: Apache-2.0
+
+// Cirrus: a thin ice-cloud layer high above the volumetric decks.
+//
+// Cirrus is too thin to have inner structure worth marching and too finely streaked for a march's
+// steps to resolve, so it is a textured sphere around the planet: one optical depth per direction,
+// from a baked tiling map (cloud_cirrus_map.comp) of long wind-drawn filaments. Single scattering
+// off ice crystals on a strong forward lobe, a floor for the higher orders, and the sky's light.
+//
+// Reads only what it is handed, so a pass can use it without the march's resources. The screen
+// result is layered with the cloud render (cloud_cirrus_composite.comp), the dome's with its march
+// (cloud_secondary_lut.comp): behind them, unless the eye is above the sheet.
+#pragma once
+
+#include "numos/lib/atmosphere_common.slangh"
+
+// Must match Renderer::Impl::kCloudCirrusMapSize in src/renderer_impl.h.
+static const float kCirrusMapSize = 1024.0f;
+// The map's span on the shell. The filament tap reads it at this scale, the detail tap
+// kCirrusDetailScale times finer, and the patch tap coarser, at unrelated angles, so no tile repeats.
+static const float kCirrusTileKm = 160.0f;
+static const float kCirrusDetailScale = 7.0f;
+static const float kCirrusPatchScale = 0.37f;
+static const vec2  kCirrusDetailRotation = vec2(0.978f, 0.208f);
+static const vec2  kCirrusPatchRotation = vec2(0.809f, 0.588f);
+// Ice crystals scatter mostly forward, with a weak back lobe (halos are not modelled).
+static const float kCirrusPhaseForwardG = 0.75f;
+static const float kCirrusPhaseBackG = -0.2f;
+static const float kCirrusPhaseForwardWeight = 0.8f;
+// The higher scattering orders, as a fraction of an isotropic lobe.
+static const float kCirrusMultipleScatter = 0.3f;
+// Keeps the slant path finite along a ray that grazes the shell.
+static const float kCirrusMinSlantCos = 0.05f;
+
+vec2 cirrusRotate(vec2 p, vec2 cosSin) {
+  return vec2(p.x * cosSin.x - p.y * cosSin.y, p.x * cosSin.y + p.y * cosSin.x);
+}
+
+// Distance along a ray to the sphere of radius `radius` around the planet, cancellation-free: the
+// radii are thousands of km, the height between them a few. `eyeRadius` is the eye's distance from
+// the centre and `mu` the ray's cosine with the eye's up. False when the shell is out of reach or
+// the planet is in the way.
+bool cirrusShellDistance(float eyeRadius, float mu, float radius, float planetRadius, out float distanceKm) {
+  distanceKm = 0.0f;
+  const float along = eyeRadius * mu;
+  const float heightTerm = (radius - eyeRadius) * (radius + eyeRadius);
+  if (heightTerm >= 0.0f) {
+    // Below the shell: the ray always leaves through it, unless the planet stops it first.
+    if (mu < 0.0f && eyeRadius * sqrt(max(1.0f - mu * mu, 0.0f)) < planetRadius) {
+      return false;
+    }
+    const float root = sqrt(along * along + heightTerm);
+    distanceKm = along > 0.0f ? heightTerm / (along + root) : root - along;
+    return true;
+  }
+  // Above the shell: only a descending ray meets it.
+  const float disc = along * along + heightTerm;
+  if (mu >= 0.0f || disc < 0.0f) {
+    return false;
+  }
+  distanceKm = -heightTerm / (sqrt(disc) - along);
+  return true;
+}
+
+// The sky-view LUT along any direction (same encoding as sampleSkyViewLutAbove, signed elevation).
+vec3 cirrusSkyRadiance(vec3 dirYUp, Texture2D<float4> skyViewLut, SamplerState lutSampler) {
+  const float elevation = asin(clamp(dirYUp.y, -1.0f, 1.0f));
+  float azimuth = atan2(dirYUp.z, dirYUp.x);
+  if (azimuth < 0.0f) azimuth += 2.0f * kPi;
+  const vec2 uv = vec2(azimuth / (2.0f * kPi), sign(elevation) * sqrt(abs(elevation) / (kPi * 0.5f)) * 0.5f + 0.5f);
+  return sampleAzimuthWrappedLut(skyViewLut, lutSampler, uv, 0.0f).rgb;
+}
+
+// The eye above the sheet: the cirrus then lies in front of what is below it, not behind.
+bool cirrusEyeAbove(AtmosphereArgs args) {
+  return args.cameraWorldPosYUpKm.y >= args.cloudCirrusAltitude;
+}
+
+// The cirrus and a cloud result (premultiplied radiance, view-ray transmittance), in their order.
+vec4 cirrusLayerWithCloud(vec4 cloud, vec4 cirrus, AtmosphereArgs args) {
+  if (cirrusEyeAbove(args)) {
+    return vec4(cirrus.rgb + (1.0f - cirrus.a) * cloud.rgb, cloud.a * (1.0f - cirrus.a));
+  }
+  return vec4(cloud.rgb + cloud.a * cirrus.rgb, cloud.a * (1.0f - cirrus.a));
+}
+
+// The cirrus along a ray from the camera: premultiplied radiance and opacity, with the air in front
+// of it in the radiance, so it goes over the sky like the cloud render does. `pixelAngle` is the
+// radians one output texel spans, which selects the map's mip. `distanceKm` is 0 on no hit.
+vec4 cirrusEvaluate(vec3 viewDirYUp, AtmosphereArgs args, float pixelAngle, Texture2D<float2> cirrusMap,
+                    SamplerState mapSampler, Texture2D<float4> transmittanceLut, Texture2D<float4> skyViewLut,
+                    SamplerState lutSampler, out float distanceKm) {
+  distanceKm = 0.0f;
+  if (args.cloudCirrusEnable == 0u || args.cloudCirrusCoverageMean <= 0.0f || args.cloudCirrusOpticalDepth <= 0.0f) {
+    return vec4(0.0f);
+  }
+  const vec3 center = getCloudPlanetCenter(args);
+  const float eyeRadius = length(center);
+  const float mu = dot(viewDirYUp, -center) / eyeRadius;
+  const float radius = args.planetRadius + args.cloudCirrusAltitude;
+  float t;
+  if (!cirrusShellDistance(eyeRadius, mu, radius, args.planetRadius, t)) {
+    return vec4(0.0f);
+  }
+  const vec3 hit = viewDirYUp * t;
+  const float shellCos = abs(dot(viewDirYUp, (hit - center) / radius));
+
+  // The shell's coordinates: world-anchored, drifting with the high wind, turned so the map's long
+  // axis lies along the streaks.
+  const vec2 world = args.cameraWorldPosYUpKm.xz + hit.xz - vec2(args.cloudCirrusWindOffsetX, args.cloudCirrusWindOffsetZ);
+  const vec2 uv = cirrusRotate(world, vec2(args.cloudCirrusStreakCos, args.cloudCirrusStreakSin)) / kCirrusTileKm;
+  const float footprintKm = t * pixelAngle / max(shellCos, kCirrusMinSlantCos);
+  const float lod = log2(max(footprintKm * kCirrusMapSize / kCirrusTileKm, 1e-3f));
+
+  const float filament = cirrusMap.SampleLevel(mapSampler, uv, lod).x;
+  const float detail = cirrusMap.SampleLevel(mapSampler, cirrusRotate(uv, kCirrusDetailRotation) * kCirrusDetailScale,
+                                             lod + log2(kCirrusDetailScale)).x;
+  const float patch = cirrusMap.SampleLevel(mapSampler, cirrusRotate(uv, kCirrusPatchRotation) * kCirrusPatchScale,
+                                            max(lod + log2(kCirrusPatchScale), 0.0f)).y;
+  // Coverage opens the patches; the filaments inside them are the visible cloud.
+  const float threshold = 1.0f - saturate(args.cloudCirrusCoverageMean);
+  const float patchMask = smoothstep(threshold - 0.15f, threshold + 0.2f, patch);
+  const float fibres = smoothstep(0.32f, 0.82f, filament * 0.72f + detail * 0.28f);
+  const float tau = args.cloudCirrusOpticalDepth * patchMask * fibres / max(shellCos, kCirrusMinSlantCos);
+  const float opacity = 1.0f - exp(-tau);
+  if (opacity <= 0.0f) {
+    return vec4(0.0f);
+  }
+  distanceKm = t;
+
+  // The key light at the shell's own height: it stays lit after ground sunset.
+  const vec3 lightDir = normalize(args.sunDirection);
+  const vec3 keyLight = args.sunIlluminance * evalSunShadowing(hit, lightDir, transmittanceLut, lutSampler, args);
+  const float cosTheta = dot(viewDirYUp, lightDir);
+  const float phase = kCirrusPhaseForwardWeight * hgPhase(cosTheta, kCirrusPhaseForwardG)
+                    + (1.0f - kCirrusPhaseForwardWeight) * hgPhase(cosTheta, kCirrusPhaseBackG)
+                    + kCirrusMultipleScatter / (4.0f * kPi);
+  const vec3 skyAlongRay = cirrusSkyRadiance(viewDirYUp, skyViewLut, lutSampler);
+  const vec3 skyLight = 0.6f * cirrusSkyRadiance(vec3(0.0f, 1.0f, 0.0f), skyViewLut, lutSampler) + 0.4f * skyAlongRay;
+  const vec3 cloudLight = keyLight * phase + skyLight;
+
+  // The air between the camera and the shell, as cloudAerialPerspective takes it for the march. The
+  // sky along the ray already holds the whole column.
+  const vec3 toEye = -getPlanetCenter(args);
+  const float eyeLength = length(toEye);
+  const float eyeMu = dot(viewDirYUp, toEye) / eyeLength;
+  const vec3 toHit = hit + toEye;
+  const float hitLength = length(toHit);
+  const float hitMu = dot(viewDirYUp, toHit) / hitLength;
+  const vec3 eyeUpward = sampleTransmittanceLut(transmittanceLut, lutSampler, max(eyeLength - args.planetRadius, 0.0f), eyeMu, args);
+  const vec3 hitUpward = sampleTransmittanceLut(transmittanceLut, lutSampler, max(hitLength - args.planetRadius, 0.0f), hitMu, args);
+  const vec3 airT = saturate(eyeUpward / max(hitUpward, vec3(1e-6f)));
+  const vec3 airShare = saturate((1.0f - airT) / max(1.0f - eyeUpward, vec3(1e-4f)));
+  return vec4((cloudLight * airT + skyAlongRay * airShare) * opacity, opacity);
+}
