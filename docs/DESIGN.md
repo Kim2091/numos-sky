@@ -205,8 +205,14 @@ sky.
 - **Other rays.** `cloud_secondary_lut` adds it to the dome, so reflections and environment bakes see it.
 - **Order.** Behind every other cloud and the scene, unless the eye is above the sheet, where it lies
   in front of what is below it.
-- **Not modelled.** It casts no shadow, does not dim the sun on surfaces, adds nothing to the clouds'
-  sky-light LUT, and has no halo.
+- **Sun.** `cloud_cirrus_shadow` writes the beam's optical depth over a 40 km window of the sheet into
+  the cloud shadow map's last layer, so `sampleCloudGroundShadowFromMap`, and through it every host,
+  shades lights by it with no new binding. Past the window, and for clouds below the sheet, the sheet's
+  mean stands in. The beam loses only the delta-scaled depth (`kCirrusBeamDepthScale`), because a strong
+  forward peak stays in the beam. A camera ray sees the sun's disc through the full depth, in the alpha
+  of `cloudRender`.
+- **Sky light.** `cloud_sky_transmittance_lut` reduces the dome, so it holds the cirrus already.
+- **Not modelled.** It has no halo.
 
 ## Rules
 

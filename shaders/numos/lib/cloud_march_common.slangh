@@ -150,7 +150,8 @@ vec3 evalCloudSunRadiance(vec3 posKm, CloudShadeContext ctx, AtmosphereArgs args
 #ifdef ATMOSPHERE_TRANSMITTANCE_LUT_AVAILABLE
   return args.sunIlluminance * evalSunShadowing(posKm - args.cameraWorldPosYUpKm, ctx.sunDirYUp,
                                                 AtmosphereTransmittanceLut, AtmosphereSkyViewSampler,
-                                                args);
+                                                args)
+       * cirrusSunMeanKeep(posKm, getCloudPlanetCenterWorldKm(args), args);
 #else
   return ctx.sunRadiance;
 #endif
