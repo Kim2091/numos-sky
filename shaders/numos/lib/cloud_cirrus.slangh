@@ -26,12 +26,19 @@ static const float kCirrusDetailScale = 7.0f;
 static const float kCirrusPatchScale = 0.37f;
 static const vec2  kCirrusDetailRotation = vec2(0.978f, 0.208f);
 static const vec2  kCirrusPatchRotation = vec2(0.809f, 0.588f);
-// Ice crystals scatter mostly forward, with a weak back lobe (halos are not modelled).
+// Ice crystals scatter mostly forward, with a weak back lobe.
 static const float kCirrusPhaseForwardG = 0.75f;
 static const float kCirrusPhaseBackG = -0.2f;
 static const float kCirrusPhaseForwardWeight = 0.8f;
 // The higher scattering orders, as a fraction of an isotropic lobe.
 static const float kCirrusMultipleScatter = 0.3f;
+// The 22 degree halo: light through a hexagonal crystal's 60 degree prism turns by at least the angle
+// of minimum deviation and piles up there, so the ring has a sharp inner edge and a soft outer tail.
+// Ice bends red least, which puts red on the inside.
+static const vec3  kCirrusHaloEdgeDeg = vec3(21.8f, 22.0f, 22.2f);
+static const float kCirrusHaloTailDeg = 4.0f;
+static const float kCirrusHaloPeak = 0.2f;
+static const float kCirrusHaloInnerDark = 0.3f;
 // Keeps the slant path finite along a ray that grazes the shell.
 static const float kCirrusMinSlantCos = 0.05f;
 // Of the optical depth the sun's beam crosses, the part that takes light out of it: the forward peak
@@ -95,6 +102,23 @@ float cirrusColumnShare(vec2 world, float lod, AtmosphereArgs args, Texture2D<fl
   return patchMask * fibres;
 }
 
+// The ice phase function, per channel for the halo, at the angle whose cosine is `cosTheta` from the light.
+vec3 cirrusPhase(float cosTheta, AtmosphereArgs args) {
+  const float lobes = kCirrusPhaseForwardWeight * hgPhase(cosTheta, kCirrusPhaseForwardG)
+                    + (1.0f - kCirrusPhaseForwardWeight) * hgPhase(cosTheta, kCirrusPhaseBackG)
+                    + kCirrusMultipleScatter / (4.0f * kPi);
+  if (args.cloudCirrusHaloStrength <= 0.0f) {
+    return vec3(lobes);
+  }
+  const float deg = degrees(acos(clamp(cosTheta, -1.0f, 1.0f)));
+  const vec3 ring = smoothstep(kCirrusHaloEdgeDeg - 0.5f, kCirrusHaloEdgeDeg + 0.5f, vec3(deg))
+                  * exp(-max(vec3(deg) - kCirrusHaloEdgeDeg, vec3(0.0f)) / kCirrusHaloTailDeg);
+  // No crystal turns light by less than the ring's angle, so the sky just inside it is darker.
+  const float inner = smoothstep(15.0f, 21.0f, deg) * (1.0f - smoothstep(21.3f, 21.9f, deg));
+  return lobes * (1.0f - args.cloudCirrusHaloStrength * kCirrusHaloInnerDark * inner)
+       + args.cloudCirrusHaloStrength * kCirrusHaloPeak * ring;
+}
+
 // The eye above the sheet: the cirrus then lies in front of what is below it, not behind.
 bool cirrusEyeAbove(AtmosphereArgs args) {
   return args.cameraWorldPosYUpKm.y >= args.cloudCirrusAltitude;
@@ -142,10 +166,7 @@ vec4 cirrusEvaluate(vec3 viewDirYUp, AtmosphereArgs args, float pixelAngle, Text
   // The key light at the shell's own height: it stays lit after ground sunset.
   const vec3 lightDir = normalize(args.sunDirection);
   const vec3 keyLight = args.sunIlluminance * evalSunShadowing(hit, lightDir, transmittanceLut, lutSampler, args);
-  const float cosTheta = dot(viewDirYUp, lightDir);
-  const float phase = kCirrusPhaseForwardWeight * hgPhase(cosTheta, kCirrusPhaseForwardG)
-                    + (1.0f - kCirrusPhaseForwardWeight) * hgPhase(cosTheta, kCirrusPhaseBackG)
-                    + kCirrusMultipleScatter / (4.0f * kPi);
+  const vec3 phase = cirrusPhase(dot(viewDirYUp, lightDir), args);
   const vec3 skyAlongRay = cirrusSkyRadiance(viewDirYUp, skyViewLut, lutSampler);
   const vec3 skyLight = 0.6f * cirrusSkyRadiance(vec3(0.0f, 1.0f, 0.0f), skyViewLut, lutSampler) + 0.4f * skyAlongRay;
   const vec3 cloudLight = keyLight * phase + skyLight;
