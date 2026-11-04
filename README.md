@@ -12,7 +12,7 @@ provider.
   lookup tables, Mie absorption, an ozone layer and planet shadow.
 - **Clouds**: volumetric clouds in the style of Guerrilla's Nubis and Nubis Cubed (a voxel density
   field with a signed distance field for empty-space skipping, multiple-scattering approximation),
-  a second cloud layer for stratus decks and ground fog, cloud shadows on the ground and in the air,
+  a second cloud layer for stratus decks and ground fog, a thin streaked cirrus sheet above them, cloud shadows on the ground and in the air,
   clouds in reflections, temporal and spatial filtering, and lightning.
 - **Aerial perspective**: a camera-aligned froxel grid near the camera and a camera-centred
   far-field table beyond it, with height fog, glow around local lights and optional scene

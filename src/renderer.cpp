@@ -83,6 +83,16 @@ namespace {
     args.cloudLayer2MapCenterX       = 0.0f;
     args.cloudLayer2MapCenterZ       = 0.0f;
     args.cloudLayer2MapValid         = 0.0f;
+    // The sky LUTs do not see the cirrus; only the dome and the screen composite read these.
+    args.cloudCirrusEnable           = 0u;
+    args.cloudCirrusAltitude         = 0.0f;
+    args.cloudCirrusCoverageMean     = 0.0f;
+    args.cloudCirrusOpticalDepth     = 0.0f;
+    args.cloudCirrusWindOffsetX      = 0.0f;
+    args.cloudCirrusWindOffsetZ      = 0.0f;
+    args.cloudCirrusStreakCos        = 0.0f;
+    args.cloudCirrusStreakSin        = 0.0f;
+    args.cloudCirrusNoiseSeed        = 0.0f;
     args.cloudEvolutionOffsetX       = 0.0f;
     args.cloudEvolutionOffsetY       = 0.0f;
     // The detail drift follows the wind direction, so a preset that rotates the wind would
@@ -1247,6 +1257,19 @@ AtmosphereArgs Renderer::Impl::getAtmosphereArgs() const {
     args.cloudLayer2MapValid      = mapLive ? 1.0f : 0.0f;
   }
 
+  {
+    const float streakAngle = m_settings.cloudCirrusStreakDirection * kDegreesToRadians;
+    args.cloudCirrusEnable       = m_settings.cloudCirrusEnable && m_settings.cloudEnabled ? 1u : 0u;
+    args.cloudCirrusAltitude     = std::max(m_settings.cloudCirrusBaseHeightMeters, 0.0f) * 0.001f;
+    args.cloudCirrusCoverageMean = m_settings.cloudCirrusCoverageMean;
+    args.cloudCirrusOpticalDepth = std::max(m_settings.cloudCirrusOpticalDepth, 0.0f);
+    args.cloudCirrusWindOffsetX  = m_cloudAdvectOffset.x * m_settings.cloudCirrusWindScale;
+    args.cloudCirrusWindOffsetZ  = m_cloudAdvectOffset.y * m_settings.cloudCirrusWindScale;
+    args.cloudCirrusStreakCos    = std::cos(streakAngle);
+    args.cloudCirrusStreakSin    = std::sin(streakAngle);
+    args.cloudCirrusNoiseSeed    = m_settings.cloudCirrusNoiseSeed;
+  }
+
   args.cloudLightingLodThreshold = m_settings.cloudLightingLodThreshold;
   args.cloudMissLinearViewZ = m_missLinearViewZ;
   {
@@ -1444,6 +1467,10 @@ void Renderer::Impl::createLutResources(PassRecorder& rec) {
   replaceTexture(rec, m_cloudLayer2Map, createTexture(rec, "Atmosphere Cloud Layer 2 Map", TextureType::Tex3D,
     Format::RG16Float, kCloudLayer2MapSize, kCloudLayer2MapSize, 2, 1));
   m_cloudLayer2MapState = CloudLayer2MapState {};
+  // Cirrus map (cloud_cirrus_map.comp): baked the first time the layer is on; ~6 MB.
+  replaceTexture(rec, m_cloudCirrusMap, createTexture(rec, "Atmosphere Cloud Cirrus Map", TextureType::Tex2D,
+    Format::RG16Float, kCloudCirrusMapSize, kCloudCirrusMapSize, 1, kCloudCirrusMapMipLevels));
+  m_cloudCirrusMapBaked = false;
 
   // Cloud NVDF SDF bake chain, 256x64x256 with texture y vertical (cloud_nvdf.h). Occupancy and the
   // JFA ping-pong are bake scratch; the two R16F SDF volumes are the published front/back pair.
@@ -1605,6 +1632,9 @@ void Renderer::Impl::computeLuts(PassRecorder& rec) {
   }
   if (cloudsEnabled && m_settings.cloudLayer2Enable) {
     updateCloudLayer2Map(rec);
+  }
+  if (cloudsEnabled && m_settings.cloudCirrusEnable) {
+    updateCloudCirrusMap(rec);
   }
 
   // Aerial perspective. Camera-fitted, so it runs every frame; after the cloud shadow map because
@@ -2263,6 +2293,38 @@ void Renderer::Impl::updateCloudLayer2Map(PassRecorder& rec) {
   rec.bindTexture(3, m_cloudLayer2Map);
   rec.setPass(PassId::cloud_layer2_map);
   rec.dispatch((kCloudLayer2MapSize + 7u) / 8u, (kCloudLayer2MapSize + 7u) / 8u, 2u);
+}
+
+// Cirrus map (cloud_cirrus_map.comp, lib/cloud_cirrus.slangh). The pattern depends on the seed alone:
+// coverage, height and wind are applied where it is read.
+void Renderer::Impl::updateCloudCirrusMap(PassRecorder& rec) {
+  if (!m_cloudCirrusMap.isValid()
+      || (m_cloudCirrusMapBaked && m_cloudCirrusMapSeed == m_settings.cloudCirrusNoiseSeed)) {
+    return;
+  }
+  GpuZone zone(rec.gpu(), "Atmosphere Cloud Cirrus Map Bake");
+  const AtmosphereArgs args = getAtmosphereArgs();
+  rec.bindConstants(0, &args, sizeof(AtmosphereArgs));
+  rec.bindTexture(1, m_cloudCirrusMap, 0);
+  rec.setPass(PassId::cloud_cirrus_map);
+  // Shader declares [numthreads(8, 8, 1)].
+  rec.dispatch((kCloudCirrusMapSize + 7u) / 8u, (kCloudCirrusMapSize + 7u) / 8u, 1u);
+
+  // A linear tap at each destination texel's centre is the 2x2 box over the source level, and repeat
+  // addressing wraps the tiling map's edges into it.
+  const GpuHandle boxSampler = sampler(rec.gpu(), Filter::Linear, Filter::Nearest, AddressMode::Repeat, 0.0f);
+  rec.setPass(PassId::cloud_cirrus_map_mip);
+  for (uint32_t level = 1; level < kCloudCirrusMapMipLevels; ++level) {
+    rec.barrier();
+    rec.bindTexture(0, m_cloudCirrusMap, level - 1);
+    rec.bindSampler(1, boxSampler);
+    rec.bindTexture(2, m_cloudCirrusMap, level);
+    const uint32_t size = std::max(kCloudCirrusMapSize >> level, 1u);
+    rec.dispatch((size + 7u) / 8u, (size + 7u) / 8u, 1u);
+  }
+  rec.barrier();
+  m_cloudCirrusMapBaked = true;
+  m_cloudCirrusMapSeed = m_settings.cloudCirrusNoiseSeed;
 }
 
 void Renderer::Impl::updateCloudShadowMap(PassRecorder& rec) {
@@ -3048,6 +3110,7 @@ void Renderer::Impl::dispatchPostDepth(IGpu& gpu, GpuHandle linearViewZ, float m
       || (!m_cloudCompositeActive && !debugViewActive)) {
       m_cloudTemporalHistoryValid = false;
     m_cloudDenoisedThisFrame = false;
+    m_cloudCirrusThisFrame = false;
     if (m_initialized) {
       dispatchCloudSampleStatistics(rec);
     }
@@ -3061,6 +3124,7 @@ void Renderer::Impl::dispatchPostDepth(IGpu& gpu, GpuHandle linearViewZ, float m
 
   dispatchCloudRender(rec, linearViewZ);
   dispatchCloudDenoise(rec);
+  dispatchCloudCirrusComposite(rec, linearViewZ);
   dispatchCloudSampleStatistics(rec);
   publishOutputs();
 }
@@ -3378,7 +3442,7 @@ void Renderer::Impl::dispatchCloudSecondaryLut(PassRecorder& rec) {
   rec.bindTexture(22, m_cloudVerticalOd);
   rec.bindTexture(23, m_cloudLayer2Map);
   rec.bindTexture(24, m_cloudBeerMap);
-
+  rec.bindTexture(30, m_cloudCirrusMap);
 
   rec.setPass(PassId::cloud_secondary_lut);
 
@@ -3401,6 +3465,44 @@ void Renderer::Impl::dispatchCloudSecondaryLut(PassRecorder& rec) {
 
 // Gaussian mip chain: each level from the previous one with the generate_mipmap pass (3x3
 // Gaussian), a linear/clamp sampler and 16x16 groups, with a barrier between levels.
+// The cirrus layered with the filtered cloud render, into its own texture: m_cloudRenderRT is next frame's
+// history and may be what the host would composite, so it is never written. Off, none of this runs
+// and the host composites the cloud render itself.
+void Renderer::Impl::dispatchCloudCirrusComposite(PassRecorder& rec, GpuHandle linearViewZ) {
+  m_cloudCirrusThisFrame = false;
+  if (!m_settings.cloudCirrusEnable || !m_cloudCirrusMapBaked) {
+    return;
+  }
+  GpuZone zone(rec.gpu(), "Atmosphere Cloud Cirrus Composite");
+  const uint32_t width = m_cloudRenderExtentWidth;
+  const uint32_t height = m_cloudRenderExtentHeight;
+  if (!m_cloudCirrusRT.isValid() || m_cloudCirrusRT.desc.width != width || m_cloudCirrusRT.desc.height != height) {
+    replaceTexture(rec, m_cloudCirrusRT, createTexture(rec, "Atmosphere Cloud Render Cirrus", TextureType::Tex2D,
+      Format::RGBA16Float, width, height, 1, 1));
+  }
+  const AtmosphereArgs args = getCloudArgs();
+  const GpuHandle mapSampler = sampler(rec.gpu(), Filter::Linear, Filter::Linear, AddressMode::Repeat, SamplerDesc::kLodClampNone);
+  const GpuHandle lutSampler = sampler(rec.gpu(), Filter::Linear, Filter::Nearest, AddressMode::ClampToEdge, 0.0f);
+  rec.barrier();
+  rec.setPass(PassId::cloud_cirrus_composite);
+  rec.bindConstants(0, &args, sizeof(AtmosphereArgs));
+  rec.bindConstants(1, &m_inputs.camera, sizeof(Camera));
+  rec.bindSampler(2, mapSampler);
+  rec.bindSampler(3, lutSampler);
+  rec.bindTexture(4, m_cloudCirrusMap);
+  rec.bindTexture(5, m_transmittanceLut);
+  rec.bindTexture(6, m_skyViewLut);
+  rec.bindTexture(7, m_multiscatteringLut);
+  rec.bindTexture(8, m_cloudDenoisedThisFrame ? m_cloudDenoisedRT : m_cloudRenderRT);
+  rec.bindTexture(9, m_cloudDepthRT);
+  rec.bindTexture(10, m_cloudCirrusRT);
+  rec.bindTexture(11, linearViewZ);
+  const float missLinearViewZ = m_missLinearViewZ;
+  rec.pushConstants(&missLinearViewZ, sizeof(missLinearViewZ));
+  rec.dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1u);
+  m_cloudCirrusThisFrame = true;
+}
+
 void Renderer::Impl::generateMipmapGaussian(PassRecorder& rec, const Texture& texture) {
   const GpuHandle linearClamp = sampler(rec.gpu(), Filter::Linear, Filter::Nearest, AddressMode::ClampToEdge);
   for (uint32_t i = 1; i < texture.desc.mipLevels; i++) {
@@ -3617,7 +3719,8 @@ void Renderer::Impl::publishOutputs() {
   o.cloudSkyTransmittanceLut = m_cloudSkyTransmittanceLut.handle;
   o.cloudShadowMap = m_cloudShadowMap.handle;
   o.cloudSecondaryLut = m_cloudSecondaryLut.handle;
-  o.cloudRender = m_cloudDenoisedThisFrame ? m_cloudDenoisedRT.handle : m_cloudRenderRT.handle;
+  o.cloudRender = m_cloudCirrusThisFrame ? m_cloudCirrusRT.handle
+                : m_cloudDenoisedThisFrame ? m_cloudDenoisedRT.handle : m_cloudRenderRT.handle;
   o.cloudDepth = m_cloudDepthRT.handle;
   o.apNearScatter = m_apNearScatter.handle;
   o.apFarScatter = m_apFarScatter.handle;
