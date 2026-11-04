@@ -399,6 +399,16 @@ struct AtmosphereArgs {
   float cloudCirrusStreakSin;
 
   float cloudCirrusNoiseSeed;      // the map bake's
+  float cloudCirrusSunMeanDepth;   // the sun beam's mean optical depth through the sheet; 0: no effect
+  uint  cloudCirrusShadowLive;     // 1: the shadow map's cirrus layer holds this frame's shadow
+  float cloudCirrusShadowHalfKm;   // that layer's window on the sheet
+
+  float cloudCirrusShadowDirX;     // the key light it was baked for
+  float cloudCirrusShadowDirY;
+  float cloudCirrusShadowDirZ;
+  float cloudCirrusShadowCenterX;  // km, the window's centre on the sheet, world Y-up
+
+  float cloudCirrusShadowCenterZ;
   float padCirrus0;
   float padCirrus1;
   float padCirrus2;

@@ -5,7 +5,7 @@
 // NUMOS_PASS_BINDING(slot, set, kind, dim, spirvImageFormat, "shader variable")
 
 #ifdef NUMOS_PASS
-NUMOS_PASS(viewer_composite, "viewer_composite.comp.spv", 0x939b239a9a38bfdaull, 8, 8, 1, 0, 0, 28)
+NUMOS_PASS(viewer_composite, "viewer_composite.comp.spv", 0x2bd686e7ea7a3af7ull, 8, 8, 1, 0, 0, 28)
 NUMOS_PASS(viewer_depth, "viewer_depth.comp.spv", 0xf9b423164baa5affull, 8, 8, 1, 0, 28, 3)
 #undef NUMOS_PASS
 #endif

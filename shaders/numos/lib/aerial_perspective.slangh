@@ -244,10 +244,11 @@ ApPhase apPhase(float cosTheta, AtmosphereArgs args) {
 // the outermost window the map knows nothing, so samples there fade to a coverage-based mean.
 
 float apCloudShadowMean(AtmosphereArgs args) {
-  if (args.cloudVoxelShadowsEnable == 0u || args.cloudEnabled < 0.5f || args.cloudCoverageMean < 0.01f) {
+  if (args.cloudVoxelShadowsEnable == 0u) {
     return 1.0f;
   }
-  return lerp(1.0f, 1.0f - saturate(args.cloudCoverageMean), args.cloudShadowStrength);
+  const float deck = args.cloudEnabled < 0.5f || args.cloudCoverageMean < 0.01f ? 1.0f : 1.0f - saturate(args.cloudCoverageMean);
+  return lerp(1.0f, deck * exp(-args.cloudCirrusSunMeanDepth), args.cloudShadowStrength);
 }
 
 float apCloudSunTransmittance(vec3 worldPos, AtmosphereArgs args, Texture3D<float2> cloudShadowMap,

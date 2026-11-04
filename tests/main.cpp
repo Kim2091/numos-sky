@@ -302,7 +302,7 @@ static void testMigration() {
 }
 
 static void testPasses() {
-  CHECK(passCount() == 29);
+  CHECK(passCount() == 30);
   const PassInfo& p = passInfo(PassId::transmittance_lut);
   CHECK(std::string(p.name) == "transmittance_lut");
   CHECK(p.localSize[0] == 16 && p.localSize[1] == 16);

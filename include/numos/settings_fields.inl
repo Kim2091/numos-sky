@@ -414,7 +414,7 @@ NUMOS_SETTING(uint32_t, cloudLayer2StepMax, 32, "rtx.atmosphere.cloudLayer2StepM
 NUMOS_SETTING(Vector3, cloudLayer2Color, Vector3(0.89f, 0.92f, 1.0f), "rtx.atmosphere.cloudLayer2Color", NUMOS_NO_MIN, NUMOS_NO_MAX, NUMOS_SETTING_NO_SAVE,
   "Deprecated: replaced by rtx.atmosphere.cloudLayer2Albedo. Layer 2 uses the main deck's Cloud Color with its own albedo. An existing value is migrated. Save the config again to stop the notice.")
 NUMOS_SETTING(bool, cloudCirrusEnable, false, "rtx.atmosphere.cloudCirrusEnable", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "Draws cirrus: thin, streaked ice cloud high above the other layers. It is a textured sheet rather than a marched volume, so it costs little, and from below it sits behind every other cloud. It lights up at sunset after the lower clouds have gone dark. It casts no shadow.")
+  "Draws cirrus: thin, streaked ice cloud high above the other layers. It is a textured sheet rather than a marched volume, so it costs little, and from below it sits behind every other cloud. It lights up at sunset after the lower clouds have gone dark. It casts a faint shadow, stronger with a low sun, which Cloud Shadow Strength fades.")
 NUMOS_SETTING(float, cloudCirrusBaseHeightMeters, 9500.0f, "rtx.atmosphere.cloudCirrusBaseHeightMeters", 0.0f, NUMOS_NO_MAX, 0,
   "The height of the cirrus sheet, in metres. Real cirrus forms from about 6000 to 13000.")
 NUMOS_SETTING(float, cloudCirrusCoverageMean, 0.6f, "rtx.atmosphere.cloudCirrusCoverageMean", 0.0f, 1.0f, 0,
