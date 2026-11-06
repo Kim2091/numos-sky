@@ -238,6 +238,27 @@ static_assert(offsetof(Camera, nearPlane) == 1352, "Camera::nearPlane offset dif
 static_assert(offsetof(Camera, flags) == 1356, "Camera::flags offset differs from the shader");
 static_assert(sizeof(Camera) >= 1360, "Camera is smaller than the shader layout");
 
+// CloudLens: 10 members, 80 bytes in the shader layout
+static_assert(offsetof(CloudLens, eyepieceCenter) == 0, "CloudLens::eyepieceCenter offset differs from the shader");
+static_assert(offsetof(CloudLens, eyepieceRadius) == 12, "CloudLens::eyepieceRadius offset differs from the shader");
+static_assert(offsetof(CloudLens, axis) == 16, "CloudLens::axis offset differs from the shader");
+static_assert(offsetof(CloudLens, magnification) == 28, "CloudLens::magnification offset differs from the shader");
+static_assert(offsetof(CloudLens, right) == 32, "CloudLens::right offset differs from the shader");
+static_assert(offsetof(CloudLens, apertureAspect) == 44, "CloudLens::apertureAspect offset differs from the shader");
+static_assert(offsetof(CloudLens, up) == 48, "CloudLens::up offset differs from the shader");
+static_assert(offsetof(CloudLens, reserved0) == 60, "CloudLens::reserved0 offset differs from the shader");
+static_assert(offsetof(CloudLens, objectiveCenter) == 64, "CloudLens::objectiveCenter offset differs from the shader");
+static_assert(offsetof(CloudLens, reserved1) == 76, "CloudLens::reserved1 offset differs from the shader");
+static_assert(sizeof(CloudLens) >= 80, "CloudLens is smaller than the shader layout");
+
+// CloudLensArgs: 5 members, 656 bytes in the shader layout
+static_assert(offsetof(CloudLensArgs, lensMask) == 0, "CloudLensArgs::lensMask offset differs from the shader");
+static_assert(offsetof(CloudLensArgs, previousLensMask) == 4, "CloudLensArgs::previousLensMask offset differs from the shader");
+static_assert(offsetof(CloudLensArgs, historyMask) == 8, "CloudLensArgs::historyMask offset differs from the shader");
+static_assert(offsetof(CloudLensArgs, reserved) == 12, "CloudLensArgs::reserved offset differs from the shader");
+static_assert(offsetof(CloudLensArgs, lenses) == 16, "CloudLensArgs::lenses offset differs from the shader");
+static_assert(sizeof(CloudLensArgs) >= 656, "CloudLensArgs is smaller than the shader layout");
+
 // AerialPerspectiveLight: 10 members, 64 bytes in the shader layout
 static_assert(offsetof(AerialPerspectiveLight, position) == 0, "AerialPerspectiveLight::position offset differs from the shader");
 static_assert(offsetof(AerialPerspectiveLight, influenceRadius) == 12, "AerialPerspectiveLight::influenceRadius offset differs from the shader");
