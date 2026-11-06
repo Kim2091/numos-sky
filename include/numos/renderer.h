@@ -44,6 +44,7 @@
 #include "numos/math.h"
 #include "numos/settings.h"
 #include "numos/lib/atmosphere_args.h"
+#include "numos/lib/cloud_lens.h"
 #include "numos/util/camera.h"
 
 namespace numos {
@@ -70,6 +71,36 @@ struct LocalLight {
   float   coneSoftness = 0.0f;
   float   focusExponent = 0.0f;
 };
+
+// Where a magnifier lens sits in one frame (Lens). Render space, world units.
+struct LensGeometry {
+  Vector3 eyepieceCenter;
+  float   eyepieceRadius = 0.0f;  // a rectangle's half height
+  // A rectangle's half width over its half height; 0 for a circular eyepiece.
+  float   apertureAspect = 0.0f;
+  Vector3 axis;                   // normalized, pointing out of the objective
+  Vector3 right;                  // a rectangle's half-width direction: normalized, perpendicular to the axis
+  Vector3 up;                     // a rectangle's half-height direction: normalized, perpendicular to the axis
+  Vector3 objectiveCenter;        // where the magnified rays start
+  float   magnification = 1.0f;
+};
+
+// A magnifier in front of the camera, such as a telescopic sight (DESIGN.md "Lenses"). A camera ray
+// that meets the eyepiece plane inside the eyepiece leaves the objective with the tangent of its
+// angle to the axis divided by the magnification. The screen clouds are marched along those rays
+// and their history is reprojected through the lens. The host's linear view Z of a lens pixel is
+// its virtual distance (the camera ray's distance to the eyepiece plane plus the distance from the
+// objective to the surface) times the camera ray's cosine to the forward axis.
+struct Lens {
+  bool active = false;          // the lens exists this frame, at `current`
+  bool previousActive = false;  // a lens was in this slot on the previous frame, at `previous`
+  // `previous` is the same lens as `current` and its image may keep its history (no cut, no zoom jump).
+  bool historyValid = false;
+  LensGeometry current;
+  LensGeometry previous;
+};
+
+static constexpr uint32_t kMaxLenses = CLOUD_MAX_LENSES;
 
 // Copied by beginFrame. The pointers in it (localLights, groundPoints, weather) must stay valid until
 // dispatchPostDepth of the same frame returns.
@@ -129,6 +160,11 @@ struct FrameInputs {
   // Remix's volume ReSTIR); NUMOS adds it to the near field the next frame. See numos_host.slangh.
   bool     hostLocalLightInjection = false;
   bool     debugViewActive = false; // keep the cloud screen pass running for host debug views
+
+  // Magnifier lenses by slot. A lens keeps its slot while it exists, and a lens that disappeared
+  // keeps previousActive for one frame, so the pixels it covered drop their history. Without a lens
+  // the screen clouds skip every lens test.
+  Lens     lenses[kMaxLenses];
 
   const WeatherSnapshot* weather = nullptr; // blended weather, or null to use Settings alone
 

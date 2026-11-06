@@ -3193,6 +3193,43 @@ uint32_t Renderer::Impl::cloudMarchStride() const {
   return stride;
 }
 
+namespace {
+
+CloudLens toCloudLens(const LensGeometry& g) {
+  CloudLens lens {};
+  lens.eyepieceCenter = vec3(g.eyepieceCenter.x, g.eyepieceCenter.y, g.eyepieceCenter.z);
+  lens.eyepieceRadius = g.eyepieceRadius;
+  lens.axis = vec3(g.axis.x, g.axis.y, g.axis.z);
+  lens.magnification = std::max(g.magnification, 1e-3f);
+  lens.right = vec3(g.right.x, g.right.y, g.right.z);
+  lens.apertureAspect = std::max(g.apertureAspect, 0.0f);
+  lens.up = vec3(g.up.x, g.up.y, g.up.z);
+  lens.objectiveCenter = vec3(g.objectiveCenter.x, g.objectiveCenter.y, g.objectiveCenter.z);
+  return lens;
+}
+
+// The cloud screen pass's lens table (cloud_lens.h) from FrameInputs::lenses.
+CloudLensArgs makeCloudLensArgs(const FrameInputs& inputs) {
+  CloudLensArgs args {};
+  for (uint32_t slot = 0; slot < kMaxLenses; ++slot) {
+    const Lens& lens = inputs.lenses[slot];
+    if (lens.active) {
+      args.lensMask |= 1u << slot;
+      args.lenses[slot] = toCloudLens(lens.current);
+    }
+    if (lens.previousActive) {
+      args.previousLensMask |= 1u << slot;
+      args.lenses[kMaxLenses + slot] = toCloudLens(lens.previous);
+    }
+    if (lens.active && lens.previousActive && lens.historyValid && !inputs.cameraCut) {
+      args.historyMask |= 1u << slot;
+    }
+  }
+  return args;
+}
+
+} // namespace
+
 void Renderer::Impl::dispatchCloudRender(PassRecorder& rec, GpuHandle linearViewZ) {
   GpuZone zone(rec.gpu(), "Atmosphere Cloud Render (Nubis Cubed)");
 
@@ -3254,6 +3291,8 @@ void Renderer::Impl::dispatchCloudRender(PassRecorder& rec, GpuHandle linearView
   rec.bindTexture(27, m_cloudFreshAux);
   rec.bindTexture(28, m_cloudStateRT);
   rec.bindTexture(29, m_cloudStatePrevious);
+  const CloudLensArgs lensArgs = makeCloudLensArgs(m_inputs);
+  rec.bindConstants(30, &lensArgs, sizeof(lensArgs));
 
   if (m_settings.cloudProfilingMode == 9) {
     // Reference path tracer (cloud_reference.slangh): ground truth for tuning the march.

@@ -1,0 +1,77 @@
+// Copyright 2026 Kim2091 (Sparkles)
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+// Lens geometry for the cloud screen pass (docs/DESIGN.md "Lenses"). The including pass declares
+// cloudLens as a CloudLensArgs constant buffer before including this file.
+//
+// A camera ray that meets a lens' eyepiece plane inside the eyepiece leaves the objective magnified:
+// its direction keeps the side it leans to, and the tangent of its angle to the axis is divided by
+// the magnification.
+
+#include "numos/lib/cloud_lens.h"
+
+static const uint kCloudLensNone = 0xFFFFFFFFu;
+
+// Returns the distance along the ray to the lens' eyepiece plane.
+// Returns a negative value when the ray does not travel toward the objective.
+float cloudLensEyepieceDistance(CloudLens lens, vec3 origin, vec3 direction) {
+  const float axial = dot(direction, lens.axis);
+  if (axial <= 0.0f) {
+    return -1.0f;
+  }
+  return dot(lens.eyepieceCenter - origin, lens.axis) / axial;
+}
+
+// A circular eyepiece is a disc of the eyepiece radius. A rectangular one is the eyepiece radius
+// high and the aperture aspect times that wide, both as half extents.
+bool cloudLensInsideEyepiece(CloudLens lens, vec3 origin, vec3 direction, float planeDistance) {
+  if (planeDistance <= 0.0f) {
+    return false;
+  }
+  const vec3 offset = origin + direction * planeDistance - lens.eyepieceCenter;
+  if (lens.apertureAspect > 0.0f) {
+    return abs(dot(offset, lens.right)) < lens.eyepieceRadius * lens.apertureAspect
+        && abs(dot(offset, lens.up)) < lens.eyepieceRadius;
+  }
+  return dot(offset, offset) < lens.eyepieceRadius * lens.eyepieceRadius;
+}
+
+// Returns the slot of the nearest lens in `mask` whose eyepiece the ray passes through, or
+// kCloudLensNone. `slotBase` is 0 for this frame's lenses and CLOUD_MAX_LENSES for the previous ones.
+uint cloudLensFind(uint mask, uint slotBase, vec3 origin, vec3 direction) {
+  uint nearestSlot = kCloudLensNone;
+  float nearestDistance = 3.402823466e+38f;
+  while (mask != 0u) {
+    const uint slot = firstbitlow(mask);
+    mask &= mask - 1u;
+    const CloudLens lens = cloudLens.lenses[slotBase + slot];
+    const float planeDistance = cloudLensEyepieceDistance(lens, origin, direction);
+    if (planeDistance < nearestDistance && cloudLensInsideEyepiece(lens, origin, direction, planeDistance)) {
+      nearestDistance = planeDistance;
+      nearestSlot = slot;
+    }
+  }
+  return nearestSlot;
+}
+
+// Maps an eye-side direction to the magnified direction leaving the objective.
+vec3 cloudLensMagnify(CloudLens lens, vec3 eyeDirection) {
+  const float axial = max(dot(eyeDirection, lens.axis), 1e-6f);
+  const vec3 transverse = eyeDirection - axial * lens.axis;
+  return normalize(lens.axis + transverse / (axial * lens.magnification));
+}
+
+// Maps a direction leaving the objective back to the eye-side direction, the inverse of
+// cloudLensMagnify. Returns false when the direction does not point out of the objective.
+bool cloudLensUnmagnify(CloudLens lens, vec3 objectiveDirection, out vec3 eyeDirection) {
+  const float axial = dot(objectiveDirection, lens.axis);
+  eyeDirection = objectiveDirection;
+  if (axial <= 1e-6f) {
+    return false;
+  }
+  const vec3 transverse = objectiveDirection - axial * lens.axis;
+  eyeDirection = normalize(lens.axis + transverse * (lens.magnification / axial));
+  return true;
+}

@@ -34,6 +34,7 @@ outputs()                    ◀───      textures, samplers, args buffer, 
 - conventions: up axis, units per metre fallback, world origin (float);
 - render extent (the cloud screen pass runs at it);
 - optional: an opaque TLAS, local lights for aerial perspective glow, "host sky override active" (dome light), blue noise, a blended weather snapshot.
+- optional: magnifier lenses in front of the camera (see [Lenses](#lenses)).
 
 The full per-frame contract (call order, when outputs are valid, ownership, barriers, threading) is in the comments of `include/numos/renderer.h` and `include/numos/gpu.h`.
 
@@ -106,6 +107,27 @@ Every crossing, and the side it converts on:
 Not exactly invariant: a few numerical guards are fixed in world units (`1e-4` on a light's
 equivalent radius, `1e-6` / `1e-12` divide guards). They only matter for degenerate inputs (a lamp
 under 0.1 mm at 1 unit per metre).
+
+## Lenses
+
+A host that magnifies part of the screen through a lens, such as a telescopic sight, passes it in `FrameInputs::lenses`: up to
+`kMaxLenses` slots, each with this frame's and the previous frame's geometry. A camera ray that meets the eyepiece plane
+inside the eyepiece (a disc, or a rectangle) leaves the objective with the tangent of its angle to the axis divided by the
+magnification. The screen cloud pass (`cloud_render.comp.slang`, `lib/cloud_lens.slangh`) follows those rays:
+
+- A pixel belongs to the lens its jittered camera ray passes through, the ray the host classified its depth with.
+- Its marches go along the magnified directions. The march keeps the camera position as its origin; the objective is
+  within the length of the sight of it.
+- The host's linear view Z of a lens pixel is its virtual distance times the camera ray's cosine to the forward axis. The
+  virtual distance is the camera ray's distance to the eyepiece plane plus the distance from the objective, so the march
+  ends the eyepiece distance short of it.
+- The history of a lens pixel is reprojected through the previous frame's lens in the same slot: the cloud point's
+  direction from the previous objective, unmagnified, is the direction the previous camera saw it in. It is dropped when
+  the slot has no history (`Lens::historyValid`, a camera cut) or the previous camera ray misses the previous eyepiece.
+  A pixel outside every lens drops the history it would take from inside a previous lens.
+- The cell march and full-rate neighborhoods use only samples from pixels of the same lens, or of none.
+
+Without a lens the pass skips every lens test. The spatial denoise and the aerial perspective do not know about lenses.
 
 ## Ground level
 
