@@ -92,6 +92,7 @@ def generate(spirv_dir):
            '#include "numos/util/camera.h"',
            '#include "numos/lib/generate_mipmap.h"',
            '#include "numos/lib/ground_probe.h"',
+           '#include "numos/lib/cloud_lens.h"',
            '',
            'namespace numos::detail {',
            '']
