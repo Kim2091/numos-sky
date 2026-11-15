@@ -20,6 +20,8 @@ STRUCTS = {
     'AtmosphereArgs': 'cloud_render.comp.spv',
     'MoonParams': 'cloud_render.comp.spv',
     'Camera': 'cloud_render.comp.spv',
+    'CloudLens': 'cloud_render.comp.spv',
+    'CloudLensArgs': 'cloud_render.comp.spv',
     'AerialPerspectiveLight': 'aerial_perspective_light_cull.comp.spv',
     'CloudNvdfJfaArgs': 'cloud_nvdf_jfa.comp.spv',
     'GroundProbeArgs': 'ground_probe.comp.spv',
@@ -90,6 +92,7 @@ def generate(spirv_dir):
            '#include "numos/util/camera.h"',
            '#include "numos/lib/generate_mipmap.h"',
            '#include "numos/lib/ground_probe.h"',
+           '#include "numos/lib/cloud_lens.h"',
            '',
            'namespace numos::detail {',
            '']

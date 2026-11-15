@@ -45,6 +45,13 @@ ConstantBuffer<AtmosphereArgs> atmosphereArgs;
 layout(binding = 17)
 ConstantBuffer<Camera> cloudCamera;
 
+// The magnifier lenses in front of the camera (cloud_lens.h). The lens tests are skipped while
+// lensMask and previousLensMask are 0.
+#include "numos/lib/cloud_lens.h"
+layout(binding = 30)
+ConstantBuffer<CloudLensArgs> cloudLens;
+#include "numos/lib/cloud_lens.slangh"
+
 // Linear repeat sampler for the volume taps, matching the frac() tile wrap. Slot 1 is unused.
 layout(binding = 2)
 SamplerState AtmosphereCloudNoise3DSampler;
@@ -159,19 +166,6 @@ struct CloudPixelResult {
   vec4 color;  // premultiplied cloud rgb, view-ray transmittance
   vec4 depth;  // entry km, transmittance-weighted mean km, surface km, density evaluations
 };
-
-// Slant distance to the primary surface this pixel resolved, or kNoSurfaceKm on a sky miss.
-float cloudSurfaceDistanceKm(uint2 pixelCoord, CameraDirections cloudRay, AtmosphereArgs args) {
-  const float linearViewZ = PrimaryLinearViewZ[pixelCoord];
-  // Sky rays carry NRD's miss sentinel. It arrives through the CB rather than as a literal so it
-  // cannot drift from the value NRD actually uses (this pass has no binding for NRD's own CB).
-  if (linearViewZ >= args.cloudMissLinearViewZ) {
-    return kNoSurfaceKm;
-  }
-  // Linear view Z is measured along the camera forward axis; the march needs slant range.
-  const float cosToForward = max(abs(cloudRay.viewDirection.z), 1e-3f);
-  return numosWorldToKm(abs(linearViewZ) / cosToForward, args);
-}
 
 // jitterIndex: the pixel's own sample count (the frame index at full rate), so a pixel marched every
 // 4th or 16th frame still walks the whole blue-noise sequence.
@@ -325,6 +319,104 @@ CameraDirections cloudPixelRay(uint2 pixelCoord, uint2 outputDim, vec2 offset) {
   return cameraScreenUVToDirection(cloudCamera, (vec2(pixelCoord) + 0.5f + offset) / vec2(outputDim), false);
 }
 
+// A pixel's view ray. Inside a lens it is the magnified ray leaving the objective. The march keeps
+// the camera position as its origin: the objective is within the length of the sight of it, which
+// the cloud's kilometer scale does not resolve.
+struct CloudViewRay {
+  vec3  worldDirection;  // the marched direction
+  float cosToForward;    // the camera ray's cosine to the camera forward axis
+  float eyeDistanceKm;   // inside a lens, the camera ray's distance to the eyepiece plane; else 0
+  float magnification;   // 1 outside every lens
+  uint  lensSlot;        // kCloudLensNone outside every lens
+};
+
+// Returns the slot of the lens the pixel's jittered camera ray passes through, or kCloudLensNone.
+// That is the ray the host classified the pixel and its linear view Z with.
+uint cloudLensSlotAtPixel(uint2 pixelCoord) {
+  if (cloudLens.lensMask == 0u) {
+    return kCloudLensNone;
+  }
+  const vec3 direction = cameraPixelCoordinateToDirection(cloudCamera, ivec2(pixelCoord), true).worldDirection;
+  return cloudLensFind(cloudLens.lensMask, 0u, cameraGetWorldPosition(cloudCamera), direction);
+}
+
+// The view ray along `cameraRay` through the lens in `lensSlot`, or the camera ray itself for
+// kCloudLensNone. The camera ray does not need to pass through the eyepiece, so every sub-pixel ray
+// of a rim pixel goes through the pixel's lens.
+CloudViewRay cloudViewRayFromCamera(CameraDirections cameraRay, uint lensSlot, AtmosphereArgs args) {
+  CloudViewRay ray;
+  ray.worldDirection = cameraRay.worldDirection;
+  ray.cosToForward = max(abs(cameraRay.viewDirection.z), 1e-3f);
+  ray.eyeDistanceKm = 0.0f;
+  ray.magnification = 1.0f;
+  ray.lensSlot = lensSlot;
+  if (lensSlot != kCloudLensNone) {
+    const CloudLens lens = cloudLens.lenses[lensSlot];
+    const float eyeDistance = cloudLensEyepieceDistance(lens, cameraGetWorldPosition(cloudCamera), cameraRay.worldDirection);
+    ray.worldDirection = cloudLensMagnify(lens, cameraRay.worldDirection);
+    ray.eyeDistanceKm = numosWorldToKm(max(eyeDistance, 0.0f), args);
+    ray.magnification = lens.magnification;
+  }
+  return ray;
+}
+
+// The unjittered view ray through `offset` pixels from the center of `pixelCoord`.
+CloudViewRay cloudViewRay(uint2 pixelCoord, uint2 outputDim, vec2 offset, uint lensSlot, AtmosphereArgs args) {
+  return cloudViewRayFromCamera(cloudPixelRay(pixelCoord, outputDim, offset), lensSlot, args);
+}
+
+// Slant distance from the march origin to the primary surface this pixel resolved, or kNoSurfaceKm
+// on a sky miss.
+float cloudSurfaceDistanceKm(uint2 pixelCoord, CloudViewRay ray, AtmosphereArgs args) {
+  const float linearViewZ = PrimaryLinearViewZ[pixelCoord];
+  // Sky rays carry NRD's miss sentinel. It arrives through the CB rather than as a literal so it
+  // cannot drift from the value NRD actually uses (this pass has no binding for NRD's own CB).
+  if (linearViewZ >= args.cloudMissLinearViewZ) {
+    return kNoSurfaceKm;
+  }
+  // Linear view Z is measured along the camera forward axis; the march needs slant range. A lens
+  // pixel's depth is its virtual distance, the eyepiece distance plus the distance from the
+  // objective, so the march ends the eyepiece distance short of it.
+  return max(numosWorldToKm(abs(linearViewZ) / ray.cosToForward, args) - ray.eyeDistanceKm, 0.0f);
+}
+
+// Projects `worldPoint` to the previous frame's screen UV, unjittered: the history holds
+// pixel-centered values (see the rays above). A lens pixel's point is seen through the previous
+// frame's lens in the same slot. Returns false when the projection is invalid, when a lens pixel's
+// lens has no history or the previous camera ray misses its eyepiece, and when a pixel outside every
+// lens was seen through one of the previous lenses.
+bool cloudPreviousScreenUv(CloudViewRay ray, vec3 worldPoint, out vec2 prevUv) {
+  prevUv = vec2(-1.0f);
+  const vec3 previousCameraPosition = cameraGetPreviousWorldPosition(cloudCamera);
+  vec4 prevClip = mul(cloudCamera.prevWorldToProjection, vec4(worldPoint, 1.0f));
+  if (ray.lensSlot != kCloudLensNone) {
+    if (((cloudLens.historyMask >> ray.lensSlot) & 1u) == 0u) {
+      return false;
+    }
+    const CloudLens previousLens = cloudLens.lenses[CLOUD_MAX_LENSES + ray.lensSlot];
+    const vec3 objectiveToPoint = worldPoint - previousLens.objectiveCenter;
+    const float objectiveDistance = length(objectiveToPoint);
+    vec3 eyeDirection;
+    if (!(objectiveDistance > 0.0f)
+        || !cloudLensUnmagnify(previousLens, objectiveToPoint / objectiveDistance, eyeDirection)
+        || !cloudLensInsideEyepiece(previousLens, previousCameraPosition, eyeDirection,
+                                    cloudLensEyepieceDistance(previousLens, previousCameraPosition, eyeDirection))) {
+      return false;
+    }
+    // The previous eye-side direction projects to the pixel the previous camera saw the point at.
+    prevClip = mul(cloudCamera.prevWorldToProjection, vec4(eyeDirection, 0.0f));
+  } else if (cloudLens.previousLensMask != 0u
+             && cloudLensFind(cloudLens.previousLensMask, CLOUD_MAX_LENSES, previousCameraPosition,
+                              normalize(worldPoint - previousCameraPosition)) != kCloudLensNone) {
+    return false;
+  }
+  if (!all(isfinite(prevClip)) || prevClip.w <= 1e-6f) {
+    return false;
+  }
+  prevUv = cameraNDCToScreenUV(cloudCamera, prevClip.xy / prevClip.w);
+  return true;
+}
+
 // Largest local rate of change, per pixel, of last frame's output around `texel`: relative for the
 // radiance, absolute for the transmittance.
 float cloudHistoryGradient(int2 texel, int2 maxTexel) {
@@ -347,10 +439,10 @@ struct CloudHistory {
   float lagCapFrames;  // in-cloud motion ambiguity: the longest history, in frames, worth keeping
 };
 
-// The reprojected history of `pixelCoord`, whose centre ray is `worldDir`, false when there is none.
+// The reprojected history of `pixelCoord`, whose center ray is `ray`, false when there is none.
 // layer2Share: layer 2's share of this pixel's cloud (g_cloudLayer2Share), whose base may follow the
 // camera (args.cloudLayer2FollowStepKm): that share moved with the camera, not with the world.
-bool cloudTemporalHistory(uint2 pixelCoord, uint2 outputDim, vec3 worldDir, vec4 freshDepth,
+bool cloudTemporalHistory(uint2 pixelCoord, uint2 outputDim, CloudViewRay ray, vec4 freshDepth,
                           float tSurfaceKm, vec4 freshColor, float freshFlash, float layer2Share,
                           AtmosphereArgs args, out CloudHistory h) {
   h.color = vec4(0.0f, 0.0f, 0.0f, 1.0f);
@@ -363,7 +455,7 @@ bool cloudTemporalHistory(uint2 pixelCoord, uint2 outputDim, vec3 worldDir, vec4
   const float volumetric = hasCloud
     ? saturate((freshDepth.y - max(freshDepth.x, 0.0f)) / max(freshDepth.y, 1e-3f)) : 0.0f;
   const float distKm = hasCloud ? max(freshDepth.y, 1e-3f) : min(tSurfaceKm, kCloudTemporalFarKm);
-  vec3 worldPoint = cameraGetWorldPosition(cloudCamera) + worldDir * numosKmToWorld(distKm, args);
+  vec3 worldPoint = cameraGetWorldPosition(cloudCamera) + ray.worldDirection * numosKmToWorld(distKm, args);
   if (hasCloud) {
     // The wind carried that cloud here; last frame it sat one wind step back.
     worldPoint -= numosKmYUpToWorld(vec3(args.cloudWindStepXKm, 0.0f, args.cloudWindStepZKm), args);
@@ -372,22 +464,16 @@ bool cloudTemporalHistory(uint2 pixelCoord, uint2 outputDim, vec3 worldDir, vec4
       worldPoint -= numosKmYUpToWorld(vec3(0.0f, args.cloudLayer2FollowStepKm * layer2Share, 0.0f), args);
     }
   }
-  // Unjittered: the history holds pixel-centred values (see the rays above).
-  const vec4 prevClip = mul(cloudCamera.prevWorldToProjection, vec4(worldPoint, 1.0f));
-  if (!all(isfinite(prevClip)) || prevClip.w <= 1e-6f) {
-    return false;
-  }
-  const vec2 prevUv = cameraNDCToScreenUV(cloudCamera, prevClip.xy / prevClip.w);
-  if (any(prevUv < vec2(0.0f)) || any(prevUv >= vec2(1.0f))) {
+  vec2 prevUv;
+  if (!cloudPreviousScreenUv(ray, worldPoint, prevUv) || any(prevUv < vec2(0.0f)) || any(prevUv >= vec2(1.0f))) {
     return false;
   }
   float ambiguityPx = 0.0f;
   if (hasCloud) {
     const vec3 farPoint = cameraGetWorldPosition(cloudCamera)
-                        + worldDir * numosKmToWorld(kCloudTemporalFarKm, args);
-    const vec4 farClip = mul(cloudCamera.prevWorldToProjection, vec4(farPoint, 1.0f));
-    if (all(isfinite(farClip)) && farClip.w > 1e-6f) {
-      const vec2 farUv = cameraNDCToScreenUV(cloudCamera, farClip.xy / farClip.w);
+                        + ray.worldDirection * numosKmToWorld(kCloudTemporalFarKm, args);
+    vec2 farUv;
+    if (cloudPreviousScreenUv(ray, farPoint, farUv)) {
       ambiguityPx = max(length((prevUv - farUv) * vec2(outputDim)) * volumetric
                         - kCloudTemporalAmbiguityFloorPixels, 0.0f);
     }
@@ -395,7 +481,8 @@ bool cloudTemporalHistory(uint2 pixelCoord, uint2 outputDim, vec3 worldDir, vec4
   const float prevDistKm = numosWorldToKm(length(worldPoint - cameraGetPreviousWorldPosition(cloudCamera)), args);
   const float moveKm = numosWorldToKm(length(cameraGetWorldPosition(cloudCamera)
                                              - cameraGetPreviousWorldPosition(cloudCamera)), args);
-  const float pixelRad = 2.0f / max(abs(cloudCamera.viewToProjection[1][1]) * float(outputDim.y), 1e-6f);
+  // A lens divides the angle a pixel spans by its magnification.
+  const float pixelRad = 2.0f / max(abs(cloudCamera.viewToProjection[1][1]) * float(outputDim.y) * ray.magnification, 1e-6f);
   const bool currentIsSky = tSurfaceKm >= kNoSurfaceKm;
 
   vec2 texelF = prevUv * vec2(outputDim) - 0.5f;
@@ -668,9 +755,10 @@ struct CloudResolved {
 
 // A pixel's output from its neighbourhood and its history. `spacing`: the sample lattice's (1 at full
 // rate). `marchSamples`: the density evaluation count for depth.w. A pixel no sample sees (a
-// silhouette) is marched by the caller and its march added to nb.
+// silhouette) is marched by the caller and its march added to nb. `lensSlot`: the pixel's lens.
 CloudResolved cloudResolvePixel(uint2 pixelCoord, uint2 outputDim, float tSurfaceKm, CloudNeighbourhood nb,
-                                float spacing, float marchSamples, CloudShadeContext ctx, AtmosphereArgs args) {
+                                float spacing, float marchSamples, uint lensSlot, CloudShadeContext ctx,
+                                AtmosphereArgs args) {
   const bool hasInterp = nb.interpWeight > 1e-4f;
   const vec4 wideColor = nb.wideWeight > 1e-4f ? nb.wide / nb.wideWeight : nb.interp / nb.interpWeight;
   const vec4 interpColor = hasInterp ? nb.interp / nb.interpWeight : wideColor;
@@ -688,7 +776,7 @@ CloudResolved cloudResolvePixel(uint2 pixelCoord, uint2 outputDim, float tSurfac
   const bool filterOn = args.cloudTemporalHistoryWeight > 0.0f;
   const bool historyValid = filterOn && (args.cloudScreenInterleave & 0x20000u) != 0u;
   CloudHistory h;
-  if (historyValid && cloudTemporalHistory(pixelCoord, outputDim, cloudPixelRay(pixelCoord, outputDim, vec2(0.0f)).worldDirection,
+  if (historyValid && cloudTemporalHistory(pixelCoord, outputDim, cloudViewRay(pixelCoord, outputDim, vec2(0.0f), lensSlot, args),
                                            r.depth, tSurfaceKm, interpColor, flash, layer2, args, h)) {
     // Effective samples a frame while resampling: the pixel's own march once per cell area, the
     // interpolated value on the other frames.
@@ -881,6 +969,7 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
         continue;
       }
       const uint2 pixelCoord = uint2(q);
+      const uint lensSlot = cloudLensSlotAtPixel(pixelCoord);
       // The march cell this pixel belongs to (the rebuild pass's lane covers one pixel).
       const int2 qCell = cellRebuild ? q / cellSize : cell;
       // The fresh march, and at full rate the resolve, see the pixel through its jittered ray; the
@@ -890,7 +979,7 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
       bool march = freshInBounds;
       if (step != 0u) {
         if (!fullRate) {
-          tSurfaceKm = cloudSurfaceDistanceKm(pixelCoord, cloudPixelRay(pixelCoord, outputDim, vec2(0.0f)), args);
+          tSurfaceKm = cloudSurfaceDistanceKm(pixelCoord, cloudViewRay(pixelCoord, outputDim, vec2(0.0f), lensSlot, args), args);
         }
         [unroll]
         for (int dy = -1; dy <= 1; ++dy) {
@@ -918,6 +1007,10 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
             if (d.w < 0.0f || !cloudSameSurface(tSurfaceKm, v, d, args)) {
               continue;
             }
+            // A sample seen through another lens, or through none, shows another part of the sky.
+            if (cloudLens.lensMask != 0u && cloudLensSlotAtPixel(uint2(c * cellSize + phase)) != lensSlot) {
+              continue;
+            }
             a = cellRebuild ? cloudFreshAux[uint2(c)] : vec2(gs_cloudFreshFlash[g.y][g.x], gs_cloudFreshLayer2[g.y][g.x]);
             cloudNeighbourhoodAdd(nb, v, d, a.x, a.y, vec2(c * cellSize + phase - q), float(cellSize));
           }
@@ -930,7 +1023,8 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
       if (march) {
         // The fresh march walks the pixel's own sample sequence; a silhouette march, the frame's.
         const uint marchIndex = step == 0u ? ownIndex : args.cloudRenderFrameIdx;
-        const CameraDirections cloudRay = cloudPixelRay(pixelCoord, outputDim, cloudSubpixelOffset(pixelCoord, marchIndex));
+        const CloudViewRay cloudRay = cloudViewRay(pixelCoord, outputDim, cloudSubpixelOffset(pixelCoord, marchIndex),
+                                                   lensSlot, args);
         if (step == 0u) {
           tSurfaceKm = cloudSurfaceDistanceKm(pixelCoord, cloudRay, args);
         }
@@ -963,7 +1057,7 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
         marchSamples = marched.depth.w;
       }
       const CloudResolved r = cloudResolvePixel(pixelCoord, outputDim, tSurfaceKm, nb, float(cellSize),
-                                                marchSamples, ctx, args);
+                                                marchSamples, lensSlot, ctx, args);
       cloudRenderOutput[pixelCoord] = r.color;
       cloudDepthOutput[pixelCoord] = r.depth;
       cloudStateOutput[pixelCoord] = r.state;
@@ -982,7 +1076,8 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
       continue;
     }
     const vec2 uv = (vec2(pixelCoord) + 0.5f) / vec2(outputDim);
-    const CameraDirections cloudRay = cameraScreenUVToDirection(cloudCamera, uv, true);
+    const CloudViewRay cloudRay = cloudViewRayFromCamera(cameraScreenUVToDirection(cloudCamera, uv, true),
+                                                         cloudLensSlotAtPixel(pixelCoord), args);
     const float tSurfaceKm = cloudSurfaceDistanceKm(pixelCoord, cloudRay, args);
     CloudPixelResult result;
     const vec3 viewDirYUp = worldToAtmosphereYUp(
