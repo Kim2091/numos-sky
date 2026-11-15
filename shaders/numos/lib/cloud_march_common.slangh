@@ -73,6 +73,10 @@ struct CloudShadeContext {
   vec3  planetCenterWorldKm; // getCloudPlanetCenterWorldKm(args): world-anchored. Height fractions,
                              // which travel with the world-anchored density fields.
   float planetRadiusKm;      // args.planetRadius. The atmosphere's radius, not a cloud-only one.
+  // The ground below the clouds (the ambient term's light from below).
+  vec3  groundSun;           // evalCloudSunRadiance at the camera
+  vec2  deckKeep;            // cloudDeckLightKeep
+  float groundShadow;        // evalCloudGroundShadow toward the sun
 
   // ---- Ray-constant (cloudShadeContextBeginRay) ----
   float sunCosTheta;         // dot(viewDirYUp, sunDirYUp)
@@ -764,12 +768,11 @@ NubisCubedLighting evalNubisCubedSampleCore(
   const float tDown = 1.0f / (1.0f + kDiffusion * tauBelow);
   const float tSun  = 1.0f / (1.0f + kDiffusion * tauSunward);
   const float tAnti = 1.0f / (1.0f + kDiffusion * tauAntiSunward);
-  const vec3 groundSun = evalCloudSunRadiance(args.cameraWorldPosYUpKm, ctx, args);
   // Under a closed deck the ground and the haze see the sky and the sun only through the deck
-  // (cloudDeckLightKeep; (1, 0) for broken cloud).
-  const vec2 deckKeep = cloudDeckLightKeep(args);
+  // (ctx.deckKeep, cloudDeckLightKeep; (1, 0) for broken cloud).
+  const vec2 deckKeep = ctx.deckKeep;
   const vec3 ground = args.groundAlbedo
-                    * (groundSun * (saturate(ctx.sunDirYUp.y) * (evalCloudGroundShadow(ctx.sunDirYUp, args) + deckKeep.y) / kPi)
+                    * (ctx.groundSun * (saturate(ctx.sunDirYUp.y) * (ctx.groundShadow + deckKeep.y) / kPi)
                        + ctx.skyRadianceDown * deckKeep.x);
   const float kAirLight = 0.1f;  // the lit haze between the ground and the cloud base
   const vec3 below = ground + kAirLight * 0.5f * deckKeep.x * (ctx.skyHorizonSunward + ctx.skyHorizonAntiSunward);
@@ -876,6 +879,12 @@ CloudShadeContext buildCloudShadeContextFromRing(AtmosphereArgs args, vec3 ringD
   ctx.planetCenterKm      = getCloudPlanetCenter(args);
   ctx.planetCenterWorldKm = getCloudPlanetCenterWorldKm(args);
   ctx.planetRadiusKm      = args.planetRadius;
+
+  // The ground's light, the same for every sample of the frame. evalCloudSunRadiance reads only the
+  // frame-constant fields set above.
+  ctx.groundSun    = evalCloudSunRadiance(args.cameraWorldPosYUpKm, ctx, args);
+  ctx.deckKeep     = cloudDeckLightKeep(args);
+  ctx.groundShadow = evalCloudGroundShadow(ctx.sunDirYUp, args);
 
   // Ray-constant fields stay zeroed until cloudShadeContextBeginRay runs.
   ctx.sunCosTheta  = 0.0f;
@@ -1132,7 +1141,15 @@ bool integrateCloudSample(float tSampleKm,
   vec3  airT;
   const vec3 airLight      = cloudAerialPerspective(tSampleKm, ctx, args, airT);
   float sampleWeight       = viewTransmittance * dot(airT, vec3(1.0f / 3.0f)) * (1.0f - stepTransmittance);
-  bool  refineLighting     = sampleWeight >= args.cloudLightingLodThreshold;
+  // With the lighting LOD by distance (screen pass bit 25) the threshold grows past
+  // kCloudLightingLodNearKm, to (1 + kCloudLightingLodFarGain) times at kCloudLightingLodFarKm and
+  // beyond, so far cloud reuses its light more often. Near cloud is unchanged.
+  float lodThreshold = args.cloudLightingLodThreshold;
+  if ((args.cloudScreenInterleave & 0x2000000u) != 0u) {
+    lodThreshold *= 1.0f + kCloudLightingLodFarGain
+                         * saturate((tSampleKm - kCloudLightingLodNearKm) / (kCloudLightingLodFarKm - kCloudLightingLodNearKm));
+  }
+  bool  refineLighting     = sampleWeight >= lodThreshold;
 
   vec3 surfaceLight;
   if (refineLighting || !g_cloudHasLight) {
@@ -1406,6 +1423,14 @@ static const float kNoSurfaceKm = 1e9f;
 // depth of an interior step, 15-20% of the pass, to refine pixels that are already opaque by at
 // most 1% of the background.
 static const float kCloudExitTransmittance = 0.01f;
+// The lighting LOD by distance (cloudLightingLodByDistance): its threshold's growth with distance.
+static const float kCloudLightingLodNearKm = 20.0f;
+static const float kCloudLightingLodFarKm = 60.0f;
+static const float kCloudLightingLodFarGain = 3.0f;
+// The early exit (screen pass bit 24, cloudMarchEarlyExit): a thick core stops at 3% transmittance.
+static const float kCloudEarlyExitTransmittance = 0.03f;
+// The ray's exit threshold, set by marchCloudLayers from the flags.
+static float g_cloudExitTransmittance = kCloudExitTransmittance;
 
 // Density evaluation counter, a per-thread static so counting needs no signature changes. The
 // screen pass zeroes it before marchCloudLayers and writes the total into the depth companion's .w
@@ -1590,7 +1615,7 @@ void marchCloudSlab(vec3   viewDirYUp,
       if (i >= effSampleCount) {
         break;
       }
-      if (viewTransmittance < kCloudExitTransmittance) {
+      if (viewTransmittance < g_cloudExitTransmittance) {
         cloudNoteExit(tEntry + stepLen * float(i));  // the start of the segment not marched
         break;
       }
@@ -1599,7 +1624,7 @@ void marchCloudSlab(vec3   viewDirYUp,
       segKm = stepLen;
     } else if (kind == kStepAdaptive) {
       bool more = i < iterCap && t < tExit;
-      if (more && viewTransmittance < kCloudExitTransmittance) {  // transmittance-limit exit (p.174)
+      if (more && viewTransmittance < g_cloudExitTransmittance) {  // transmittance-limit exit (p.174)
         cloudNoteExit(t);
         more = false;
       }
@@ -1642,10 +1667,10 @@ void marchCloudSlab(vec3   viewDirYUp,
         segKm = stepKm;
       } else {
         // The adaptive march is over: the tail, if the budget ran out short of the exit.
-        if (t < tExit && viewTransmittance <= kCloudExitTransmittance) {
+        if (t < tExit && viewTransmittance <= g_cloudExitTransmittance) {
           cloudNoteExit(t);  // opaque when the budget ran out: the tail is skipped
         }
-        if (!(t < tExit && viewTransmittance > kCloudExitTransmittance)) {
+        if (!(t < tExit && viewTransmittance > g_cloudExitTransmittance)) {
           break;
         }
         tailStepKm = (tExit - t) / float(kTailSamples);
@@ -1660,7 +1685,7 @@ void marchCloudSlab(vec3   viewDirYUp,
       if (i >= kTailSamples) {
         break;
       }
-      if (viewTransmittance < kCloudExitTransmittance) {
+      if (viewTransmittance < g_cloudExitTransmittance) {
         cloudNoteExit(t + float(i) * tailStepKm);
         break;
       }
@@ -1856,9 +1881,13 @@ void marchCloudLayers(vec3  viewDirYUp,
                       // cloud_render.comp.slang consumes these; the dome LUT passes throwaways.
                       out float entryDistanceKm,
                       out float meanCloudDepthKm) {
-  // Per-ray shading precompute, shared by every crossing.
-  ctx = cloudShadeContextBeginRay(ctx, viewDirYUp, args);
-
+  // The transmittance at which the ray stops (cloudMarchEarlyExit, screen pass bit 24) and the
+  // matching rescale of the result below. The transmittance's rescale spells out each branch's
+  // constants, so each folds exactly as a single fixed threshold does.
+  const bool earlyExit = (args.cloudScreenInterleave & 0x1000000u) != 0u;
+  g_cloudExitTransmittance = earlyExit ? kCloudEarlyExitTransmittance : kCloudExitTransmittance;
+  const float exitRescale = earlyExit ? 1.0f / (1.0f - kCloudEarlyExitTransmittance)
+                                      : 1.0f / (1.0f - kCloudExitTransmittance);
   entryDistanceKm = -1.0f;
   float sumWeightedDistKm = 0.0f;
   float sumWeight = 0.0f;
@@ -1893,10 +1922,41 @@ void marchCloudLayers(vec3  viewDirYUp,
     }
   }
 
+  // A ray whose crossings all lie outside [tMinClamp, tMaxClamp] (a surface in front of the cloud,
+  // or no crossing at all) meets no cloud: it skips the per-ray precompute and the march, and ends
+  // with the same exit rescale as a marched ray that found nothing.
+  bool anyCrossingLeft = false;
+  for (uint c = 0u; c < crossingCount; ++c) {
+    float tEntry, tExit;
+    anyCrossingLeft = anyCrossingLeft
+                   || cloudCrossingSpan(viewDirYUp, slabs[crossing[c] >> 1u], int(crossing[c] & 1u), tMinClamp,
+                                        tMaxClamp, ctx, tEntry, tExit);
+  }
+  if (!anyCrossingLeft) {
+    g_cloudAirAccum = vec3(0.0f);
+#if CLOUD_MARCH_LIGHTNING
+    g_cloudFlashAccum = 0.0f;
+#endif
+    g_cloudHasLight = false;
+    const vec3 emptyAureole = cloudAureoleRadiance(viewDirYUp, viewTransmittance, accumColor, pixelJitter, tMinClamp,
+                                                   tMaxClamp, slabs, crossing, crossingCount, ctx, args);
+    accumColor *= exitRescale;
+    viewTransmittance = earlyExit
+      ? max(0.0f, (viewTransmittance - kCloudEarlyExitTransmittance) * (1.0f / (1.0f - kCloudEarlyExitTransmittance)))
+      : max(0.0f, (viewTransmittance - kCloudExitTransmittance) * (1.0f / (1.0f - kCloudExitTransmittance)));
+    accumColor += emptyAureole;
+    meanCloudDepthKm = 0.0f;
+    g_cloudLayer2Share = 0.0f;
+    return;
+  }
+
+  // Per-ray shading precompute, shared by every crossing.
+  ctx = cloudShadeContextBeginRay(ctx, viewDirYUp, args);
+
   uint lastLayer = 0u;
   for (uint c = 0u; c < crossingCount; ++c) {
     g_cloudCurrentCrossing = c;
-    if (viewTransmittance < kCloudExitTransmittance) {
+    if (viewTransmittance < g_cloudExitTransmittance) {
       cloudNoteExit(crossingEntry[c]);  // the crossings from here on were not marched
       break;
     }
@@ -1916,7 +1976,7 @@ void marchCloudLayers(vec3  viewDirYUp,
   // Transmittance is reported on the scale whose zero is the march's exit threshold (see
   // kCloudExitTransmittance):
   //
-  //   T' = max(0, (T - e) / (1 - e)),   C' = C / (1 - e),   e = kCloudExitTransmittance
+  //   T' = max(0, (T - e) / (1 - e)),   C' = C / (1 - e),   e = g_cloudExitTransmittance
   //
   // Every ray that stopped on the transmittance limit was below e, so it lands at exactly 0 and no
   // background reaches a pixel the march called opaque. Every other ray moves continuously (T' is
@@ -1939,12 +1999,13 @@ void marchCloudLayers(vec3  viewDirYUp,
   // rescale below, which is for the sharp disk and the background only.
   const vec3 aureole = cloudAureoleRadiance(viewDirYUp, viewTransmittance, accumColor, pixelJitter, tMinClamp,
                                             tMaxClamp, slabs, crossing, crossingCount, ctx, args);
-  const float kExitRescale = 1.0f / (1.0f - kCloudExitTransmittance);
-  accumColor        *= kExitRescale;
+  accumColor        *= exitRescale;
 #if CLOUD_MARCH_LIGHTNING
-  g_cloudFlashAccum *= kExitRescale;
+  g_cloudFlashAccum *= exitRescale;
 #endif
-  viewTransmittance  = max(0.0f, (viewTransmittance - kCloudExitTransmittance) * kExitRescale);
+  viewTransmittance  = earlyExit
+    ? max(0.0f, (viewTransmittance - kCloudEarlyExitTransmittance) * (1.0f / (1.0f - kCloudEarlyExitTransmittance)))
+    : max(0.0f, (viewTransmittance - kCloudExitTransmittance) * (1.0f / (1.0f - kCloudExitTransmittance)));
   accumColor        += aureole;
 
   // Finalize the depth companion now that both layers have contributed. sumWeight stays ~0 only

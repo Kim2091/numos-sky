@@ -6,7 +6,38 @@
 //!> CLOUD_SUN_BEER_MAP=1
 //!variant cloud_render_reference.comp
 //!> CLOUD_REFERENCE_PATH_TRACE=1
+//!variant cloud_render_march.comp
+//!> CLOUD_SCREEN_MARCH_ONLY=1
+//!variant cloud_render_march_fast.comp
+//!> CLOUD_SCREEN_MARCH_ONLY=1 CLOUD_SUN_BEER_MAP=1
+//!variant cloud_render_march_full.comp
+//!> CLOUD_SCREEN_MARCH_ONLY=1 CLOUD_FRESH_FULL_PRECISION=1
+//!variant cloud_render_march_full_fast.comp
+//!> CLOUD_SCREEN_MARCH_ONLY=1 CLOUD_FRESH_FULL_PRECISION=1 CLOUD_SUN_BEER_MAP=1
+//!variant cloud_render_rebuild.comp
+//!> CLOUD_SCREEN_REBUILD=1
+//!variant cloud_render_rebuild_full.comp
+//!> CLOUD_SCREEN_REBUILD=1 CLOUD_FRESH_FULL_PRECISION=1
+//!variant cloud_render_fallback.comp
+//!> CLOUD_SCREEN_FALLBACK=1
+//!variant cloud_render_fallback_fast.comp
+//!> CLOUD_SCREEN_FALLBACK=1 CLOUD_SUN_BEER_MAP=1
 //!end-variants
+
+// Pass roles of the cell schedules (see main): the march pass, the rebuild pass, the fallback pass,
+// and the full-precision fresh samples of the split quarter march.
+#ifndef CLOUD_SCREEN_MARCH_ONLY
+#define CLOUD_SCREEN_MARCH_ONLY 0
+#endif
+#ifndef CLOUD_SCREEN_REBUILD
+#define CLOUD_SCREEN_REBUILD 0
+#endif
+#ifndef CLOUD_SCREEN_FALLBACK
+#define CLOUD_SCREEN_FALLBACK 0
+#endif
+#ifndef CLOUD_FRESH_FULL_PRECISION
+#define CLOUD_FRESH_FULL_PRECISION 0
+#endif
 
 // Cloud render pass (Nubis Cubed, Schneider 2023).
 //
@@ -116,18 +147,38 @@ layout(binding = 19)
 Texture2D<float4> PrevCloudDepth;
 
 // Cell march fresh samples, one texel per cell: written by the march pass, read by the rebuild pass.
+// The sixteenth march and the split quarter march store color and aux at half precision. The split
+// quarter march's schedules 2 and 3 (CLOUD_FRESH_FULL_PRECISION) store them at full precision, as the
+// one-pass quarter march holds them in groupshared memory.
+#if CLOUD_FRESH_FULL_PRECISION
+layout(binding = 25, rgba32f)
+RWTexture2D<float4> cloudFreshColor;
+#else
 layout(binding = 25, rgba16f)
 RWTexture2D<float4> cloudFreshColor;
+#endif
 layout(binding = 26, rgba32f)
 RWTexture2D<float4> cloudFreshDepth;
+#if CLOUD_FRESH_FULL_PRECISION
+layout(binding = 27, rg32f)
+RWTexture2D<float2> cloudFreshAux;  // x: the flash's share (g_cloudFlashAccum), y: layer 2's share
+#else
 layout(binding = 27, rg16f)
 RWTexture2D<float2> cloudFreshAux;  // x: the flash's share (g_cloudFlashAccum), y: layer 2's share
+#endif
 // The temporal filter's per-pixel state (docs/cloud-temporal-filter.md): .x history length in
-// samples, .y / .z the fast history's luminance and transmittance.
+// samples, .y / .z the fast history's luminance and transmittance. .w is 1 on a pixel left empty
+// with no cloud in its fresh neighbourhood while the empty-pixel skip is on, else 0; between the
+// rebuild and the fallback pass it is 2 on the pixels the fallback pass marches.
 layout(binding = 28, rgba16f)
 RWTexture2D<float4> cloudStateOutput;
 layout(binding = 29)
 Texture2D<float4> PrevCloudState;
+// Whether a 16x16-pixel tile has a pixel for the fallback pass (state .w = 2): written by the rebuild
+// pass, one texel per rebuild group, read by the fallback pass.
+static const int kCloudFallbackTilePixels = 16;
+layout(binding = 31, r32ui)
+RWTexture2D<uint> cloudFallbackTiles;
 
 // Last frame's radiance in this frame's pre-exposure (args.radianceScaleHistoryRatio is exactly 1
 // except on the frame the scale steps); the transmittance is unitless.
@@ -263,6 +314,9 @@ static const float kCloudTemporalChangeOpacity = 0.01f;    // ... and this trans
 static const float kCloudTemporalFillSamples = 4.0f;       // below this length the wide fill blends in
 static const float kCloudTemporalShortSamples = 8.0f;      // the spatial denoise works below this length
 static const float kCloudTemporalMaxSamples = 1024.0f;
+// The empty-pixel skip takes a sample or a pixel with no cloud entry and at least this
+// transmittance as empty.
+static const float kCloudEmptyTransmittance = 0.999f;
 // An interpolated value's weight (against an own march's 1) while the history is being resampled. In a
 // still view it is 0, so each pixel converges to its own marches; a reset history takes it at full
 // weight until the pixel has a sample's worth.
@@ -755,10 +809,10 @@ struct CloudResolved {
 
 // A pixel's output from its neighbourhood and its history. `spacing`: the sample lattice's (1 at full
 // rate). `marchSamples`: the density evaluation count for depth.w. A pixel no sample sees (a
-// silhouette) is marched by the caller and its march added to nb. `lensSlot`: the pixel's lens.
+// silhouette) is marched by the caller and its march added to nb. `centerRay`: the ray through the
+// pixel's centre (cloudViewRay with no offset, through the pixel's lens).
 CloudResolved cloudResolvePixel(uint2 pixelCoord, uint2 outputDim, float tSurfaceKm, CloudNeighbourhood nb,
-                                float spacing, float marchSamples, uint lensSlot, CloudShadeContext ctx,
-                                AtmosphereArgs args) {
+                                float spacing, float marchSamples, CloudViewRay centerRay, AtmosphereArgs args) {
   const bool hasInterp = nb.interpWeight > 1e-4f;
   const vec4 wideColor = nb.wideWeight > 1e-4f ? nb.wide / nb.wideWeight : nb.interp / nb.interpWeight;
   const vec4 interpColor = hasInterp ? nb.interp / nb.interpWeight : wideColor;
@@ -776,7 +830,7 @@ CloudResolved cloudResolvePixel(uint2 pixelCoord, uint2 outputDim, float tSurfac
   const bool filterOn = args.cloudTemporalHistoryWeight > 0.0f;
   const bool historyValid = filterOn && (args.cloudScreenInterleave & 0x20000u) != 0u;
   CloudHistory h;
-  if (historyValid && cloudTemporalHistory(pixelCoord, outputDim, cloudViewRay(pixelCoord, outputDim, vec2(0.0f), lensSlot, args),
+  if (historyValid && cloudTemporalHistory(pixelCoord, outputDim, centerRay,
                                            r.depth, tSurfaceKm, interpColor, flash, layer2, args, h)) {
     // Effective samples a frame while resampling: the pixel's own march once per cell area, the
     // interpolated value on the other frames.
@@ -849,6 +903,114 @@ CloudResolved cloudResolvePixel(uint2 pixelCoord, uint2 outputDim, float tSurfac
   return r;
 }
 
+#if CLOUD_SCREEN_REBUILD
+// The rebuild pass's lane resolves a 2x2 pixel block, so a group covers 16x16 pixels. Its cells and a
+// one-cell apron are loaded once into groupshared memory: up to 10x10 cells of 2x2 pixels, 6x6 of
+// 4x4. Every pixel of a cell gathers the same nine cells.
+static const int kCloudRebuildBlock = 2;
+static const int kCloudRebuildGroupPixels = CLOUD_GROUP_X * kCloudRebuildBlock;  // kCloudFallbackTilePixels
+static const int kCloudRebuildRegion = kCloudRebuildGroupPixels / 2 + 2;
+groupshared vec4 gs_rebuildColor[kCloudRebuildRegion][kCloudRebuildRegion];
+groupshared vec4 gs_rebuildDepth[kCloudRebuildRegion][kCloudRebuildRegion];
+groupshared vec2 gs_rebuildAux[kCloudRebuildRegion][kCloudRebuildRegion];
+groupshared uint gs_rebuildAnyMark;
+#endif
+
+#if CLOUD_SCREEN_MARCH_ONLY
+// The march pass of the cell schedules (CLOUD_SCREEN_MARCH_ONLY), one lane per cell: marches the
+// cell's pixel for this frame into the fresh-sample textures. It holds none of the rebuild's gather
+// and resolve, so nothing of theirs stays live across the march.
+void cloudCellMarchPass(uint3 dispatchId, uint2 outputDim, CloudShadeContext ctx, AtmosphereArgs args) {
+  const bool sixteenth = (args.cloudScreenInterleave & 0x80000u) != 0u;
+  const int cellSize = sixteenth ? 4 : 2;
+  const int2 phase = int2(sixteenth ? cloudSixteenthPhase(args.cloudRenderFrameIdx)
+                                    : cloudQuarterPhase(args.cloudRenderFrameIdx));
+  // A pixel's own marches are its cell's every 4th (16th) frame: this is the pixel's own count.
+  const uint ownIndex = args.cloudRenderFrameIdx >> (sixteenth ? 4u : 2u);
+  const int2 cellsDim = (int2(outputDim) + int2(cellSize - 1)) / cellSize;
+  const int2 cell = int2(dispatchId.xy);
+  if (any(cell >= cellsDim)) {
+    return;
+  }
+  const int2 freshPixel = cell * cellSize + phase;
+  CloudPixelResult fresh;
+  fresh.color = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+  fresh.depth = vec4(-1.0f, 0.0f, kNoSurfaceKm, -1.0f);  // w < 0: no sample
+  float freshFlash = 0.0f;
+  float freshLayer2 = 0.0f;
+  if (all(freshPixel < int2(outputDim))) {
+    // The fresh march sees the pixel through its own sub-pixel offset and walks its own sample
+    // sequence.
+    const uint2 pixelCoord = uint2(freshPixel);
+    const uint lensSlot = cloudLensSlotAtPixel(pixelCoord);
+    const CloudViewRay cloudRay = cloudViewRay(pixelCoord, outputDim, cloudSubpixelOffset(pixelCoord, ownIndex),
+                                               lensSlot, args);
+    const float tSurfaceKm = cloudSurfaceDistanceKm(pixelCoord, cloudRay, args);
+    const vec3 viewDirYUp = worldToAtmosphereYUp(cloudRay.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0);
+    fresh = marchCloudPixel(pixelCoord, viewDirYUp, tSurfaceKm, ownIndex, ctx, args);
+    freshFlash = g_cloudFlashAccum;
+    freshLayer2 = g_cloudLayer2Share;
+  }
+  cloudFreshColor[uint2(cell)] = fresh.color;
+  cloudFreshDepth[uint2(cell)] = fresh.depth;
+  cloudFreshAux[uint2(cell)] = vec2(freshFlash, freshLayer2);
+}
+#endif
+
+#if CLOUD_SCREEN_FALLBACK
+// The fallback pass of the cell schedules (CLOUD_SCREEN_FALLBACK), one lane per pixel, after the
+// rebuild pass. The rebuild pass holds no march: it marks a pixel no fresh sample sees (a silhouette)
+// with state .w = 2, and this pass marches and resolves it. Such a pixel's neighborhood is its own
+// march alone, so the result is the one a march inside the rebuild would give. A group without a
+// marked pixel exits after reading the rebuild's tile flag or the state, so only the few groups
+// that march pay for the march's registers.
+groupshared uint gs_cloudFallbackAny;
+
+void cloudFallbackPass(uint3 dispatchId, uint3 groupThreadId, uint2 outputDim, AtmosphereArgs args) {
+  // A group in a tile the rebuild marked nothing in exits after one read, the same for every lane.
+  if (cloudFallbackTiles[(dispatchId.xy - groupThreadId.xy) / uint(kCloudFallbackTilePixels)] == 0u) {
+    return;
+  }
+  const uint lane = groupThreadId.y * CLOUD_GROUP_X + groupThreadId.x;
+  const uint2 pixelCoord = dispatchId.xy;
+  const bool marked = all(pixelCoord < outputDim) && cloudStateOutput[pixelCoord].w > 1.5f;
+  if (lane == 0u) {
+    gs_cloudFallbackAny = 0u;
+  }
+  GroupMemoryBarrierWithGroupSync();
+  if (marked) {
+    InterlockedOr(gs_cloudFallbackAny, 1u);
+  }
+  GroupMemoryBarrierWithGroupSync();
+  if (gs_cloudFallbackAny == 0u) {
+    return;
+  }
+  // The sky ring is sampled once per group (buildCloudShadeContextGroup); every lane gets here.
+  CloudShadeContext ctx = buildCloudShadeContextGroup(args, lane);
+  if (!marked) {
+    return;
+  }
+  const int cellSize = (args.cloudScreenInterleave & 0x80000u) != 0u ? 4 : 2;
+  const uint lensSlot = cloudLensSlotAtPixel(pixelCoord);
+  const CloudViewRay centerRay = cloudViewRay(pixelCoord, outputDim, vec2(0.0f), lensSlot, args);
+  const float tSurfaceKm = cloudSurfaceDistanceKm(pixelCoord, centerRay, args);
+  // A silhouette march walks the frame's sample sequence.
+  const uint marchIndex = args.cloudRenderFrameIdx;
+  const CloudViewRay cloudRay = cloudViewRay(pixelCoord, outputDim, cloudSubpixelOffset(pixelCoord, marchIndex),
+                                             lensSlot, args);
+  const vec3 viewDirYUp = worldToAtmosphereYUp(cloudRay.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0);
+  const CloudPixelResult marched = marchCloudPixel(pixelCoord, viewDirYUp, tSurfaceKm, marchIndex, ctx, args);
+  CloudNeighbourhood nb = cloudNeighbourhoodEmpty();
+  cloudNeighbourhoodAdd(nb, marched.color, marched.depth, g_cloudFlashAccum, g_cloudLayer2Share, vec2(0.0f),
+                        float(cellSize));
+  const CloudResolved r = cloudResolvePixel(pixelCoord, outputDim, tSurfaceKm, nb, float(cellSize),
+                                            marched.depth.w, centerRay, args);
+  cloudRenderOutput[pixelCoord] = r.color;
+  cloudDepthOutput[pixelCoord] = r.depth;
+  cloudStateOutput[pixelCoord] = r.state;
+}
+#endif
+
 [shader("compute")]
 [numthreads(CLOUD_GROUP_X, CLOUD_GROUP_Y, 1)]
 void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_GroupThreadID) {
@@ -856,6 +1018,11 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
   cloudRenderOutput.GetDimensions(outputDim.x, outputDim.y);
 
   AtmosphereArgs args = atmosphereArgs;
+
+#if CLOUD_SCREEN_FALLBACK
+  cloudFallbackPass(dispatchId, groupThreadId, outputDim, args);
+  return;
+#endif
 
   const uint period = 1u;
   const uint2 cellDim = uint2(1u, 1u);
@@ -892,19 +1059,30 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
   // (cloud_march_common.slangh) ends these rays on the planet instead, so the deck stops at the
   // horizon on its own.
 
+#if !CLOUD_SCREEN_REBUILD
   // The sky ring is sampled once per group (buildCloudShadeContextGroup); every lane gets here.
   CloudShadeContext ctx = buildCloudShadeContextGroup(args, groupThreadId.y * CLOUD_GROUP_X + groupThreadId.x);
+#endif
+
+#if CLOUD_SCREEN_MARCH_ONLY
+  cloudCellMarchPass(dispatchId, outputDim, ctx, args);
+  return;
+#endif
 
 #ifdef CLOUD_TEMPORAL_FILTER
   if (period == 1u) {
     // Three schedules share this code:
-    //   * Cell march (bits 18 and 19 both set): cells of 2x2 pixels (quarter march) or 4x4
-    //     (sixteenth march, bit 19), in two dispatches. The march pass (one lane per cell) marches one
-    //     pixel of every cell, cycling through all of them, into the fresh-sample buffers; the rebuild
-    //     pass (bit 20, one lane per pixel) rebuilds every pixel from the fresh samples of the cells
-    //     around it plus the temporal history. Two passes let each pixel see cells outside its
-    //     workgroup; in one pass every group would rebuild its tile alone and the tiles would show as
-    //     blocks.
+    //   * Cell march (bit 18 with bit 19 or bit 21): cells of 4x4 pixels (sixteenth march, bit 19) or
+    //     2x2 (split quarter march, bit 21), in three passes. The march pass (CLOUD_SCREEN_MARCH_ONLY,
+    //     cloudCellMarchPass, one lane per cell) marches one pixel of every cell, cycling through all of
+    //     them, into the fresh-sample buffers. The rebuild pass (CLOUD_SCREEN_REBUILD, one lane per 2x2
+    //     pixels) rebuilds every pixel from the fresh samples of the cells around it plus the temporal history, and
+    //     marks the pixels no fresh sample sees. It holds no march, so the march's registers do not
+    //     limit its occupancy. The fallback pass (CLOUD_SCREEN_FALLBACK) marches the marked pixels.
+    //     Separate passes let each pixel see cells outside its workgroup; in one pass every group
+    //     would rebuild its tile alone and the tiles would show as blocks. The split quarter march
+    //     gathers across tiles, except in its exact mode (bit 23), which keeps to its pixel's
+    //     tile of the one-pass quarter schedule and gives that schedule's image.
     //   * Quarter march (bit 18 alone): one 2x2 cell per lane, its group grid shifted every frame
     //     like the full-rate path.
     //   * Full rate: one pixel per lane. The 3x3 neighbourhood stops at the group edge, so the group
@@ -914,11 +1092,16 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
     // lane reaches their barrier, in bounds or not.
     //
     // Step 0 is the lane's fresh march (not in the rebuild pass); steps 1 to subCount resolve the
-    // rebuild pass's pixel, the quarter cell's four pixels or the full-rate pixel, marching a pixel
+    // rebuild pass's 2x2 pixels, the quarter cell's four pixels or the full-rate pixel, marching a pixel
     // no fresh sample sees (a silhouette). Every march goes through the one marchCloudPixel call in
     // the loop, so the shader holds a single copy of the march.
-    const bool cellSchedule = (args.cloudScreenInterleave & 0xC0000u) == 0xC0000u;
-    const bool cellRebuild = cellSchedule && (args.cloudScreenInterleave & 0x100000u) != 0u;
+    const bool cellSchedule = (args.cloudScreenInterleave & 0x40000u) != 0u
+                           && (args.cloudScreenInterleave & 0x280000u) != 0u;
+#if CLOUD_SCREEN_REBUILD
+    const bool cellRebuild = true;
+#else
+    const bool cellRebuild = false;
+#endif
     const bool quarter = !cellSchedule && (args.cloudScreenInterleave & 0x40000u) != 0u;
     const bool fullRate = !cellSchedule && !quarter;
     const bool sixteenth = cellSchedule && (args.cloudScreenInterleave & 0x80000u) != 0u;
@@ -946,7 +1129,28 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
     float freshFlash = 0.0f;
     float freshLayer2 = 0.0f;
 
-    const uint subCount = quarter ? 4u : 1u;
+#if CLOUD_SCREEN_REBUILD
+    // The group's cells and their apron into groupshared memory. A cell outside the image keeps no
+    // value: the gather tests the bounds before it reads.
+    const int2 regionOrigin = (int2(dispatchId.xy) - int2(groupThreadId.xy)) * kCloudRebuildBlock / cellSize - 1;
+    const int regionSize = kCloudRebuildGroupPixels / cellSize + 2;
+    if (all(groupThreadId.xy == uint2(0u))) {
+      gs_rebuildAnyMark = 0u;
+    }
+    for (int i = int(groupThreadId.y * CLOUD_GROUP_X + groupThreadId.x); i < regionSize * regionSize;
+         i += CLOUD_GROUP_X * CLOUD_GROUP_Y) {
+      const int2 r = int2(i % regionSize, i / regionSize);
+      const int2 c = regionOrigin + r;
+      if (all(c >= int2(0)) && all(c < cellsDim)) {
+        gs_rebuildColor[r.y][r.x] = cloudFreshColor[uint2(c)];
+        gs_rebuildDepth[r.y][r.x] = cloudFreshDepth[uint2(c)];
+        gs_rebuildAux[r.y][r.x] = cloudFreshAux[uint2(c)];
+      }
+    }
+    GroupMemoryBarrierWithGroupSync();
+#endif
+
+    const uint subCount = quarter || cellRebuild ? 4u : 1u;
     for (uint step = cellRebuild ? 1u : 0u; step <= subCount; ++step) {
       if (step == 1u && !cellSchedule) {
         gs_cloudFresh[groupThreadId.y][groupThreadId.x] = fresh.color;
@@ -959,34 +1163,38 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
         }
       }
       const uint sub = step - 1u;
+      const int2 subOffset = int2(int(sub & 1u), int(sub >> 1u));
       const int2 q = step == 0u ? freshPixel
-                   : (cellRebuild ? int2(dispatchId.xy)
-                                  : (quarter ? cell * 2 + int2(int(sub & 1u), int(sub >> 1u)) : freshPixel));
+                   : (cellRebuild ? int2(dispatchId.xy) * 2 + subOffset
+                                  : (quarter ? cell * 2 + subOffset : freshPixel));
       if (step != 0u && any(q >= int2(outputDim))) {
-        if (cellRebuild) {
-          return;
-        }
         continue;
       }
       const uint2 pixelCoord = uint2(q);
       const uint lensSlot = cloudLensSlotAtPixel(pixelCoord);
-      // The march cell this pixel belongs to (the rebuild pass's lane covers one pixel).
+      // The march cell this pixel belongs to (a rebuild lane's 2x2 pixels share one).
       const int2 qCell = cellRebuild ? q / cellSize : cell;
       // The fresh march, and at full rate the resolve, see the pixel through its jittered ray; the
       // cell schedules resolve every pixel of a cell through its centre.
       float tSurfaceKm = freshSurfaceKm;
       CloudNeighbourhood nb = cloudNeighbourhoodEmpty();
       bool march = freshInBounds;
+      // Whether every fresh sample in reach found no cloud (for the empty-pixel skip below).
+      bool freshEmpty = true;
+      // The ray through the pixel's centre: the cell schedules' surface distance and the resolve's
+      // history reprojection.
+      CloudViewRay centerRay;
       if (step != 0u) {
+        centerRay = cloudViewRay(pixelCoord, outputDim, vec2(0.0f), lensSlot, args);
         if (!fullRate) {
-          tSurfaceKm = cloudSurfaceDistanceKm(pixelCoord, cloudViewRay(pixelCoord, outputDim, vec2(0.0f), lensSlot, args), args);
+          tSurfaceKm = cloudSurfaceDistanceKm(pixelCoord, centerRay, args);
         }
         [unroll]
         for (int dy = -1; dy <= 1; ++dy) {
           [unroll]
           for (int dx = -1; dx <= 1; ++dx) {
-            // The rebuild pass reads every cell's fresh sample from the fresh-sample buffers; the
-            // others read their group's from groupshared memory.
+            // The rebuild pass reads the cells from its group's region, the others their group's
+            // fresh samples, both in groupshared memory.
             const int2 c = qCell + int2(dx, dy);
             const int2 g = int2(groupThreadId.xy) + int2(dx, dy);
             vec4 d, v;
@@ -995,8 +1203,17 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
               if (any(c < int2(0)) || any(c >= cellsDim)) {
                 continue;
               }
-              d = cloudFreshDepth[uint2(c)];
-              v = cloudFreshColor[uint2(c)];
+              // The split quarter march's exact mode (bit 23) keeps to the one-pass quarter
+              // schedule's shifted group tiles, so it gives that schedule's image.
+              if ((args.cloudScreenInterleave & 0x800000u) != 0u && any((c + tileShift) / int2(CLOUD_GROUP_X, CLOUD_GROUP_Y)
+                                    != (qCell + tileShift) / int2(CLOUD_GROUP_X, CLOUD_GROUP_Y))) {
+                continue;
+              }
+#if CLOUD_SCREEN_REBUILD
+              const int2 r = c - regionOrigin;
+              d = gs_rebuildDepth[r.y][r.x];
+              v = gs_rebuildColor[r.y][r.x];
+#endif
             } else {
               if (any(g < int2(0)) || g.x >= CLOUD_GROUP_X || g.y >= CLOUD_GROUP_Y) {
                 continue;
@@ -1004,14 +1221,22 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
               d = gs_cloudFreshDepth[g.y][g.x];
               v = gs_cloudFresh[g.y][g.x];
             }
-            if (d.w < 0.0f || !cloudSameSurface(tSurfaceKm, v, d, args)) {
+            if (d.w < 0.0f) {
+              continue;
+            }
+            freshEmpty = freshEmpty && d.x < 0.0f && v.a >= kCloudEmptyTransmittance;
+            if (!cloudSameSurface(tSurfaceKm, v, d, args)) {
               continue;
             }
             // A sample seen through another lens, or through none, shows another part of the sky.
             if (cloudLens.lensMask != 0u && cloudLensSlotAtPixel(uint2(c * cellSize + phase)) != lensSlot) {
               continue;
             }
-            a = cellRebuild ? cloudFreshAux[uint2(c)] : vec2(gs_cloudFreshFlash[g.y][g.x], gs_cloudFreshLayer2[g.y][g.x]);
+#if CLOUD_SCREEN_REBUILD
+            a = gs_rebuildAux[c.y - regionOrigin.y][c.x - regionOrigin.x];
+#else
+            a = vec2(gs_cloudFreshFlash[g.y][g.x], gs_cloudFreshLayer2[g.y][g.x]);
+#endif
             cloudNeighbourhoodAdd(nb, v, d, a.x, a.y, vec2(c * cellSize + phase - q), float(cellSize));
           }
         }
@@ -1019,6 +1244,15 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
         march = nb.interpWeight <= 1e-4f && nb.wideWeight <= 1e-4f;
       }
 
+#if CLOUD_SCREEN_REBUILD
+      // The rebuild pass holds no march: the fallback pass marches and resolves this pixel.
+      if (march) {
+        cloudStateOutput[pixelCoord] = vec4(0.0f, 0.0f, 0.0f, 2.0f);
+        InterlockedOr(gs_rebuildAnyMark, 1u);
+        continue;
+      }
+      CloudPixelResult marched;
+#else
       CloudPixelResult marched;
       if (march) {
         // The fresh march walks the pixel's own sample sequence; a silhouette march, the frame's.
@@ -1031,6 +1265,7 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
         const vec3 viewDirYUp = worldToAtmosphereYUp(cloudRay.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0);
         marched = marchCloudPixel(pixelCoord, viewDirYUp, tSurfaceKm, marchIndex, ctx, args);
       }
+#endif
 
       if (step == 0u) {
         if (march) {
@@ -1049,23 +1284,56 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
       }
 
       // .w: the density evaluations of this cell's march, or of the silhouette march.
-      float marchSamples = cellRebuild ? cloudFreshDepth[uint2(qCell)].w
-                         : gs_cloudFreshDepth[groupThreadId.y][groupThreadId.x].w;
+#if CLOUD_SCREEN_REBUILD
+      float marchSamples = gs_rebuildDepth[qCell.y - regionOrigin.y][qCell.x - regionOrigin.x].w;
+#else
+      float marchSamples = gs_cloudFreshDepth[groupThreadId.y][groupThreadId.x].w;
+#endif
+      // Empty-pixel skip (screen pass bit 22). It is decided from this frame's fresh samples first:
+      // where none in reach met cloud, one fetch of the texel's last state tells whether last frame
+      // left it empty with an empty fresh neighbourhood too (state .w = 1). Then the pixel is written
+      // empty without the history reprojection and the resolve.
+      const bool emptySkip = (args.cloudScreenInterleave & 0x400000u) != 0u;
+      if (emptySkip && !march && freshEmpty && args.cloudTemporalHistoryWeight > 0.0f
+          && (args.cloudScreenInterleave & 0x20000u) != 0u) {
+        const vec4 prevState = PrevCloudState.Load(int3(q, 0));
+        if (prevState.w == 1.0f) {
+          // The history length carries over. An empty pixel has nothing to denoise, so depth.w carries
+          // no short-history share and the spatial denoise's group early-out holds.
+          cloudRenderOutput[pixelCoord] = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+          cloudDepthOutput[pixelCoord] = vec4(-1.0f, 0.0f, tSurfaceKm, floor(max(marchSamples, 0.0f)));
+          cloudStateOutput[pixelCoord] = vec4(prevState.x, 0.0f, 1.0f, 1.0f);
+          continue;
+        }
+      }
       if (march) {
         cloudNeighbourhoodAdd(nb, marched.color, marched.depth, g_cloudFlashAccum, g_cloudLayer2Share, vec2(0.0f),
                               float(cellSize));
         marchSamples = marched.depth.w;
       }
-      const CloudResolved r = cloudResolvePixel(pixelCoord, outputDim, tSurfaceKm, nb, float(cellSize),
-                                                marchSamples, lensSlot, ctx, args);
+      CloudResolved r = cloudResolvePixel(pixelCoord, outputDim, tSurfaceKm, nb, float(cellSize),
+                                          marchSamples, centerRay, args);
+      // The empty-pixel skip's flag for the next frame: an empty pixel with an empty fresh
+      // neighbourhood.
+      if (emptySkip && freshEmpty && r.depth.x < 0.0f && r.color.a >= kCloudEmptyTransmittance
+          && r.state.z >= kCloudEmptyTransmittance) {
+        r.state.w = 1.0f;
+      }
       cloudRenderOutput[pixelCoord] = r.color;
       cloudDepthOutput[pixelCoord] = r.depth;
       cloudStateOutput[pixelCoord] = r.state;
     }
+#if CLOUD_SCREEN_REBUILD
+    // Every lane of a rebuild group gets here: its pixels either resolve or continue.
+    GroupMemoryBarrierWithGroupSync();
+    if (all(groupThreadId.xy == uint2(0u))) {
+      cloudFallbackTiles[(dispatchId.xy - groupThreadId.xy) * uint(kCloudRebuildBlock) / uint(kCloudFallbackTilePixels)] = gs_rebuildAnyMark;
+    }
+#endif
     return;
   }
-#endif
-
+#else
+  // Without the temporal filter (the reference path tracer) every pixel is marched on its own.
   if (!cellInBounds) {
     return;
   }
@@ -1086,4 +1354,5 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
     cloudRenderOutput[pixelCoord] = result.color;
     cloudDepthOutput[pixelCoord] = result.depth;
   }
+#endif
 }

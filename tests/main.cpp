@@ -42,7 +42,7 @@ using namespace numos;
 
 static void testInfos() {
   const auto& infos = settingInfos();
-  CHECK(infos.size() == 199 + 7 * kMaxMoons);
+  CHECK(infos.size() == 204 + 7 * kMaxMoons);
   CHECK(findSetting("rtx.atmosphere.sunSize") != nullptr);
   CHECK(findSetting("rtx.atmosphere.moon3.rotation") != nullptr);
   CHECK(findSetting("rtx.atmosphere.nope") == nullptr);
@@ -302,7 +302,7 @@ static void testMigration() {
 }
 
 static void testPasses() {
-  CHECK(passCount() == 26);
+  CHECK(passCount() == 34);
   const PassInfo& p = passInfo(PassId::transmittance_lut);
   CHECK(std::string(p.name) == "transmittance_lut");
   CHECK(p.localSize[0] == 16 && p.localSize[1] == 16);

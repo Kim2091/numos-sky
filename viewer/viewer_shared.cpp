@@ -112,6 +112,12 @@ Options parse(int argc, char** argv) {
     else if (a == "--print-seed") o.printSeed = true;
     else if (a == "--sequence-every") o.sequenceEvery = std::max(1u, uint32_t(std::stoul(next())));
     else if (a == "--interactive") o.interactive = true;
+    else if (a == "--lens") {
+      const std::string v = next();
+      if (std::sscanf(v.c_str(), "%f,%f", &o.lensMagnification, &o.lensRadius) < 1 || !(o.lensMagnification > 0.0f)) {
+        throw std::runtime_error("--lens wants MAG[,RADIUS]");
+      }
+    }
     else if (a == "--lightning-pos") {
       float v[3] = {};
       if (std::sscanf(next().c_str(), "%f,%f,%f", &v[0], &v[1], &v[2]) != 3) {

@@ -65,6 +65,8 @@ struct Options {
   std::vector<uint32_t> lightningAt;  // --lightning-at f: force a strike at frame f (automatic strikes off)
   bool lightningAtPosition = false;   // --lightning-pos x,y,z: ... there (metres, render space)
   Vector3 lightningPosition;
+  float lensMagnification = 0.0f;  // --lens MAG[,RADIUS]: a magnifier on the view axis (0 = none)
+  float lensRadius = 0.1f;         // its eyepiece radius in metres, 0.5 m in front of the eye
   std::string sequenceDir;     // --sequence-dir: also write frames there (fNNNNN.ppm), for demo videos
   uint32_t sequenceEvery = 1;  // --sequence-every n: every nth frame
   std::string seed;            // --seed: replaces --conf and the sun options
