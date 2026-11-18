@@ -335,6 +335,16 @@ NUMOS_SETTING(int32_t, cloudTemporalStillSamples, 64, "rtx.atmosphere.cloudTempo
   "How many frames each cloud pixel averages while the view and the clouds are still. Higher values give calmer still images but take longer to settle after a change the filter does not detect.")
 NUMOS_SETTING(int32_t, cloudMarchRate, 0, "rtx.atmosphere.cloudMarchRate", 0, 3, 0,
   "How many cloud pixels are marched each frame. The others are rebuilt from neighbouring samples and the cloud filter's history.\n0: Auto, chosen from the render and output resolution: quarter rate at native resolution and mild upscaling with at least 720 render lines, full rate otherwise.\n1: Full, every pixel every frame.\n2: Quarter, one pixel of each 2x2 block per frame, for a quarter of the cost. A still view looks the same as at full rate.\n3: Sixteenth, one pixel of each 4x4 block per frame, for a sixteenth of the cost. Noisy and soft in motion.\nThe quarter and sixteenth rates need Cloud Temporal History Weight above 0.")
+NUMOS_SETTING(int32_t, cloudQuarterMarchSchedule, 2, "rtx.atmosphere.cloudQuarterMarchSchedule", 0, 3, 0,
+  "How the GPU runs the quarter-rate cloud march. It has no effect at other march rates.\n0: One pass.\n1: Split: three passes (the march, a rebuild of every pixel, and a march of the few pixels at object edges that no sample covers), reading neighboring samples across the passes' tiles. The image is very close to One pass.\n2: Split, exact (default): the split passes arranged to give exactly the One pass image.\n3: Split with full-precision samples, for diagnosing the difference between 1 and 2.")
+NUMOS_SETTING(bool, cloudEmptyPixelSkip, true, "rtx.atmosphere.cloudEmptyPixelSkip", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
+  "Skips the cloud filter's work on pixels with no cloud this frame or last frame, such as clear sky and terrain under the deck. The only visible change is that a pixel a cloud has just left clears up to a frame sooner. Turn it off to compare.")
+NUMOS_SETTING(bool, cloudMarchEarlyExit, false, "rtx.atmosphere.cloudMarchEarlyExit", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
+  "Stops each cloud ray once 3% of the light behind the cloud still gets through, instead of 1%, so thick cloud cores cost fewer steps. The result is rescaled so an opaque core stays opaque.")
+NUMOS_SETTING(bool, cloudLightingLodByDistance, true, "rtx.atmosphere.cloudLightingLodByDistance", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
+  "Raises Cloud Lighting LOD Threshold with distance: unchanged within 20 km, four times the threshold from 60 km. Far clouds reuse their lighting more often, which saves GPU time; their billows can look slightly softer.")
+NUMOS_SETTING(float, cloudMarchRayBudgetMillions, 0.0f, "rtx.atmosphere.cloudMarchRayBudgetMillions", 0.0f, NUMOS_NO_MAX, 0,
+  "With Cloud March Rate on Auto, the most cloud rays a frame may march, in millions. Past it Auto marches a sparser pattern (a quarter, then a sixteenth of the pixels), so high render resolutions cost no more than this. Sparser patterns are noisier in motion. 0 turns the budget off.")
 NUMOS_SETTING(bool, cloudQuarterMarch, true, "rtx.atmosphere.cloudQuarterMarch", NUMOS_NO_MIN, NUMOS_NO_MAX, NUMOS_SETTING_NO_SAVE,
   "Deprecated: replaced by rtx.atmosphere.cloudMarchRate (2 = Quarter, 1 = Full, 0 = Auto). An existing value is migrated automatically. Save the config again to stop the notice.")
 NUMOS_SETTING(bool, cloudSixteenthMarch, false, "rtx.atmosphere.cloudSixteenthMarch", NUMOS_NO_MIN, NUMOS_NO_MAX, NUMOS_SETTING_NO_SAVE,
@@ -355,8 +365,8 @@ NUMOS_SETTING(int32_t, cloudPerformancePreset, 0, "rtx.atmosphere.cloudPerforman
   "A switch for cloud shortcuts that are faster but look slightly different.\n0: Quality.\n1: Performance. Each cloud sample takes its sun shadow from a simpler shadow map. Fine billow detail is softer, and billow tops look slightly brighter when the sun is low.\nThe cloud march rate is set separately by Cloud March Rate.")
 NUMOS_SETTING(int32_t, cloudSecondaryLutInterleaveMode, 2, "rtx.atmosphere.cloudSecondaryLutInterleaveMode", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "How much of the cloud reflection dome is updated each frame. The rest is at most a few frames old. The whole dome is still rebuilt when the clouds change noticeably or the camera cuts.\n0: All of it every frame.\n1: Half.\n2: A quarter.")
-NUMOS_SETTING(int32_t, cloudDetailLodMode, 0, "rtx.atmosphere.cloudDetailLodMode", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "Blurs cloud detail by sample spacing in the cloud march and the reflection dome. It changes cloud shapes as well as fine texture.\n0: Off, the native look.\n1: Off, the same as 0.\n2: Always on.")
+NUMOS_SETTING(int32_t, cloudDetailLodMode, 2, "rtx.atmosphere.cloudDetailLodMode", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
+  "Reads coarser levels of the cloud detail volume where the march's steps are long, which is cheaper on the GPU. With the default bias only long steps, far from the camera, read a coarser level, and the image barely changes.\n0: Off, full detail at every step.\n1: Off, the same as 0.\n2: On, by step length (default).")
 NUMOS_SETTING(float, cloudDetailLodBias, -3.0f, "rtx.atmosphere.cloudDetailLodBias", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "The blur bias used while Cloud Detail LOD Mode is on. Negative values keep more detail, positive values blur further. It has no effect while the mode is off.")
 NUMOS_SETTING(float, cloudVoxelGridRebakeGranularityKm, 0.1f, "rtx.atmosphere.cloudVoxelGridRebakeGranularityKm", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,

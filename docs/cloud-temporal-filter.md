@@ -140,15 +140,64 @@ filter's own fast-history length.
 The host reports the output size in `FrameInputs::outputWidth / outputHeight` (0 = no upscaling). Remix passes
 its final output extent.
 
+**Ray budget** (`rtx.atmosphere.cloudMarchRayBudgetMillions`, default 0 = off). With Auto, a march whose
+rays (render pixels / k^2) exceed the budget takes the next sparser stride, past the motion and
+magnification tests, so the cost stops growing with the render resolution. At 2560x1600 a budget of
+0.6M turns the quarter march into the sixteenth, which smears cloud edges in fast flight; that is
+why it is off by default.
+
 **Switching.** A DLSS mode change changes the render resolution, which reallocates the cloud targets and starts
 a fresh history (the history is per render pixel; there is nothing valid to keep). A rate change at the same
 resolution (an option change) keeps the history: the resolve handles any lattice spacing, and N counts samples,
 not frames, so it stays meaningful; only the cap's conversion (samples per frame) changes with the stride.
 
+## Pass structure of the sparse marches
+
+The march holds most of the pass's registers, so any kernel that contains it runs at the march's low
+occupancy, even on lanes that never march. The sparse schedules therefore keep the march out of the
+kernel that rebuilds every pixel:
+
+- **Sixteenth march**, three dispatches:
+  1. march pass (`cloud_render_march`, one lane per 4x4 cell, only the march compiled in): marches one pixel per cell into the
+     fresh-sample textures (bindings 25 to 27, RGBA16F / RGBA32F / RG16F, one texel per cell);
+  2. rebuild pass (`cloud_render_rebuild`, one lane per pixel, no march): gathers the 3x3 cells' fresh
+     samples and resolves against the history. A pixel no fresh sample sees (a silhouette) is marked
+     with state `.w = 1` instead;
+  3. fallback pass (`cloud_render_fallback`, one lane per pixel): a group whose 16x16-pixel tile the
+     rebuild marked nothing in exits after one read of the tile flags (binding 31, R32Uint, written once
+     per rebuild group); a group with no marked pixel of its own exits after reading the state; marked pixels are marched and resolved, and their state `.w` is reset
+     to 0. A marked pixel's neighborhood is its own march alone, so the result equals a march inside
+     the rebuild.
+- **Quarter march**, by `rtx.atmosphere.cloudQuarterMarchSchedule`:
+  - 0, one pass (`cloud_render`): one lane per 2x2 cell, the cells shared in groupshared memory, the
+    group grid shifted each frame;
+  - 1, split: the same three passes as the sixteenth march with 2x2 cells and half-precision fresh
+    textures. The rebuild gathers the 3x3 cells around each pixel across group boundaries, so fewer
+    pixels at group corners fall back to their own march;
+  - 2, split exact (default): full-precision fresh textures (`cloud_render_march_full`,
+    `cloud_render_rebuild_full`, matching the groupshared values), and the rebuild gathers only cells
+    from its pixel's tile of the one-pass schedule's shifted group grid. It gives exactly the one-pass
+    image;
+  - 3, diagnostic: schedule 1's cross-tile gather with schedule 2's full-precision textures, to tell
+    the two differences between 1 and 2 apart.
+- **Full rate** marches every pixel in one pass.
+
+The fallback pass gives bit-identical output to a march inside the rebuild. The `_fast` variants of
+the march and fallback passes serve `cloudPerformancePreset` 1.
+
+**Empty-pixel skip** (`rtx.atmosphere.cloudEmptyPixelSkip`, default on). A pixel whose resolve ends
+empty (no cloud entry, transmittance at least 0.999) while every fresh sample in reach was empty is
+flagged in state `.w = 1`. On the next frame, a pixel whose fresh samples are all empty reads its own
+state texel once; if it is flagged, the pass writes the empty constants without the history
+reprojection (12 fetches) and the resolve. The history length carries over, and depth.w carries no
+short-history share (an empty pixel has nothing to denoise), so the spatial denoise's group early-out
+still holds over clear sky. Clear sky and terrain under the deck
+pay only the gather. A cloud that has just left a pixel can clear a frame sooner than through the
+filter.
+
 ## What it costs and what to check in game
 
-- One more RGBA16F pair at the cloud render resolution; per pixel a few more ALU in the resolve. The
-  quarter march still does its four pixels per lane from groupshared memory.
+- One more RGBA16F pair at the cloud render resolution; per pixel a few more ALU in the resolve.
 - In game (not run; no GPU was available when this was written):
   - a still view at sunset on bright rims: should settle within about a second (full rate) or four
     (quarter march, an own sample every 4 frames) and stop shimmering;

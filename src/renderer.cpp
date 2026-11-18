@@ -1135,11 +1135,19 @@ AtmosphereArgs Renderer::Impl::getAtmosphereArgs() const {
     args.cloudRenderRTEnable = m_cloudCompositeActive ? 1u : 0u;
     // Secondary rays read the cloud LUT.
     args.cloudSecondaryLutEnable = m_settings.cloudSecondaryLutEnable ? 1u : 0u;
-    // Screen pass flags: bit 17 temporal history valid, bit 18 cell march (quarter), bit 19 its
-    // cells are 4x4 (sixteenth).
+    // Screen pass flags: bit 17 temporal history valid, bit 18 quarter march or sparser, bit 19 its
+    // cells are 4x4 (sixteenth), bit 21 the quarter march runs in separate passes, bit 22 the
+    // empty-pixel skip, bit 23 the split quarter march keeps to the one-pass tiles (schedule 2),
+    // bit 24 the march's early exit, bit 25 the lighting LOD by distance (both also read by the
+    // reflection dome bake).
     args.cloudScreenInterleave = (m_cloudTemporalHistoryValid ? (1u << 17u) : 0u)
       | (cloudQuarterMarchActive() ? (1u << 18u) : 0u)
-      | (cloudSixteenthMarchActive() ? (1u << 19u) : 0u);
+      | (cloudSixteenthMarchActive() ? (1u << 19u) : 0u)
+      | (cloudQuarterSplitActive() ? (1u << 21u) : 0u)
+      | (cloudQuarterSplitValidation() ? (1u << 23u) : 0u)
+      | (m_settings.cloudEmptyPixelSkip ? (1u << 22u) : 0u)
+      | (m_settings.cloudMarchEarlyExit ? (1u << 24u) : 0u)
+      | (m_settings.cloudLightingLodByDistance ? (1u << 25u) : 0u);
     args.cloudTemporalHistoryWeight = std::min(std::max(m_settings.cloudTemporalHistoryWeight, 0.0f), 0.98f);
     args.cloudTemporalStillSamples = float(std::clamp(m_settings.cloudTemporalStillSamples, 1, 1024));
     args.cloudReprojectDepthTolerance = std::max(m_settings.cloudHistoryDepthTolerance, 0.0f);
@@ -2642,7 +2650,8 @@ void Renderer::Impl::ensureCloudRenderRT(PassRecorder& rec, uint32_t width, uint
   const bool extentsMatch = (m_cloudRenderExtentWidth == width) && (m_cloudRenderExtentHeight == height);
   if (extentsMatch && m_cloudRenderRT.isValid() && m_cloudDepthRT.isValid()
       && m_cloudRenderPrevious.isValid() && m_cloudDepthPrevious.isValid() && m_cloudDenoisedRT.isValid()
-      && m_cloudFreshColor.isValid() && m_cloudStateRT.isValid() && m_cloudStatePrevious.isValid()) {
+      && m_cloudFreshColor.isValid() && m_cloudStateRT.isValid() && m_cloudStatePrevious.isValid()
+      && m_cloudFallbackTiles.isValid()) {
     return;
   }
 
@@ -2665,20 +2674,37 @@ void Renderer::Impl::ensureCloudRenderRT(PassRecorder& rec, uint32_t width, uint
     Format::RGBA16Float, width, height, 1, 1));
   replaceTexture(rec, m_cloudStatePrevious, createTexture(rec, "Atmosphere Cloud Temporal State Previous",
     TextureType::Tex2D, Format::RGBA16Float, width, height, 1, 1));
-  // Sixteenth march fresh samples (cloud_render's march pass -> rebuild pass), one texel per 4x4 cell.
-  const uint32_t cellsW = (width + 3u) / 4u;
-  const uint32_t cellsH = (height + 3u) / 4u;
-  replaceTexture(rec, m_cloudFreshColor, createTexture(rec, "Atmosphere Cloud Fresh Color", TextureType::Tex2D,
-    Format::RGBA16Float, cellsW, cellsH, 1, 1));
-  replaceTexture(rec, m_cloudFreshDepth, createTexture(rec, "Atmosphere Cloud Fresh Depth", TextureType::Tex2D,
-    Format::RGBA32Float, cellsW, cellsH, 1, 1));
-  replaceTexture(rec, m_cloudFreshAux, createTexture(rec, "Atmosphere Cloud Fresh Aux", TextureType::Tex2D,
-    Format::RG16Float, cellsW, cellsH, 1, 1));
+  // The rebuild pass's per-tile flag for the fallback pass: a tile of 16x16 pixels has a pixel to march.
+  replaceTexture(rec, m_cloudFallbackTiles, createTexture(rec, "Atmosphere Cloud Fallback Tiles", TextureType::Tex2D,
+    Format::R32Uint, (width + 15u) / 16u, (height + 15u) / 16u, 1, 1));
 
   m_cloudTemporalHistoryValid = false;
   m_cloudRenderExtentWidth = width;
   m_cloudRenderExtentHeight = height;
+  ensureCloudFreshTextures(rec, m_cloudFreshLayout);
   logInfo(format("[Cloud render] extent=", width, "x", height, " (internal resolution)"));
+}
+
+void Renderer::Impl::ensureCloudFreshTextures(PassRecorder& rec, CloudFreshLayout layout) {
+  const bool fullPrecision = layout == CloudFreshLayout::QuarterFull;
+  const uint32_t cell = layout == CloudFreshLayout::Sixteenth ? 4u : 2u;
+  const uint32_t cellsW = (m_cloudRenderExtentWidth + cell - 1u) / cell;
+  const uint32_t cellsH = (m_cloudRenderExtentHeight + cell - 1u) / cell;
+  if (m_cloudFreshColor.isValid() && m_cloudFreshLayout == layout
+      && m_cloudFreshColor.desc.width == cellsW && m_cloudFreshColor.desc.height == cellsH) {
+    return;
+  }
+  // The cell march's fresh samples (march pass -> rebuild pass), one texel per cell. They live for one
+  // frame, so a new layout keeps the temporal history. The formats match the pass variants'
+  // declarations: half precision for cloud_render_march and cloud_render_rebuild, full precision for
+  // cloud_render_march_full and cloud_render_rebuild_full (quarter schedules 2 and 3).
+  replaceTexture(rec, m_cloudFreshColor, createTexture(rec, "Atmosphere Cloud Fresh Color", TextureType::Tex2D,
+    fullPrecision ? Format::RGBA32Float : Format::RGBA16Float, cellsW, cellsH, 1, 1));
+  replaceTexture(rec, m_cloudFreshDepth, createTexture(rec, "Atmosphere Cloud Fresh Depth", TextureType::Tex2D,
+    Format::RGBA32Float, cellsW, cellsH, 1, 1));
+  replaceTexture(rec, m_cloudFreshAux, createTexture(rec, "Atmosphere Cloud Fresh Aux", TextureType::Tex2D,
+    fullPrecision ? Format::RG32Float : Format::RG16Float, cellsW, cellsH, 1, 1));
+  m_cloudFreshLayout = layout;
 }
 
 void Renderer::Impl::setCloudShadowCameraPosition(const Vector3& cameraWorldPosYUpKm) {
@@ -3190,6 +3216,16 @@ uint32_t Renderer::Impl::cloudMarchStride() const {
       stride = k;
     }
   }
+  // The ray budget (cloudMarchRayBudgetMillions): past it Auto takes the next sparser march whatever
+  // the motion and magnification tests say, so the march's cost stops growing with the render
+  // resolution.
+  const float budget = m_settings.cloudMarchRayBudgetMillions * 1.0e6f;
+  if (budget > 0.0f) {
+    const float pixels = float(m_inputs.renderWidth) * renderHeight;
+    while (stride < 4u && pixels / float(stride * stride) > budget) {
+      stride *= 2u;
+    }
+  }
   return stride;
 }
 
@@ -3243,6 +3279,10 @@ void Renderer::Impl::dispatchCloudRender(PassRecorder& rec, GpuHandle linearView
   std::swap(m_cloudRenderRT, m_cloudRenderPrevious);
   std::swap(m_cloudDepthRT, m_cloudDepthPrevious);
   std::swap(m_cloudStateRT, m_cloudStatePrevious);
+  const bool splitQuarter = cloudQuarterSplitActive();
+  const bool fullPrecision = cloudQuarterSplitFullPrecision();
+  ensureCloudFreshTextures(rec, !splitQuarter ? CloudFreshLayout::Sixteenth
+                              : (fullPrecision ? CloudFreshLayout::QuarterFull : CloudFreshLayout::Quarter));
   AtmosphereArgs args = getCloudArgs();
   traceCloudPlacement(args);
   m_cloudProfileState.samples = args.cloudViewSamples;
@@ -3291,35 +3331,58 @@ void Renderer::Impl::dispatchCloudRender(PassRecorder& rec, GpuHandle linearView
   rec.bindTexture(27, m_cloudFreshAux);
   rec.bindTexture(28, m_cloudStateRT);
   rec.bindTexture(29, m_cloudStatePrevious);
+  rec.bindTexture(31, m_cloudFallbackTiles);
   const CloudLensArgs lensArgs = makeCloudLensArgs(m_inputs);
   rec.bindConstants(30, &lensArgs, sizeof(lensArgs));
 
-  if (m_settings.cloudProfilingMode == 9) {
+  const bool reference = m_settings.cloudProfilingMode == 9;
+  const bool fast = m_settings.cloudPerformancePreset == 1;
+  if (reference) {
     // Reference path tracer (cloud_reference.slangh): ground truth for tuning the march.
     rec.setPass(PassId::cloud_render_reference);
+  } else if (fullPrecision) {
+    rec.setPass(fast ? PassId::cloud_render_march_full_fast : PassId::cloud_render_march_full);
+  } else if (cloudSixteenthMarchActive() || splitQuarter) {
+    rec.setPass(fast ? PassId::cloud_render_march_fast : PassId::cloud_render_march);
   } else {
-    rec.setPass(m_settings.cloudPerformancePreset == 1 ? PassId::cloud_render_fast : PassId::cloud_render);
+    rec.setPass(fast ? PassId::cloud_render_fast : PassId::cloud_render);
   }
 
   const uint32_t groupWidth = 8u;
   const uint32_t groupHeight = 8u;
   const uint32_t width = m_cloudRenderExtentWidth;
   const uint32_t height = m_cloudRenderExtentHeight;
-  if (cloudSixteenthMarchActive()) {
-    // Sixteenth march, two dispatches: the march pass (one lane per 4x4 cell) into the fresh
-    // buffers, then the rebuild pass (one lane per pixel, screen pass bit 20) reads them. The
-    // quarter march keeps one pass with the cells shared in groupshared memory: reading them back
-    // from memory costs 0.2 ms more, while at 4x4 a group's own cells are too few (its tiles show
-    // as 32 px blocks).
-    const uint32_t cell = 4u;
+  if (cloudSixteenthMarchActive() || splitQuarter) {
+    // Cell march in three dispatches: the march pass (one lane per cell) into the fresh buffers, the
+    // rebuild pass (one lane per pixel, no march) from them, and the fallback pass (one lane per
+    // pixel), which marches the pixels the rebuild marked. The sixteenth march always runs this way:
+    // at 4x4 a group's own cells are too few for the one-pass schedule (its tiles show as 32 px
+    // blocks). The quarter march runs this way with cloudQuarterMarchSchedule 1 to 3.
+    const uint32_t cell = splitQuarter ? 2u : 4u;
     const uint32_t cellsW = (width + cell - 1u) / cell;
     const uint32_t cellsH = (height + cell - 1u) / cell;
-    rec.dispatch((cellsW + groupWidth - 1u) / groupWidth, (cellsH + groupHeight - 1u) / groupHeight, 1);
+    // Each pass has its own GPU zone, so the timings show the rebuild apart from the marches.
+    {
+      GpuZone marchZone(rec.gpu(), "Cloud Cell March");
+      rec.dispatch((cellsW + groupWidth - 1u) / groupWidth, (cellsH + groupHeight - 1u) / groupHeight, 1);
+    }
     rec.barrier();
-    AtmosphereArgs rebuildArgs = args;
-    rebuildArgs.cloudScreenInterleave |= 1u << 20u;
-    rec.bindConstants(0, &rebuildArgs, sizeof(AtmosphereArgs));
-    rec.dispatch((width + groupWidth - 1u) / groupWidth, (height + groupHeight - 1u) / groupHeight, 1);
+    if (!reference) {
+      rec.setPass(fullPrecision ? PassId::cloud_render_rebuild_full : PassId::cloud_render_rebuild);
+    }
+    {
+      // A rebuild lane resolves 2x2 pixels; the reference pass keeps one lane per pixel.
+      GpuZone rebuildZone(rec.gpu(), "Cloud Rebuild");
+      const uint32_t block = reference ? 1u : 2u;
+      rec.dispatch((width + block * groupWidth - 1u) / (block * groupWidth),
+                   (height + block * groupHeight - 1u) / (block * groupHeight), 1);
+    }
+    if (!reference) {
+      rec.barrier();
+      rec.setPass(fast ? PassId::cloud_render_fallback_fast : PassId::cloud_render_fallback);
+      GpuZone fallbackZone(rec.gpu(), "Cloud Fallback");
+      rec.dispatch((width + groupWidth - 1u) / groupWidth, (height + groupHeight - 1u) / groupHeight, 1);
+    }
   } else {
     // The quarter march has one lane per 2x2 cell. The pass shifts its group grid each frame for
     // the temporal filter (cloud_render's tileShift), so it needs one more group per axis to keep

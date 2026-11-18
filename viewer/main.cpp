@@ -16,6 +16,7 @@
 //                [--seed NUMOS1-...] (the whole configuration from a seed; --set still applies over it)
 //                [--print-seed]      (print the seed of the configuration, weather and clocks at the end)
 //                [--sun-speed deg/s] (sun elevation changes by this much per second of 60 fps frames)
+//                [--lens MAG[,RADIUS]] (a magnifier on the view axis, eyepiece radius in metres)
 //                [--interactive]     (window, free camera and settings UI; needs NUMOS_BUILD_VIEWER_UI)
 
 #include <algorithm>
@@ -335,6 +336,28 @@ int main(int argc, char** argv) try {
       in.lightningStrike = std::find(opt.lightningAt.begin(), opt.lightningAt.end(), frame) != opt.lightningAt.end();
       in.lightningStrikeAtPosition = opt.lightningAtPosition;
       in.lightningStrikePosition = opt.lightningPosition;
+      if (opt.lensMagnification > 0.0f) {
+        // A circular magnifier on the view axis, like a scope held to the eye: the eyepiece 0.5 m in
+        // front of the eye, the objective 0.3 m beyond it. The viewer's depth does not follow the
+        // lens, so it suits sky views.
+        auto lensAt = [&](const Vector3& e) {
+          LensGeometry g;
+          const Vector3 x = normalize(cross(Vector3(0.0f, 1.0f, 0.0f), forward));
+          g.eyepieceCenter = Vector3(e.x + forward.x * 0.5f, e.y + forward.y * 0.5f, e.z + forward.z * 0.5f);
+          g.eyepieceRadius = opt.lensRadius;
+          g.axis = forward;
+          g.right = x;
+          g.up = cross(forward, x);
+          g.objectiveCenter = Vector3(e.x + forward.x * 0.8f, e.y + forward.y * 0.8f, e.z + forward.z * 0.8f);
+          g.magnification = opt.lensMagnification;
+          return g;
+        };
+        in.lenses[0].active = true;
+        in.lenses[0].previousActive = frame > 1;
+        in.lenses[0].historyValid = frame > 1;
+        in.lenses[0].current = lensAt(eye);
+        in.lenses[0].previous = lensAt(eyeAt(frame > 1 ? frame - 1 : frame));
+      }
       if (opt.sunSpeed != 0.0f) {
         settings.sunElevation = opt.sunElevation + opt.sunSpeed * float(frame - 1) / 60.0f;
         renderer.setSettings(settings);

@@ -196,6 +196,26 @@ struct Renderer::Impl {
   uint32_t cloudMarchStride() const;
   bool cloudQuarterMarchActive() const { return cloudMarchStride() >= 2u; }
   bool cloudSixteenthMarchActive() const { return cloudMarchStride() >= 4u; }
+  // The quarter march in separate march, rebuild and fallback passes (cloudQuarterMarchSchedule 1 to
+  // 3). The reference path tracer keeps the one-pass schedule.
+  bool cloudQuarterSplitActive() const {
+    return cloudMarchStride() == 2u && m_settings.cloudQuarterMarchSchedule != 0 && m_settings.cloudProfilingMode != 9;
+  }
+  // Schedule 2: the one-pass schedule's tiles and full-precision fresh samples (its exact image).
+  bool cloudQuarterSplitValidation() const {
+    return cloudQuarterSplitActive() && m_settings.cloudQuarterMarchSchedule == 2;
+  }
+  // Schedules 2 and 3 keep the fresh samples at full precision.
+  bool cloudQuarterSplitFullPrecision() const {
+    return cloudQuarterSplitActive() && m_settings.cloudQuarterMarchSchedule >= 2;
+  }
+  // The cell march's fresh-sample textures, one texel per cell.
+  enum class CloudFreshLayout : uint8_t {
+    Sixteenth,          // 4x4 cells, half-precision color and aux
+    Quarter,            // 2x2 cells, half precision
+    QuarterFull,        // 2x2 cells, full precision (the one-pass quarter march's groupshared values)
+  };
+  void ensureCloudFreshTextures(PassRecorder& rec, CloudFreshLayout layout);
   void dispatchCloudSampleStatistics(PassRecorder& rec);
   void dispatchCloudSecondaryLut(PassRecorder& rec);
   void generateMipmapGaussian(PassRecorder& rec, const Texture& texture);
@@ -360,6 +380,8 @@ struct Renderer::Impl {
   Texture  m_cloudFreshColor;
   Texture  m_cloudFreshDepth;
   Texture  m_cloudFreshAux;
+  Texture  m_cloudFallbackTiles;  // R32Uint, one texel per 16x16 pixels (cloud_render binding 31)
+  CloudFreshLayout m_cloudFreshLayout = CloudFreshLayout::Sixteenth;  // the layout ensureCloudFreshTextures made
   Texture  m_cloudDenoisedRT;  // cloudSpatialDenoise output; composited instead of m_cloudRenderRT
   bool     m_cloudDenoisedThisFrame = false;
   bool     m_cloudTemporalHistoryValid = false;  // survives lighting re-bakes; not camera cuts
