@@ -199,6 +199,7 @@ namespace {
       m.primeMeridian = vec3(0.0f, 0.0f, 0.0f);
       m.sunlightDirection = vec3(0.0f, 0.0f, 0.0f);
       m.textureLayer = 0.0f;
+      m.discGain = 0.0f;
     }
   }
 
@@ -315,6 +316,7 @@ namespace {
     args.airglowThicknessKm = 0.0f;
     args.zodiacalLightScale = 0.0f;
     args.nightGlowInScatter = vec3(0.0f, 0.0f, 0.0f);
+    args.nightSkyIlluminance = vec3(0.0f, 0.0f, 0.0f);
     args.eclipticPoleLocal = vec3(0.0f, 0.0f, 0.0f);
     args.celestialToLocalX = vec3(0.0f, 0.0f, 0.0f);
     args.celestialToLocalY = vec3(0.0f, 0.0f, 0.0f);
@@ -328,6 +330,14 @@ namespace {
     const Vector3 sun = settings.sunIlluminance * settings.sunIntensity;
     const float sunLuminance = 0.2126f * sun.x + 0.7152f * sun.y + 0.0722f * sun.z;
     return sunLuminance > 0.0f ? kSunLux / sunLuminance : 1.0f;
+  }
+
+  // The sun that lights the night sky (the moons, stars, Milky Way, airglow and zodiacal light): the
+  // default sunIlluminance x sunIntensity, the real sun at the calibration above. The night keeps its
+  // light whatever the sun's settings.
+  Vector3 referenceSunIlluminance() {
+    static const Settings defaults {};
+    return defaults.sunIlluminance * defaults.sunIntensity;
   }
 } // anonymous namespace
 
@@ -407,6 +417,20 @@ namespace {
   float relativeSkyLuminance(float elevationDeg) {
     return elevationDeg >= 0.0f ? 1.0f : std::pow(10.0f, 0.45f * std::max(elevationDeg, -30.0f));
   }
+}
+
+// The reference sun's luminance over this sun's: what turns a night light's fraction of the reference sun
+// (m_moons[i].illuminance, the night glow) into a fraction of this sun, whose daylight the sky levels are
+// relative to. 1 with the default sun.
+float Renderer::Impl::nightSunRatio() const {
+  const Vector3 ref = referenceSunIlluminance();
+  const Vector3 sun = m_settings.sunIlluminance * m_settings.sunIntensity;
+  const float refLuminance = 0.2126f * ref.x + 0.7152f * ref.y + 0.0722f * ref.z;
+  const float sunLuminance = 0.2126f * sun.x + 0.7152f * sun.y + 0.0722f * sun.z;
+  if (sunLuminance == refLuminance) {
+    return 1.0f;
+  }
+  return sunLuminance > 0.0f ? std::min(refLuminance / sunLuminance, 1e30f) : 1e30f;
 }
 
 // The night sky's geometry for this frame (celestial.h): the frame the stars turn with and every
@@ -516,9 +540,10 @@ void Renderer::Impl::updateCelestial() {
   // Moons whose light the sky bake integrates: those not lost under the sun's sky. Daylight is ~1e6
   // brighter than the full moon's sky, below fp16's resolution of it, so it stays bit-identical.
   m_moonSkyLightMask = 0u;
+  const float nightRatio = nightSunRatio();
   for (uint32_t i = 0; i < count; ++i) {
     const Vector3& f = m_moons[i].illuminance;
-    if (0.2126f * f.x + 0.7152f * f.y + 0.0722f * f.z > 1e-4f * relativeSkyLuminance(sunElevationDeg)) {
+    if ((0.2126f * f.x + 0.7152f * f.y + 0.0722f * f.z) * nightRatio > 1e-4f * relativeSkyLuminance(sunElevationDeg)) {
       m_moonSkyLightMask |= 1u << i;
     }
   }
@@ -817,23 +842,36 @@ void Renderer::Impl::updateRadianceScale() {
     float sunElevationDeg, sunAzimuthDeg;
     resolveSunAngles(sunElevationDeg, sunAzimuthDeg);
 
-    // The natural night sky (airglow, zodiacal light, starlight) relative to daylight's.
-    constexpr float kNightSkyRelative = 6e-8f;
+    // The natural night sky (airglow, zodiacal light, starlight) relative to the reference sun's
+    // daylight, and the starlight's share of it: ~80 of the ~390 S10 the sky above averages
+    // (getAtmosphereArgs). The night sky and the moons are lit by the reference sun; nightRatio puts
+    // them relative to this sun's daylight.
     const float twilight = relativeSkyLuminance(sunElevationDeg);
-    float night = kNightSkyRelative;
+    const float nightRatio = nightSunRatio();
+    const float nightSkyRelative = 6e-8f * nightRatio;
+    constexpr float kStarlightShare = 0.2f;
+    float moon = 0.0f;
     for (uint32_t i = 0; i < MAX_MOONS; ++i) {
       const MoonParams& m = m_moons[i];
       if (m.enabled < 0.5f) {
         continue;
       }
       const float fraction = 0.2126f * m.illuminance.x + 0.7152f * m.illuminance.y + 0.0722f * m.illuminance.z;
-      night += fraction
-             * relativeSkyLuminance(std::asin(std::min(std::max(m.direction.y, -1.0f), 1.0f)) / kDegreesToRadians);
+      moon += fraction * nightRatio
+            * relativeSkyLuminance(std::asin(std::min(std::max(m.direction.y, -1.0f), 1.0f)) / kDegreesToRadians);
     }
-    // Night gain (night_gain.h): the natural night light x nightGain, faded in through twilight. Everything
-    // keyed to the sky's level below (this pre-exposure, where a lightning flash ends) sees the gained sky.
-    m_nightGain = nightGainInForce(twilight, night, m_settings.nightGainStops);
-    float relative = twilight + night * m_nightGain;
+    const float night = nightSkyRelative + moon;
+    // Night gain (night_gain.h): the natural night light x the night gains, faded in through twilight.
+    // Everything keyed to the sky's level below (this pre-exposure, where a lightning flash ends) sees the
+    // gained sky: the stars and the moonlight with their own gains, but not the moon discs, which light
+    // nothing.
+    m_nightGains = nightGainsInForce(twilight, night, m_settings.nightGainStops, m_settings.starGainStops,
+                                     m_settings.moonlightGainStops, m_settings.moonDiscGainStops);
+    const bool oneGain = m_nightGains.stars == m_nightGains.night && m_nightGains.moonlight == m_nightGains.night;
+    const float gainedNight = oneGain ? night * m_nightGains.night
+      : nightSkyRelative * ((1.0f - kStarlightShare) * m_nightGains.night + kStarlightShare * m_nightGains.stars)
+        + moon * m_nightGains.moonlight;
+    float relative = twilight + gainedNight;
     m_skyRelativeLuminance = relative;  // also where a lightning flash ends (advanceLightning)
     if (!m_settings.radianceAutoScale) {
       relative = 1.0f;
@@ -969,20 +1007,30 @@ AtmosphereArgs Renderer::Impl::getAtmosphereArgs() const {
   // Leinert table (zodiacal_light_table.slangh), solar coloured. The air below sees the sky above
   // averaged over the hemisphere: van Rhijn-weighted airglow (1.258 x zenith for a 92 km layer),
   // ~150 S10 of zodiacal light and ~80 S10 of starlight. With the stars and extinction that gives
-  // ~21.9 V mag/arcsec^2 at the zenith.
+  // ~21.9 V mag/arcsec^2 at the zenith. starInScatter is the starlight's part of the in-scatter, which
+  // takes the star gain below.
+  // All of it is a fraction of the reference sun (nightSkyIlluminance), so the sun's settings leave it alone.
+  vec3 starInScatter(0.0f, 0.0f, 0.0f);
+  {
+    const Vector3 ref = referenceSunIlluminance();
+    args.nightSkyIlluminance = vec3(ref.x, ref.y, ref.z);
+  }
   if ((args.nightSkyFlags & 8u) != 0u) {
     constexpr float kS10 = 6.61e-12f;
     constexpr float kAirglowZenithS10 = 130.0f;
     const vec3 kAirglowColour(1.277f, 0.972f, 0.463f);
-    const float sunLuminance = 0.2126f * args.sunIlluminance.x + 0.7152f * args.sunIlluminance.y
-                             + 0.0722f * args.sunIlluminance.z;
+    const float sunLuminance = 0.2126f * args.nightSkyIlluminance.x + 0.7152f * args.nightSkyIlluminance.y
+                             + 0.0722f * args.nightSkyIlluminance.z;
     args.airglowAltitudeKm = 92.0f;
     args.airglowThicknessKm = 12.0f;
     const vec3 airglowZenith = kAirglowColour * (sunLuminance * kAirglowZenithS10 * kS10);
     args.airglowEmission = airglowZenith * (1.0f / args.airglowThicknessKm);
     args.zodiacalLightScale = kS10;
     const float aboveS10 = 0.5f * (150.0f + ((args.nightSkyFlags & 3u) == 3u ? 80.0f : 0.0f));
-    args.nightGlowInScatter = airglowZenith * 1.258f + args.sunIlluminance * (aboveS10 * kS10);
+    args.nightGlowInScatter = airglowZenith * 1.258f + args.nightSkyIlluminance * (aboveS10 * kS10);
+    if ((args.nightSkyFlags & 3u) == 3u) {
+      starInScatter = args.nightSkyIlluminance * (0.5f * 80.0f * kS10);
+    }
   }
   {
     // A pixel's angular size at the screen centre: 2 tan(fovY / 2) / height.
@@ -1016,12 +1064,13 @@ AtmosphereArgs Renderer::Impl::getAtmosphereArgs() const {
       break;
     }
   }
+  // The moons are lit by the reference sun (referenceSunIlluminance), like the rest of the night sky.
+  const Vector3 moonSun = referenceSunIlluminance();
   for (uint32_t i = 0; i < MAX_MOONS; ++i) {
     args.moons[i] = m_moons[i];
-    // A fraction of the sun's illuminance until here.
+    // A fraction of the reference sun's illuminance until here.
     const Vector3 fraction = m_moons[i].illuminance + m_moonUmbra[i] * umbralTransmittance;
-    args.moons[i].illuminance = vec3(fraction.x * args.sunIlluminance.x, fraction.y * args.sunIlluminance.y,
-                                     fraction.z * args.sunIlluminance.z);
+    args.moons[i].illuminance = vec3(fraction.x * moonSun.x, fraction.y * moonSun.y, fraction.z * moonSun.z);
   }
   args.moonSkyLightMask = m_moonSkyLightMask;
   args.cloudKeyLight = m_cloudKeyLight;
@@ -1294,16 +1343,22 @@ AtmosphereArgs Renderer::Impl::getAtmosphereArgs() const {
   // Pre-exposure (updateRadianceScale): every light source carries R, so everything lit by them is
   // physical x R. A multiply by 1 in daylight, which is exact.
   args.radianceScaleHistoryRatio = m_radianceScale / m_prevRadianceScale;
-  // Night gain (rtx.atmosphere.nightGainStops, night_gain.h) scales all natural night light: the
-  // moons (their light, discs and the sky they light), airglow, zodiacal light (a fraction of the
-  // sun's illuminance, which keeps its own level) and the star field (nightSkyGain).
-  args.nightSkyGain = m_nightGain;
-  args.zodiacalLightScale *= m_nightGain;
-  args.airglowEmission = args.airglowEmission * m_nightGain;
-  args.nightGlowInScatter = args.nightGlowInScatter * m_nightGain;
+  // The night gains (night_gain.h) scale the natural night light. Night Gain scales airglow and
+  // zodiacal light (a fraction of the sun's illuminance, which keeps its own level). Star Gain adds to
+  // it for the star field (nightSkyGain) and the starlight in the in-scatter, Moonlight Gain for the
+  // moons (their light, discs and the sky they light), and Moon Disc Gain for the discs alone
+  // (MoonParams::discGain).
+  const NightGains& gains = m_nightGains;
+  args.nightSkyGain = gains.stars;
+  args.zodiacalLightScale *= gains.night;
+  args.airglowEmission = args.airglowEmission * gains.night;
+  args.nightGlowInScatter = gains.stars == gains.night ? args.nightGlowInScatter * gains.night
+    : (args.nightGlowInScatter - starInScatter) * gains.night + starInScatter * gains.stars;
   args.sunIlluminance = args.sunIlluminance * m_radianceScale;
+  args.nightSkyIlluminance = args.nightSkyIlluminance * m_radianceScale;
   for (uint32_t i = 0; i < MAX_MOONS; ++i) {
-    args.moons[i].illuminance = args.moons[i].illuminance * (m_radianceScale * m_nightGain);
+    args.moons[i].illuminance = args.moons[i].illuminance * (m_radianceScale * gains.moonlight);
+    args.moons[i].discGain = gains.moonDisc;
   }
   args.lightningFlashIntensity *= m_radianceScale;
   args.apLocalLightIntensity *= m_radianceScale;  // the local-light gain; host injection is the host's own units
@@ -3801,7 +3856,10 @@ void Renderer::Impl::publishOutputs() {
   o.apLightInjection = m_apLightInjection.handle;
   o.groundLevelWorldUnits = m_groundLevelWorldUnits;
   o.luxPerUnit = luxPerUnit(m_settings);
-  o.nightGain = m_nightGain;
+  o.nightGain = m_nightGains.night;
+  o.starGain = m_nightGains.stars;
+  o.moonlightGain = m_nightGains.moonlight;
+  o.moonDiscGain = m_nightGains.moonDisc;
   o.groundLevelMeasured = m_groundLevelMeasured;
   o.cloudMarchStride = cloudMarchStride();
   o.apLights = m_apLightBuffer.handle;

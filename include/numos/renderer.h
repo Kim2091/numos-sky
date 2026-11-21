@@ -236,6 +236,11 @@ struct FrameOutputs {
   float luxPerUnit = 1.0f;
   // rtx.atmosphere.nightGainStops as the factor in force this frame (1 by day, faded in through twilight).
   float nightGain = 1.0f;
+  // The factors in force on the star field (Night Gain + Star Gain), the moonlight (Night Gain +
+  // Moonlight Gain) and the moon discs on top of the moonlight (Moon Disc Gain), faded in the same way.
+  float starGain = 1.0f;
+  float moonlightGain = 1.0f;
+  float moonDiscGain = 1.0f;
   bool  groundLevelMeasured = false;
   // The screen clouds' march stride this frame: 1 full rate, 2 quarter, 4 sixteenth (cloudMarchRate, or
   // its Auto choice).

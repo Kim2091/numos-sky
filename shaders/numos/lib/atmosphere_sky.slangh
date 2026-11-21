@@ -139,7 +139,8 @@ vec3 evalMoonDisk(vec3 viewDir, uint moonIdx, AtmosphereArgs args, vec3 sunDirYU
   // Earthshine: the Earth, seen from the moon close to the observer's direction, lights the whole
   // disk; LS is 0.5 there and Phi_LS ~ 1, so the disk delivers illuminance x earthshine.
   radiance += m.illuminance * (m.earthshine / solidAngle);
-  return radiance * albedo;
+  // Moon Disc Gain (rtx.atmosphere.moonDiscGainStops) brightens or dims the disc only, not its light.
+  return radiance * albedo * m.discGain;
 }
 
 // ============================================================================

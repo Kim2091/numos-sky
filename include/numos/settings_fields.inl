@@ -124,7 +124,7 @@ NUMOS_SETTING(float, aerialPerspectiveSceneShadowRangeMeters, 4600.0f, "rtx.atmo
 NUMOS_SETTING(float, sunShadowSoftnessDeg, 0.0f, "rtx.atmosphere.sunShadowSoftnessDeg", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "Sun shadow softness, as the sun light's angular radius in degrees. 0 is physical and follows Sun Size. A value above 0 softens or sharpens shadows without changing the visible sun disc, for soft shadows under a small sun.")
 NUMOS_SETTING(float, sunIntensity, 1.09f, "rtx.atmosphere.sunIntensity", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The strength of the sun.")
+  "The strength of the sun. The night sky (moons, stars, airglow) keeps its physical light.")
 NUMOS_SETTING(float, sunElevation, 15.0f, "rtx.atmosphere.sunElevation", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "The sun's height above the horizon, in degrees. A game integration can set it every frame, which overrides the saved value.")
 NUMOS_SETTING(float, sunRotation, 0.0f, "rtx.atmosphere.sunRotation", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
@@ -178,7 +178,7 @@ NUMOS_SETTING(float, ozoneLayerAltitude, 25.0f, "rtx.atmosphere.ozoneLayerAltitu
 NUMOS_SETTING(float, ozoneLayerWidth, 15.0f, "rtx.atmosphere.ozoneLayerWidth", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "The half-thickness of the ozone layer, in kilometres. Together with Ozone Density it sets the total amount of ozone.")
 NUMOS_SETTING(Vector3, sunIlluminance, Vector3(15.0f, 15.0f, 15.0f), "rtx.atmosphere.sunIlluminance", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The sun's base colour and brightness.")
+  "The sun's base colour and brightness. The night sky (moons, stars, airglow) keeps its physical light.")
 NUMOS_SETTING(bool, radianceAutoScale, true, "rtx.atmosphere.radianceAutoScale", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "Scales everything the sky outputs by a power of two that follows the light level, so a night sky, which is about a hundred-millionth as bright as the day sky, keeps its precision in 16-bit render targets. Daylight always uses a scale of 1. Turn it off only for debugging: a moonless night then turns black in 16-bit targets.")
 NUMOS_SETTING(float, multiScatterPhysicalStrength, 1.0f, "rtx.atmosphere.multiScatterPhysicalStrength", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
@@ -196,7 +196,13 @@ NUMOS_SETTING(bool, cloudDiskAureole, true, "rtx.atmosphere.cloudDiskAureole", N
 NUMOS_SETTING(float, cloudDropletDiameter, 20.0f, "rtx.atmosphere.cloudDropletDiameter", 5.0f, 50.0f, 0,
   "The typical cloud droplet size, in micrometres, from 5 to 50. 20 is typical of stratocumulus. Smaller droplets, as in fresh cumulus and fog, give a wider glow around the sun and the moons.")
 NUMOS_SETTING(float, nightGainStops, 0.0f, "rtx.atmosphere.nightGainStops", 0.0f, 16.0f, 0,
-  "Night Gain, in stops. 0 is physical. Brightens all natural night light together (the moons, the moonlit sky, starlight, airglow) so the sky, clouds and ground stay consistent.\nSmall values, about +1 to +3, make up for the eye's dark adaptation, which a display cannot reproduce, so a physical night looks darker on screen than in reality. Large values, up to +10 and beyond, balance the night against a game whose own lights are much brighter than physical.\nThe sun, twilight and lightning are not changed, and the gain fades in through twilight so the sky never brightens after sunset.")
+  "Night Gain, in stops. 0 is physical. Brightens all natural night light together (the moons, the moonlit sky, starlight, airglow) so the sky, clouds and ground stay consistent. Star Gain, Moonlight Gain and Moon Disc Gain adjust the stars and the moons on top of it.\nSmall values, about +1 to +3, make up for the eye's dark adaptation, which a display cannot reproduce, so a physical night looks darker on screen than in reality. Large values, up to +10 and beyond, balance the night against a game whose own lights are much brighter than physical.\nThe sun, twilight and lightning are not changed, and the gain fades in through twilight so the sky never brightens after sunset.")
+NUMOS_SETTING(float, starGainStops, 0.0f, "rtx.atmosphere.starGainStops", -16.0f, 16.0f, 0,
+  "Star Gain, in stops, on top of Night Gain. 0 adds nothing. Brightens or dims the stars and the Milky Way, and the starlight on the sky, clouds and ground, without changing the moons. Raise it to show more stars on a moonlit night or under a game whose own lights are bright.\nLike Night Gain, it does nothing by day and fades in through twilight.")
+NUMOS_SETTING(float, moonlightGainStops, 0.0f, "rtx.atmosphere.moonlightGainStops", -16.0f, 16.0f, 0,
+  "Moonlight Gain, in stops, on top of Night Gain. 0 adds nothing. Brightens or dims everything the moons light: their light on the scene, the moonlit sky and clouds, and their discs. The stars are not changed. Lower it when a raised Night Gain makes the moonlight too strong next to the stars.\nLike Night Gain, it does nothing by day and fades in through twilight.")
+NUMOS_SETTING(float, moonDiscGainStops, 0.0f, "rtx.atmosphere.moonDiscGainStops", -16.0f, 16.0f, 0,
+  "Moon Disc Gain, in stops, on top of Moonlight Gain. 0 adds nothing. Brightens or dims only the visible moon discs, not the light they give, so a blown-out moon can be tamed without darkening the moonlit scene.\nLike Night Gain, it does nothing by day and fades in through twilight.")
 NUMOS_SETTING(float, starScintillation, 1.0f, "rtx.atmosphere.starScintillation", 0.0f, 4.0f, 0,
   "How strongly the stars twinkle, relative to a typical night (1). Stars near the horizon twinkle most and can flash colours, while high stars stay steady. 0 turns twinkling off.")
 NUMOS_SETTING(float, directionalLightRadianceScale, 1.0f, "rtx.atmosphere.directionalLightRadianceScale", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,

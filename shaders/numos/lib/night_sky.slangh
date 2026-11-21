@@ -5,8 +5,8 @@
 
 // The night sky's sources beyond the atmosphere: the catalogue stars and the Milky Way background
 // (assets/nightsky, built by tools/build_nightsky_assets.py). All of it is in fractions of the sun's
-// illuminance (x kNightSkyAssetScale), so multiplying by args.sunIlluminance makes it physical and
-// pre-exposed like everything else.
+// illuminance (x kNightSkyAssetScale), so multiplying by args.nightSkyIlluminance (the reference sun)
+// makes it physical and pre-exposed like everything else.
 //
 // The stars and the background are fixed on the celestial sphere; args.celestialToLocal* turn them
 // into the local Y-up frame (the same frame the real moon uses).
@@ -85,7 +85,7 @@ vec3 evalNightSkyGlow(vec3 viewDirYUp, float eyeRadius, float groundDistance, At
                    - nightSkyLengthInsideSphere(eyeRadius, viewDirYUp.y, rLow, groundDistance);
   vec3 glow = args.airglowEmission * max(path, 0.0f);
   if (groundDistance > 1e9f) {
-    glow += args.sunIlluminance * (args.zodiacalLightScale
+    glow += args.nightSkyIlluminance * (args.zodiacalLightScale
             * zodiacalLightS10(viewDirYUp, normalize(args.sunDirection), args.eclipticPoleLocal));
   }
   return glow;
@@ -202,7 +202,7 @@ vec3 evalNightSkyBeyondAir(vec3 viewDirYUp, AtmosphereArgs args, SamplerState s)
   const vec3 e = nightSkyLocalToEquatorial(viewDirYUp, args);
   vec3 r = evalNightSkyStars(viewDirYUp, args) + sampleNightSkyMilkyWay(e, args)
          - sampleNightSkyStarlightLow(e, NightSkyStarlightLow, s);
-  return r * args.sunIlluminance * (args.nightSkyGain / kNightSkyAssetScale);  // night gain
+  return r * args.nightSkyIlluminance * (args.nightSkyGain / kNightSkyAssetScale);  // night gain
 }
 
 #endif // NIGHT_SKY_AVAILABLE

@@ -15,7 +15,7 @@
 
 namespace numos::detail {
 
-// AtmosphereArgs: 179 members, 1440 bytes in the shader layout
+// AtmosphereArgs: 181 members, 1456 bytes in the shader layout
 static_assert(offsetof(AtmosphereArgs, sunDirection) == 0, "AtmosphereArgs::sunDirection offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, planetRadius) == 12, "AtmosphereArgs::planetRadius offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, sunIlluminance) == 16, "AtmosphereArgs::sunIlluminance offset differs from the shader");
@@ -195,7 +195,9 @@ static_assert(offsetof(AtmosphereArgs, apDebugView) == 1424, "AtmosphereArgs::ap
 static_assert(offsetof(AtmosphereArgs, apDebugRadianceScale) == 1428, "AtmosphereArgs::apDebugRadianceScale offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, padApDebug0) == 1432, "AtmosphereArgs::padApDebug0 offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, padApDebug1) == 1436, "AtmosphereArgs::padApDebug1 offset differs from the shader");
-static_assert(sizeof(AtmosphereArgs) >= 1440, "AtmosphereArgs is smaller than the shader layout");
+static_assert(offsetof(AtmosphereArgs, nightSkyIlluminance) == 1440, "AtmosphereArgs::nightSkyIlluminance offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, padNightSky0) == 1452, "AtmosphereArgs::padNightSky0 offset differs from the shader");
+static_assert(sizeof(AtmosphereArgs) >= 1456, "AtmosphereArgs is smaller than the shader layout");
 
 // MoonParams: 12 members, 96 bytes in the shader layout
 static_assert(offsetof(MoonParams, direction) == 0, "MoonParams::direction offset differs from the shader");
@@ -209,7 +211,7 @@ static_assert(offsetof(MoonParams, earthshine) == 60, "MoonParams::earthshine of
 static_assert(offsetof(MoonParams, primeMeridian) == 64, "MoonParams::primeMeridian offset differs from the shader");
 static_assert(offsetof(MoonParams, textureLayer) == 76, "MoonParams::textureLayer offset differs from the shader");
 static_assert(offsetof(MoonParams, sunlightDirection) == 80, "MoonParams::sunlightDirection offset differs from the shader");
-static_assert(offsetof(MoonParams, reserved) == 92, "MoonParams::reserved offset differs from the shader");
+static_assert(offsetof(MoonParams, discGain) == 92, "MoonParams::discGain offset differs from the shader");
 static_assert(sizeof(MoonParams) >= 96, "MoonParams is smaller than the shader layout");
 
 // Camera: 24 members, 1360 bytes in the shader layout

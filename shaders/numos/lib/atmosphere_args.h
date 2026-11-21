@@ -36,7 +36,7 @@ struct MoonParams {
 
   vec3 sunlightDirection;  // toward the sun from the moon, Y-up, shades its disk: the true sun's
                            // direction, or one placed at the phase a game moon's phase setting gives
-  float reserved;
+  float discGain;          // the drawn disk's factor on top of its light (rtx.atmosphere.moonDiscGainStops)
 };
 
 // Everything the NUMOS passes and the host shader API read for one frame. Shared with C++ and laid
@@ -387,6 +387,11 @@ struct AtmosphereArgs {
   float padApDebug0;
   float padApDebug1;
 
+  // The sunlight the night sky's assets and glow are fractions of (stars, Milky Way, zodiacal light),
+  // x radianceScale: the reference sun, the default sunIlluminance x sunIntensity, whatever the sun's
+  // settings, so the night sky keeps its physical light.
+  vec3 nightSkyIlluminance;
+  float padNightSky0;
 };
 
 NUMOS_SHARED_END

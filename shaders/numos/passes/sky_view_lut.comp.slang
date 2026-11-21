@@ -84,7 +84,7 @@ vec3 computeSkyView(vec2 uv, AtmosphereArgs args,
     if (reachesSpace && (args.nightSkyFlags & 3u) == 3u) {
       const vec3 e = nightSkyLocalToEquatorial(viewDir, args);
       beyondAir += sampleNightSkyStarlightLow(e, starlightLowInput, lutSampler)
-                 * args.sunIlluminance * (args.nightSkyGain / kNightSkyAssetScale);  // night gain
+                 * args.nightSkyIlluminance * (args.nightSkyGain / kNightSkyAssetScale);  // night gain
     }
     radiance += beyondAir * transmittance;
   }

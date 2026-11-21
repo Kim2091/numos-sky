@@ -42,7 +42,7 @@ using namespace numos;
 
 static void testInfos() {
   const auto& infos = settingInfos();
-  CHECK(infos.size() == 204 + 7 * kMaxMoons);
+  CHECK(infos.size() == 207 + 7 * kMaxMoons);
   CHECK(findSetting("rtx.atmosphere.sunSize") != nullptr);
   CHECK(findSetting("rtx.atmosphere.moon3.rotation") != nullptr);
   CHECK(findSetting("rtx.atmosphere.nope") == nullptr);
@@ -997,6 +997,216 @@ static void testNightGain() {
   }
 }
 
+// The separate night gains: at 0 they are Night Gain exactly, by day they are all 1, at night each reaches
+// its own total, and the sky (twilight + glow, stars and moon, each with its own factor) never brightens
+// while the sun sets.
+static void testNightGains() {
+  for (float night : { 2e-6f, 2e-7f, 6e-8f }) {
+    for (float stops : { 0.0f, 1.0f, 4.0f, 10.0f }) {
+      for (float twilight : { 1.0f, 1e-3f, 1e-6f, 1e-8f, 1e-12f }) {
+        const NightGains g = nightGainsInForce(twilight, night, stops, 0.0f, 0.0f, 0.0f);
+        const float n = nightGainInForce(twilight, night, stops);
+        CHECK(g.night == n && g.stars == n && g.moonlight == n && g.moonDisc == 1.0f);
+      }
+    }
+  }
+  const float combos[][4] = { { 0, 4, -4, -2 }, { 4, 3, -6, 2 }, { 10, -10, 0, -8 }, { 0, 12, 12, 4 },
+                              { 12, 4, 4, -16 }, { 2, -2, 8, 0 }, { 16, 16, -16, 16 } };
+  for (float night : { 2e-6f, 2e-7f, 6e-8f }) {
+    for (const auto& c : combos) {
+      const NightGains day = nightGainsInForce(1.0f, night, c[0], c[1], c[2], c[3]);
+      const float tolerance = c[0] + std::max(c[1], c[2]) > 12.0f ? 1e-2f : 1e-6f;
+      CHECK(std::fabs(day.night - 1.0f) < tolerance && std::fabs(day.stars - 1.0f) < tolerance);
+      CHECK(std::fabs(day.moonlight - 1.0f) < tolerance && std::fabs(day.moonDisc - 1.0f) < tolerance);
+      const NightGains dark = nightGainsInForce(1e-14f, night, c[0], c[1], c[2], c[3]);
+      const auto near = [](float a, float stops) {
+        return std::fabs(a - std::exp2(stops)) < 1e-3f * std::exp2(stops);
+      };
+      const auto total = [](float n, float x) { return std::min(std::max(n + x, -16.0f), 16.0f); };
+      CHECK(near(dark.night, c[0]) && near(dark.stars, total(c[0], c[1])));
+      CHECK(near(dark.moonlight, total(c[0], c[2])) && near(dark.moonDisc, c[3]));
+      // Each gain depends on its own settings only.
+      const NightGains other = nightGainsInForce(1e-5f, night, c[0], c[1] + 3.0f, c[2], c[3] - 3.0f);
+      const NightGains base = nightGainsInForce(1e-5f, night, c[0], c[1], c[2], c[3]);
+      CHECK(other.night == base.night && other.moonlight == base.moonlight);
+      const NightGains moved = nightGainsInForce(1e-5f, night, c[0], c[1], c[2] - 2.0f, c[3]);
+      CHECK(moved.night == base.night && moved.stars == base.stars);
+      // A total gain above 12 stops brings a full moon's night within a few stops of daylight, where the
+      // sky may brighten by a fraction of a percent near sunset, as with Night Gain alone.
+      const float rise = tolerance > 1e-6f ? 1e-2f : 1e-5f;
+      for (float moonShare : { 0.0f, 0.5f, 0.97f }) {
+        float previous = 1e30f;
+        for (float h = 10.0f; h > -30.0f; h -= 0.01f) {
+          const float twilight = h >= 0.0f ? 1.0f : std::pow(10.0f, 0.45f * h);
+          const NightGains g = nightGainsInForce(twilight, night, c[0], c[1], c[2], c[3]);
+          const float glow = night * (1.0f - moonShare);
+          const float sky = twilight + glow * 0.8f * g.night + glow * 0.2f * g.stars + night * moonShare * g.moonlight;
+          CHECK(sky <= previous * (1.0f + rise));
+          previous = sky;
+        }
+      }
+    }
+  }
+}
+
+// The renderer's night: one frame under a game moon at full phase, the sun 40 degrees down (or up).
+static FrameOutputs nightFrame(Settings s, float sunElevation = -40.0f) {
+  s.unitsPerMeter = 1.0f;
+  s.realMoonEnabled = false;
+  s.moons[0].enabled = true;
+  s.moons[0].elevation = 45.0f;
+  s.moons[0].phase = 0.5f;
+  s.sunElevation = sunElevation;
+  ProbeGpu gpu;
+  Renderer renderer;
+  renderer.setSettings(s);
+  const float view[16] = { 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0, -2, 0, 1 };
+  const float proj[16] = { 1, 0, 0, 0,  0, 1.777f, 0, 0,  0, 0, 1, 1,  0, 0, -0.1f, 0 };
+  FrameInputs in;
+  in.frameIndex = 1;
+  in.deltaSeconds = 1.0f / 60.0f;
+  in.cameraCut = true;
+  in.camera = makeCamera(view, proj, view, proj, 0.0f, 0.0f, 64, 32, 0.1f, false);
+  in.cameraPosition = Vector3(0.0f, 2.0f, 0.0f);
+  in.cameraPositionGame = in.cameraPosition;
+  in.cameraForward = Vector3(0.0f, 0.0f, 1.0f);
+  std::memcpy(in.viewToWorld, &in.camera.viewToWorld, sizeof(in.viewToWorld));
+  std::memcpy(in.projectionToView, &in.camera.projectionToView, sizeof(in.projectionToView));
+  in.renderWidth = 64;
+  in.renderHeight = 32;
+  renderer.beginFrame(gpu, in);
+  renderer.dispatchPostDepth(gpu, 0, 1e9f);
+  return renderer.outputs();
+}
+
+// The first moon's light, physical (the pre-exposure divided out).
+static Vector3 moonLight(const FrameOutputs& o) {
+  const vec3 e = o.args.moons[0].illuminance;
+  return Vector3(e.x, e.y, e.z) * (1.0f / o.args.apDebugRadianceScale);
+}
+
+// a == b x ratio, per channel, to float precision.
+static bool sameLight(Vector3 a, Vector3 b, float ratio) {
+  return std::fabs(a.x - b.x * ratio) <= 1e-5f * std::fabs(b.x * ratio)
+      && std::fabs(a.y - b.y * ratio) <= 1e-5f * std::fabs(b.y * ratio)
+      && std::fabs(a.z - b.z * ratio) <= 1e-5f * std::fabs(b.z * ratio);
+}
+
+// The night sky is lit by the reference sun: the default sun, whatever the sun's settings.
+static void testMoonReferenceSun() {
+  const Settings defaults;
+  const FrameOutputs base = nightFrame(defaults);
+  const Vector3 moon = moonLight(base);
+  CHECK(base.args.moons[0].enabled > 0.5f && moon.y > 0.0f);
+  // With the default settings the sun is the reference sun, so the moon gets the light it always had.
+  const Vector3 sun = defaults.sunIlluminance * defaults.sunIntensity;
+  const Vector3 sunNow = Vector3(base.args.sunIlluminance.x, base.args.sunIlluminance.y,
+                                 base.args.sunIlluminance.z) * (1.0f / base.args.apDebugRadianceScale);
+  CHECK(sameLight(sunNow, sun, 1.0f));
+  // Sun Intensity and the sun's illuminance (a weather preset's sunlight) leave the moon alone.
+  Settings s = defaults;
+  s.sunIntensity *= 4.0f;
+  CHECK(sameLight(moonLight(nightFrame(s)), moon, 1.0f));
+  s = defaults;
+  s.sunIlluminance = Vector3(30.0f, 25.0f, 20.0f);
+  CHECK(sameLight(moonLight(nightFrame(s)), moon, 1.0f));
+  s = defaults;
+  s.sunIntensity *= 4.0f;
+  CHECK(sameLight(moonLight(nightFrame(s, 30.0f)), moonLight(nightFrame(defaults, 30.0f)), 1.0f));
+  // The rest of the night sky too: the star field, airglow, zodiacal light and the night glow's in-scatter,
+  // physical, under 4x Sun Intensity and under a different sun.
+  const auto physical = [](const FrameOutputs& o, vec3 v) {
+    return Vector3(v.x, v.y, v.z) * (1.0f / o.args.apDebugRadianceScale);
+  };
+  const auto nightSky = [&](const FrameOutputs& o, Vector3& stars, Vector3& airglow, Vector3& zodiacal,
+                            Vector3& inScatter) {
+    stars = physical(o, o.args.nightSkyIlluminance * o.args.nightSkyGain);
+    airglow = physical(o, o.args.airglowEmission);
+    zodiacal = physical(o, o.args.nightSkyIlluminance * o.args.zodiacalLightScale);
+    inScatter = physical(o, o.args.nightGlowInScatter);
+  };
+  Vector3 stars0, airglow0, zodiacal0, inScatter0;
+  nightSky(base, stars0, airglow0, zodiacal0, inScatter0);
+  CHECK((base.args.nightSkyFlags & 8u) != 0u && airglow0.y > 0.0f && zodiacal0.y > 0.0f && stars0.y > 0.0f);
+  CHECK(sameLight(physical(base, base.args.nightSkyIlluminance), sun, 1.0f));
+  for (int variant = 0; variant < 2; ++variant) {
+    Settings t = defaults;
+    if (variant == 0) {
+      t.sunIntensity *= 4.0f;
+    } else {
+      t.sunIlluminance = Vector3(30.0f, 25.0f, 20.0f);
+    }
+    const FrameOutputs o = nightFrame(t);
+    Vector3 stars, airglow, zodiacal, inScatter;
+    nightSky(o, stars, airglow, zodiacal, inScatter);
+    CHECK(sameLight(stars, stars0, 1.0f) && sameLight(airglow, airglow0, 1.0f));
+    CHECK(sameLight(zodiacal, zodiacal0, 1.0f) && sameLight(inScatter, inScatter0, 1.0f));
+    CHECK(o.nightGain == base.nightGain);
+  }
+}
+
+// The night gains reach only their own lights, and nothing by day.
+static void testNightBrightness() {
+  const Settings defaults;
+  const FrameOutputs base = nightFrame(defaults);
+  const Vector3 moon = moonLight(base);
+  CHECK(base.nightGain == 1.0f && base.starGain == 1.0f && base.moonlightGain == 1.0f && base.moonDiscGain == 1.0f);
+  CHECK(base.args.nightSkyGain == 1.0f && base.args.moons[0].discGain == 1.0f);
+  {
+    // Star Gain: the star field only.
+    Settings s = defaults;
+    s.starGainStops = 3.0f;
+    const FrameOutputs o = nightFrame(s);
+    CHECK(sameLight(moonLight(o), moon, 1.0f));
+    CHECK(std::fabs(o.args.nightSkyGain - 8.0f) < 1e-3f && o.starGain == o.args.nightSkyGain);
+    CHECK(o.nightGain == 1.0f && o.moonlightGain == 1.0f && o.args.moons[0].discGain == 1.0f);
+  }
+  {
+    // Moonlight Gain: the moon's light, not the stars; the pre-exposure follows the moonlit sky.
+    Settings s = defaults;
+    s.moonlightGainStops = 3.0f;
+    const FrameOutputs o = nightFrame(s);
+    CHECK(sameLight(moonLight(o), moon, std::exp2(3.0f)));
+    CHECK(o.args.nightSkyGain == 1.0f && o.args.moons[0].discGain == 1.0f);
+    CHECK(o.args.apDebugRadianceScale < base.args.apDebugRadianceScale);
+  }
+  {
+    // Moon Disc Gain: the disc factor only; the light and the pre-exposure stay.
+    Settings s = defaults;
+    s.moonDiscGainStops = -2.0f;
+    const FrameOutputs o = nightFrame(s);
+    CHECK(sameLight(moonLight(o), moon, 1.0f));
+    CHECK(std::fabs(o.args.moons[0].discGain - 0.25f) < 1e-5f && o.args.nightSkyGain == 1.0f);
+    CHECK(o.args.apDebugRadianceScale == base.args.apDebugRadianceScale);
+  }
+  {
+    // Night Gain with the others: each on top of it.
+    Settings s = defaults;
+    s.nightGainStops = 4.0f;
+    s.starGainStops = 2.0f;
+    s.moonlightGainStops = -3.0f;
+    const FrameOutputs o = nightFrame(s);
+    CHECK(std::fabs(o.nightGain - 16.0f) < 1e-2f && std::fabs(o.args.nightSkyGain - 64.0f) < 4e-2f);
+    CHECK(std::fabs(o.moonlightGain - 2.0f) < 2e-3f);
+    const Vector3 m = moonLight(o);
+    CHECK(std::fabs(m.y - 2.0f * moon.y) < 2e-3f * moon.y);
+  }
+  {
+    // Daylight: no gain at all, and the moon (and everything else) as with the defaults.
+    Settings s = defaults;
+    s.nightGainStops = 6.0f;
+    s.starGainStops = 5.0f;
+    s.moonlightGainStops = -5.0f;
+    s.moonDiscGainStops = 4.0f;
+    const FrameOutputs day = nightFrame(s, 30.0f);
+    const FrameOutputs dayBase = nightFrame(defaults, 30.0f);
+    CHECK(day.nightGain == 1.0f && day.starGain == 1.0f && day.moonlightGain == 1.0f && day.moonDiscGain == 1.0f);
+    CHECK(day.args.nightSkyGain == 1.0f && day.args.moons[0].discGain == 1.0f);
+    CHECK(sameLight(moonLight(day), moonLight(dayBase), 1.0f));
+    CHECK(day.args.apDebugRadianceScale == 1.0f && dayBase.args.apDebugRadianceScale == 1.0f);
+  }
+}
+
 static void testConfigFile(const char* path) {
   std::ifstream f(path);
   if (!f) {
@@ -1159,6 +1369,9 @@ int main(int argc, char** argv) {
   testGroundReset();
   testMarchRate();
   testNightGain();
+  testNightGains();
+  testMoonReferenceSun();
+  testNightBrightness();
   if (argc > 1) {
     testConfigFile(argv[1]);
   }

@@ -28,6 +28,7 @@
 #include "numos/lib/ground_probe.h"
 #include "celestial.h"
 #include "ground_field.h"
+#include "night_gain.h"
 #include "pass_recorder.h"
 
 namespace numos {
@@ -136,6 +137,7 @@ struct Renderer::Impl {
   void resolveSunAngles(float& outElevationDeg, float& outAzimuthDeg) const;
   void updateRadianceScale();
   void updateCelestial();
+  float nightSunRatio() const;
   AtmosphereArgs getCloudArgs() const;
   bool setNightSkyAssets(const NightSkyAssets& assets);
   void uploadNightSky(PassRecorder& rec);
@@ -459,7 +461,7 @@ struct Renderer::Impl {
   uint32_t m_coverageSteadyFrames = 0u;  // frames the cloud coverage has held still
 
   // Night sky geometry (updateCelestial). m_moons[i].illuminance is a fraction of the sun's
-  // illuminance here; getAtmosphereArgs multiplies the sun's in.
+  // illuminance here; getAtmosphereArgs multiplies the reference sun's in (referenceSunIlluminance).
   celestial::LocalFrame m_celestialFrame {};
   Vector3  m_eclipticPoleLocal          { 0.0f, 1.0f, 0.0f };
   MoonParams m_moons[MAX_MOONS] {};
@@ -503,7 +505,7 @@ struct Renderer::Impl {
   float    m_lightningEnvelope          { 0.0f };
   float    m_lightningEnvelopePrevious  { 0.0f };
   float    m_skyRelativeLuminance       { 1.0f };  // updateRadianceScale: the sky relative to daylight's
-  float    m_nightGain                  { 1.0f };  // updateRadianceScale: nightGainStops faded through twilight
+  NightGains m_nightGains {};  // updateRadianceScale: the night gains faded through twilight (night_gain.h)
   int      m_lightningPulsesLeft        { 0 };
   float    m_lightningTimeToPulse       { 0.0f };
   uint32_t m_lightningRngState          { 0x9E3779B9u };

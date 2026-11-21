@@ -8,7 +8,7 @@ This page is for host integrators and for anyone changing the night code.
 
 | Source | Model | Where |
 | --- | --- | --- |
-| Moonlight | Earth's Moon at its real place for the configured date and latitude (Astronomical Almanac low-precision theory, topocentric parallax). Brightness follows the measured phase law, V = -12.73 + 0.026\|a\| + 4e-9 a^4 (Allen), so the opposition surge is included. Also: lunar colour, earthshine, and the eclipse share of the sun's disk. Game moons can be added: four slots in all, the real moon taking one. | `src/celestial.*`, `updateCelestial` |
+| Moonlight | Earth's Moon at its real place for the configured date and latitude (Astronomical Almanac low-precision theory, topocentric parallax). Brightness follows the measured phase law, V = -12.73 + 0.026\|a\| + 4e-9 a^4 (Allen), so the opposition surge is included. Also: lunar colour, earthshine, and the eclipse share of the sun's disk. Lit by the reference sun (the default `sunIlluminance` x `sunIntensity`), like the whole night sky, so the sun's settings leave it alone. Game moons can be added: four slots in all, the real moon taking one. | `src/celestial.*`, `updateCelestial` |
 | Moon disk | Lommel-Seeliger shading, normalised so the disk delivers exactly the moon's illuminance at any drawn size. LRO colour albedo and LOLA relief are placed by the moon's axis and prime meridian, so the real librations come out of the geometry. | `evalMoonDisk` (atmosphere_sky.slangh) |
 | Eclipse light | In the Earth's umbra: sunlight refracted through the limb at 12 km, twice through the configured atmosphere, times 5e-5. That gives a copper-red moon at ~1.5e-5 of full (Danjon ~2). | `getAtmosphereArgs` |
 | Stars | Hipparcos stars brighter than V 7.5, as points. Each is drawn as a Gaussian at least one pixel wide (it never aliases), plus a 4% wing. Scintillation is sigma ~ 0.1 X^1.75 (Young 1967), chromatic near the horizon. | `night_sky.slangh` |
@@ -89,6 +89,10 @@ of the disk's illuminance (sunlit part plus earthshine for a moon). It is spread
 | `rtx.atmosphere.latitudeDegrees`, `northOffsetDegrees` | | where the celestial pole is |
 | `rtx.atmosphere.nightSkyStars` | true | stars and Milky Way |
 | `rtx.atmosphere.starScintillation` | 1 | turbulence relative to a typical night |
+| `rtx.atmosphere.nightGainStops` | 0 | all natural night light, in stops (DESIGN.md, "Night gain") |
+| `rtx.atmosphere.starGainStops` | 0 | the stars and Milky Way and their light, in stops on top of Night Gain |
+| `rtx.atmosphere.moonlightGainStops` | 0 | the moons' light, discs and the sky they light, in stops on top of Night Gain |
+| `rtx.atmosphere.moonDiscGainStops` | 0 | the drawn moon discs only, in stops on top of the moonlight |
 
 With a hand-placed sun (no time cycle), the sky turns rigidly around it: the frame puts the sun's catalogue position for the date exactly on the drawn sun (`celestial::alignedFrame`). The moon's place and phase therefore always agree with the sun on screen.
 

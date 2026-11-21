@@ -238,6 +238,12 @@ void drawNightSkySection(AppState& app) {
   if (ImGui::Checkbox("Real moon", &s.realMoonEnabled)) changed(app);
   if (ImGui::SliderFloat("Night gain", &s.nightGainStops, 0.0f, 12.0f, "%.1f stops")) changed(app);
   tooltip(findSetting("rtx.atmosphere.nightGainStops")->description);
+  if (ImGui::SliderFloat("Star gain", &s.starGainStops, -8.0f, 12.0f, "%+.1f stops")) changed(app);
+  tooltip(findSetting("rtx.atmosphere.starGainStops")->description);
+  if (ImGui::SliderFloat("Moonlight gain", &s.moonlightGainStops, -12.0f, 8.0f, "%+.1f stops")) changed(app);
+  tooltip(findSetting("rtx.atmosphere.moonlightGainStops")->description);
+  if (ImGui::SliderFloat("Moon disc gain", &s.moonDiscGainStops, -12.0f, 8.0f, "%+.1f stops")) changed(app);
+  tooltip(findSetting("rtx.atmosphere.moonDiscGainStops")->description);
   ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 5.0f);
   inputString("##nightdir", app.nightSkyDir);
   ImGui::SameLine();

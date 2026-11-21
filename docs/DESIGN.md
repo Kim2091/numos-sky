@@ -208,6 +208,34 @@ the sun sets (tested over -30..+10 degrees for gains up to 12 stops) and settles
 the sky's level uses the gained sky: NUMOS's pre-exposure (so a boosted night does not overflow) and the
 level where a lightning flash ends.
 
+Three more gains, each in stops (default 0, range -16..16), set the night's balance on top of Night Gain:
+
+| Setting | Scales |
+| --- | --- |
+| `rtx.atmosphere.starGainStops` | the star field and Milky Way (`nightSkyGain`) and the starlight in the night glow's in-scatter |
+| `rtx.atmosphere.moonlightGainStops` | the moons' light: the scene lights, the sky, clouds and ground they light, and so their discs |
+| `rtx.atmosphere.moonDiscGainStops` | the drawn moon discs only (`MoonParams::discGain`, `evalMoonDisk`), on top of the moonlight |
+
+Airglow and zodiacal light keep Night Gain alone. Each light's total gain g (Night Gain plus its own, held to
+-16..16) fades in by the rule above for a gain of that size, against the same natural night: its factor is
+2^(g x fade), with fade = log2(nightGainInForce) / g. A total of 0 or less fades over the stop above the
+natural night instead, and a dimmed light only falls as the sun sets. The disc gain fades with the moonlight's
+total. So by day every factor is 1, at night each is its full value, and each depends on its own settings
+alone: Star Gain never changes the moon, nor Moonlight Gain the stars. The sky still keeps falling as the sun
+sets, because it is the sum of the lights' shares of the night, each paired with its share of the twilight,
+and every such pair falls on its own (`testNightGains`). `FrameOutputs::starGain`, `moonlightGain` and
+`moonDiscGain` report the factors in force. The pre-exposure counts the gained starlight (its ~20% share of
+the moonless glow) and the gained moonlight, so exposure follows what is lit, but not the disc gain: the
+discs light nothing, and their radiance is capped below fp16's range anyway.
+
+The whole night sky is lit by a fixed reference sun, the default `sunIlluminance` x `sunIntensity` (the real
+sun's 1.27e5 lux): the moons, and the stars, Milky Way, airglow, zodiacal light and night glow in-scatter
+(`AtmosphereArgs::nightSkyIlluminance`, x the pre-exposure, which the night sky shaders read in place of
+`sunIlluminance`). So Sun Intensity and a weather preset's sunlight change only the sun and the daylight.
+The night estimate behind the pre-exposure, which is relative to the current sun's daylight, scales the
+night glow and the moons by the reference sun over the current one to match. With the default sun nothing
+changes.
+
 ## Rules
 
 1. **No host types cross the boundary.** No DXVK, Vulkan, D3D or ImGui types in public headers except the optional backends.
