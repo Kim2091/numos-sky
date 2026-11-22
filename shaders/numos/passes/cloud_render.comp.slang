@@ -321,6 +321,11 @@ static const float kCloudEmptyTransmittance = 0.999f;
 // still view it is 0, so each pixel converges to its own marches; a reset history takes it at full
 // weight until the pixel has a sample's worth.
 static const float kCloudInterpolatedMovingWeight = 0.25f;
+// Screen pass bit 28: a weather jump (Renderer::Impl::updateCloudWeatherJump). For a few frames every
+// history is capped at kCloudWeatherJumpSamples and no pixel is flagged empty, so the whole image
+// re-converges together from the new weather instead of patch by patch.
+static const uint kCloudWeatherJumpBit = 0x10000000u;
+static const float kCloudWeatherJumpSamples = 2.0f;
 groupshared vec4 gs_cloudFresh[CLOUD_GROUP_Y][CLOUD_GROUP_X];
 groupshared vec4 gs_cloudFreshDepth[CLOUD_GROUP_Y][CLOUD_GROUP_X];
 groupshared float gs_cloudFreshFlash[CLOUD_GROUP_Y][CLOUD_GROUP_X];  // g_cloudFlashAccum of each march
@@ -349,9 +354,15 @@ static const float kCloudTemporalFarKm = 400.0f;  // stand-in depth for cloudles
 // history's own local gradient (over 4 px, so its noise barely counts): about a pixel at a cloud
 // edge, many pixels across smooth in-cloud glow, where the extra averaging is what keeps the noise
 // down while flying through fog.
+//
+// The gradient is read from the history, which inside the deck is itself short and noisy, so its
+// noise would shorten the history further. With screen pass bit 26 (cloudTemporalSmoothLagGradient)
+// each of its four taps averages three texels across the axis it measures, and the allowed lag
+// reaches kCloudTemporalMaxLagPixelsSmooth; args.cloudTemporalInCloudMinFrames floors the cap.
 static const float kCloudTemporalLagErrorTolerance = 0.02f;  // relative radiance (or opacity) error
 static const float kCloudTemporalMinLagPixels = 1.0f;
 static const float kCloudTemporalMaxLagPixels = 16.0f;
+static const float kCloudTemporalMaxLagPixelsSmooth = 64.0f;
 static const float kCloudTemporalAmbiguityFloorPixels = 0.25f;  // below this, no cap
 
 float cloudLuminance(vec3 rgb) {
@@ -471,13 +482,24 @@ bool cloudPreviousScreenUv(CloudViewRay ray, vec3 worldPoint, out vec2 prevUv) {
   return true;
 }
 
+// One gradient tap of last frame's output at `texel` + `offset`: the texel itself, or with `smooth`
+// the mean of it and its two neighbors along `across`.
+vec4 cloudHistoryGradientTap(int2 texel, int2 offset, int2 across, bool smooth, int2 maxTexel) {
+  const vec4 center = loadPrevCloudRender(clamp(texel + offset, int2(0), maxTexel));
+  if (!smooth) {
+    return center;
+  }
+  return (center + loadPrevCloudRender(clamp(texel + offset + across, int2(0), maxTexel))
+                 + loadPrevCloudRender(clamp(texel + offset - across, int2(0), maxTexel))) * (1.0f / 3.0f);
+}
+
 // Largest local rate of change, per pixel, of last frame's output around `texel`: relative for the
 // radiance, absolute for the transmittance.
-float cloudHistoryGradient(int2 texel, int2 maxTexel) {
-  const vec4 xp = loadPrevCloudRender(clamp(texel + int2(2, 0), int2(0), maxTexel));
-  const vec4 xm = loadPrevCloudRender(clamp(texel - int2(2, 0), int2(0), maxTexel));
-  const vec4 yp = loadPrevCloudRender(clamp(texel + int2(0, 2), int2(0), maxTexel));
-  const vec4 ym = loadPrevCloudRender(clamp(texel - int2(0, 2), int2(0), maxTexel));
+float cloudHistoryGradient(int2 texel, int2 maxTexel, bool smooth) {
+  const vec4 xp = cloudHistoryGradientTap(texel, int2(2, 0), int2(0, 1), smooth, maxTexel);
+  const vec4 xm = cloudHistoryGradientTap(texel, int2(-2, 0), int2(0, 1), smooth, maxTexel);
+  const vec4 yp = cloudHistoryGradientTap(texel, int2(0, 2), int2(1, 0), smooth, maxTexel);
+  const vec4 ym = cloudHistoryGradientTap(texel, int2(0, -2), int2(1, 0), smooth, maxTexel);
   const float lum = 0.25f * (cloudLuminance(xp.rgb) + cloudLuminance(xm.rgb)
                              + cloudLuminance(yp.rgb) + cloudLuminance(ym.rgb));
   const vec2 gLum = vec2(cloudLuminance(xp.rgb) - cloudLuminance(xm.rgb),
@@ -491,7 +513,33 @@ struct CloudHistory {
   vec4  state;         // .x length in samples, .y fast luminance, .z fast transmittance
   float stillness;     // 1: reprojected texel-exact (nothing moved); 0: resampled
   float lagCapFrames;  // in-cloud motion ambiguity: the longest history, in frames, worth keeping
+  float volumetric;    // how much of the ray the cloud fills from near the camera (see below)
+  float depthMeanKm;   // the history's mean cloud depth over its cloudy taps, 0 without one
 };
+
+// The point a pixel's cloud at `distKm` along `ray` sat at last frame, and its previous screen UV;
+// false off the previous screen.
+bool cloudHistoryPoint(CloudViewRay ray, float distKm, bool hasCloud, float layer2Share, AtmosphereArgs args,
+                       out vec3 worldPoint, out vec2 prevUv) {
+  worldPoint = cameraGetWorldPosition(cloudCamera) + ray.worldDirection * numosKmToWorld(distKm, args);
+  if (hasCloud) {
+    // The wind carried that cloud here; last frame it sat one wind step back.
+    worldPoint -= numosKmYUpToWorld(vec3(args.cloudWindStepXKm, 0.0f, args.cloudWindStepZKm), args);
+    // A layer 2 following the camera climbed with it: last frame its share sat one step lower.
+    if (args.cloudLayer2FollowStepKm != 0.0f) {
+      worldPoint -= numosKmYUpToWorld(vec3(0.0f, args.cloudLayer2FollowStepKm * layer2Share, 0.0f), args);
+    }
+  }
+  return cloudPreviousScreenUv(ray, worldPoint, prevUv) && all(prevUv >= vec2(0.0f)) && all(prevUv < vec2(1.0f));
+}
+
+// Inside the deck the fresh mean depth is the transmittance-weighted mean of a few jittered marches
+// and wobbles by tens of percent from frame to frame, and the reprojection point wobbles with it.
+// With screen pass bit 27 (cloudTemporalStableDepth) a volumetric pixel reprojects at the history's
+// own mean depth instead (found at the fresh depth's reprojection, blended in log depth by how
+// volumetric the ray is), and the resolve writes a temporally filtered mean depth for such pixels,
+// so that history depth is itself smooth.
+static const uint kCloudStableDepthBit = 0x8000000u;
 
 // The reprojected history of `pixelCoord`, whose center ray is `ray`, false when there is none.
 // layer2Share: layer 2's share of this pixel's cloud (g_cloudLayer2Share), whose base may follow the
@@ -503,24 +551,32 @@ bool cloudTemporalHistory(uint2 pixelCoord, uint2 outputDim, CloudViewRay ray, v
   h.state = vec4(0.0f);
   h.stillness = 0.0f;
   h.lagCapFrames = kCloudTemporalMaxSamples;
+  h.depthMeanKm = 0.0f;
   const bool hasCloud = freshDepth.x >= 0.0f;
   // How much of the ray the cloud fills from near the camera: 0 for a cloud seen from outside (entry
   // at its mean depth), 1 from inside the deck.
   const float volumetric = hasCloud
     ? saturate((freshDepth.y - max(freshDepth.x, 0.0f)) / max(freshDepth.y, 1e-3f)) : 0.0f;
-  const float distKm = hasCloud ? max(freshDepth.y, 1e-3f) : min(tSurfaceKm, kCloudTemporalFarKm);
-  vec3 worldPoint = cameraGetWorldPosition(cloudCamera) + ray.worldDirection * numosKmToWorld(distKm, args);
-  if (hasCloud) {
-    // The wind carried that cloud here; last frame it sat one wind step back.
-    worldPoint -= numosKmYUpToWorld(vec3(args.cloudWindStepXKm, 0.0f, args.cloudWindStepZKm), args);
-    // A layer 2 following the camera climbed with it: last frame its share sat one step lower.
-    if (args.cloudLayer2FollowStepKm != 0.0f) {
-      worldPoint -= numosKmYUpToWorld(vec3(0.0f, args.cloudLayer2FollowStepKm * layer2Share, 0.0f), args);
-    }
-  }
+  h.volumetric = volumetric;
+  float distKm = hasCloud ? max(freshDepth.y, 1e-3f) : min(tSurfaceKm, kCloudTemporalFarKm);
+  vec3 worldPoint;
   vec2 prevUv;
-  if (!cloudPreviousScreenUv(ray, worldPoint, prevUv) || any(prevUv < vec2(0.0f)) || any(prevUv >= vec2(1.0f))) {
+  if (!cloudHistoryPoint(ray, distKm, hasCloud, layer2Share, args, worldPoint, prevUv)) {
     return false;
+  }
+  if ((args.cloudScreenInterleave & kCloudStableDepthBit) != 0u && volumetric > 0.0f) {
+    const int2 guess = clamp(int2(prevUv * vec2(outputDim)), int2(0), int2(outputDim) - 1);
+    const vec4 guessDepth = PrevCloudDepth.Load(int3(guess, 0));
+    if (guessDepth.x >= 0.0f) {
+      const float stableKm = exp(lerp(log(distKm), log(max(guessDepth.y, 1e-3f)), volumetric));
+      vec3 stablePoint;
+      vec2 stableUv;
+      if (cloudHistoryPoint(ray, stableKm, hasCloud, layer2Share, args, stablePoint, stableUv)) {
+        distKm = stableKm;
+        worldPoint = stablePoint;
+        prevUv = stableUv;
+      }
+    }
   }
   float ambiguityPx = 0.0f;
   if (hasCloud) {
@@ -556,6 +612,8 @@ bool cloudTemporalHistory(uint2 pixelCoord, uint2 outputDim, CloudViewRay ray, v
   vec4 sum = vec4(0.0f);
   vec4 stateSum = vec4(0.0f);
   float weightSum = 0.0f;
+  float logDepthSum = 0.0f;
+  float depthWeightSum = 0.0f;
   [unroll]
   for (uint i = 0u; i < 4u; ++i) {
     const int2 texel = clamp(baseTexel + offsets[i], int2(0), maxTexel);
@@ -577,10 +635,15 @@ bool cloudTemporalHistory(uint2 pixelCoord, uint2 outputDim, CloudViewRay ray, v
     sum += loadPrevCloudRender(texel) * weights[i];
     stateSum += PrevCloudState.Load(int3(texel, 0)) * weights[i];
     weightSum += weights[i];
+    if (depth.x >= 0.0f) {
+      logDepthSum += log(max(depth.y, 1e-3f)) * weights[i];
+      depthWeightSum += weights[i];
+    }
   }
   if (weightSum < 0.5f) {
     return false;
   }
+  h.depthMeanKm = depthWeightSum > 1e-4f ? exp(logDepthSum / depthWeightSum) : 0.0f;
   h.color = sum / weightSum;
   h.state = stateSum / weightSum;
   // Taps were dropped: the history is partly from elsewhere, so it counts for less.
@@ -607,11 +670,14 @@ bool cloudTemporalHistory(uint2 pixelCoord, uint2 outputDim, CloudViewRay ray, v
     h.state.y = max(h.state.y + cloudLuminance(h.color.rgb) - before, 0.0f);
   }
   if (ambiguityPx > 0.0f) {
+    const bool smooth = (args.cloudScreenInterleave & 0x4000000u) != 0u;
     const float lagPx = clamp(kCloudTemporalLagErrorTolerance
-                                / max(cloudHistoryGradient(int2(round(texelF)), maxTexel), 1e-6f),
-                              kCloudTemporalMinLagPixels, kCloudTemporalMaxLagPixels);
-    // The exponential weight w = lagPx / (lagPx + ambiguityPx) as a length: 1 / (1 - w) frames.
-    h.lagCapFrames = 1.0f + lagPx / ambiguityPx;
+                                / max(cloudHistoryGradient(int2(round(texelF)), maxTexel, smooth), 1e-6f),
+                              kCloudTemporalMinLagPixels,
+                              smooth ? kCloudTemporalMaxLagPixelsSmooth : kCloudTemporalMaxLagPixels);
+    // The exponential weight w = lagPx / (lagPx + ambiguityPx) as a length: 1 / (1 - w) frames, at
+    // least the in-cloud floor.
+    h.lagCapFrames = max(1.0f + lagPx / ambiguityPx, args.cloudTemporalInCloudMinFrames);
   }
   return true;
 }
@@ -840,6 +906,9 @@ CloudResolved cloudResolvePixel(uint2 pixelCoord, uint2 outputDim, float tSurfac
     const float cap = min(lerp(movingCap, max(args.cloudTemporalStillSamples, movingCap), h.stillness),
                           max(h.lagCapFrames * samplesPerFrame, 1.0f));
     float n = min(max(h.state.x, 0.0f), cap);
+    if ((args.cloudScreenInterleave & kCloudWeatherJumpBit) != 0u) {
+      n = min(n, kCloudWeatherJumpSamples);
+    }
     vec4 history = h.color;
     if (!all(isfinite(history)) || !all(isfinite(h.state.yz)) || !isfinite(n)) {
       n = 0.0f;
@@ -889,6 +958,13 @@ CloudResolved cloudResolvePixel(uint2 pixelCoord, uint2 outputDim, float tSurfac
     const vec2 fastIn = vec2(cloudLuminance(fresh.rgb), fresh.a);
     const vec2 fast = fastN + c > 1e-6f ? (h.state.yz * fastN + fastIn * c) / (fastN + c) : fastIn;
     r.state = vec4(min(total, kCloudTemporalMaxSamples), fast, 0.0f);
+    // The volumetric pixel's mean depth, filtered with the history (in log depth), for a steady
+    // reprojection next frame (kCloudStableDepthBit).
+    if ((args.cloudScreenInterleave & kCloudStableDepthBit) != 0u && r.depth.x >= 0.0f && h.depthMeanKm > 0.0f
+        && total > 1e-6f) {
+      const float keep = h.volumetric * n / total;
+      r.depth.y = max(exp(lerp(log(max(r.depth.y, 1e-3f)), log(h.depthMeanKm), keep)), r.depth.x);
+    }
   } else {
     // No history: the filter off gives the raw march; otherwise the wide fill (a blur, not sparkle),
     // which counts as one sample.
@@ -1051,6 +1127,12 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
       cloudDepthOutput[pixelCoord] = vec4(-1.0f, 0.0f, kNoSurfaceKm, 0.0f);
       cloudStateOutput[pixelCoord] = vec4(0.0f);
     }
+#if CLOUD_SCREEN_REBUILD
+    // Nothing is marked: the fallback pass's groups exit on the tile flag instead of the state.
+    if (all(groupThreadId.xy == uint2(0u))) {
+      cloudFallbackTiles[(dispatchId.xy - groupThreadId.xy) * uint(kCloudRebuildBlock) / uint(kCloudFallbackTilePixels)] = 0u;
+    }
+#endif
     return;
   }
 
@@ -1184,6 +1266,17 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
       // The ray through the pixel's centre: the cell schedules' surface distance and the resolve's
       // history reprojection.
       CloudViewRay centerRay;
+      // The split quarter march's exact mode (bit 23) gathers only from its pixel's tile of the
+      // one-pass schedule. A pixel whose history is short takes the wide fill, and from one tile
+      // that is one flat blur per tile, which shows as blocks after a reset. With bit 29 such a pixel
+      // gathers across tiles like schedule 1: no history, a weather jump (bit 28), or last frame's
+      // length at this pixel under kCloudTemporalFillSamples.
+      bool exactTiles = (args.cloudScreenInterleave & 0x800000u) != 0u;
+      if (exactTiles && step != 0u && (args.cloudScreenInterleave & 0x20000000u) != 0u) {
+        exactTiles = (args.cloudScreenInterleave & 0x20000u) != 0u
+                  && (args.cloudScreenInterleave & kCloudWeatherJumpBit) == 0u
+                  && PrevCloudState.Load(int3(q, 0)).x >= kCloudTemporalFillSamples;
+      }
       if (step != 0u) {
         centerRay = cloudViewRay(pixelCoord, outputDim, vec2(0.0f), lensSlot, args);
         if (!fullRate) {
@@ -1205,7 +1298,7 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
               }
               // The split quarter march's exact mode (bit 23) keeps to the one-pass quarter
               // schedule's shifted group tiles, so it gives that schedule's image.
-              if ((args.cloudScreenInterleave & 0x800000u) != 0u && any((c + tileShift) / int2(CLOUD_GROUP_X, CLOUD_GROUP_Y)
+              if (exactTiles && any((c + tileShift) / int2(CLOUD_GROUP_X, CLOUD_GROUP_Y)
                                     != (qCell + tileShift) / int2(CLOUD_GROUP_X, CLOUD_GROUP_Y))) {
                 continue;
               }
@@ -1293,7 +1386,9 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
       // where none in reach met cloud, one fetch of the texel's last state tells whether last frame
       // left it empty with an empty fresh neighbourhood too (state .w = 1). Then the pixel is written
       // empty without the history reprojection and the resolve.
-      const bool emptySkip = (args.cloudScreenInterleave & 0x400000u) != 0u;
+      // After a weather jump the skip and its flags pause, so a pixel the new weather fills is resolved.
+      const bool emptySkip = (args.cloudScreenInterleave & 0x400000u) != 0u
+                          && (args.cloudScreenInterleave & kCloudWeatherJumpBit) == 0u;
       if (emptySkip && !march && freshEmpty && args.cloudTemporalHistoryWeight > 0.0f
           && (args.cloudScreenInterleave & 0x20000u) != 0u) {
         const vec4 prevState = PrevCloudState.Load(int3(q, 0));

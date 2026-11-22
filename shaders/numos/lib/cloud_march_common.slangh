@@ -1834,6 +1834,12 @@ vec3 cloudAureoleRadiance(vec3 viewDirYUp, float viewTransmittance, vec3 cloudRa
   if (args.cloudForwardPeakWeight <= 0.0f || viewTransmittance >= 1.0f) {
     return vec3(0.0f);
   }
+  // The aureole is the disk's light carried along the view ray, so it needs the ray to reach the sky.
+  // A ray that ends on a surface has no disk behind it; the cloud in front of that surface keeps the
+  // in-scattered light the march gives it.
+  if (tMaxClamp > 0.0f && tMaxClamp < kNoSurfaceKm) {
+    return vec3(0.0f);
+  }
   // Below the horizon its air mass grows steeply, so a set sun or moon fades out.
   const vec3 light = args.sunIlluminance * getAtmosphericTransmittanceForDir(ctx.sunDirYUp, args);
   float tau = -log(max(viewTransmittance, 1e-30f));

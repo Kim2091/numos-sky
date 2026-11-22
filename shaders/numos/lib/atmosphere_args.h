@@ -400,7 +400,9 @@ struct AtmosphereArgs {
   // Relative depth tolerance of the composite's depth-aware near-field upsample
   // (rtx.atmosphere.aerialPerspectiveUpsampleDepthTolerance; 0 = plain bilinear).
   float apUpsampleDepthTolerance;
-  uint  padAp1;
+  // The screen clouds' in-cloud history floor, in frames (rtx.atmosphere.cloudTemporalInCloudMinFrames):
+  // the motion-ambiguity lag cap never goes below it. 0 = no floor.
+  float cloudTemporalInCloudMinFrames;
   uint  padAp2;
 };
 

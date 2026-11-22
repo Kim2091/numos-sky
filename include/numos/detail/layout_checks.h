@@ -199,7 +199,7 @@ static_assert(offsetof(AtmosphereArgs, nightSkyIlluminance) == 1440, "Atmosphere
 static_assert(offsetof(AtmosphereArgs, padNightSky0) == 1452, "AtmosphereArgs::padNightSky0 offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, apLocalLightTileMaxCount) == 1456, "AtmosphereArgs::apLocalLightTileMaxCount offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, apUpsampleDepthTolerance) == 1460, "AtmosphereArgs::apUpsampleDepthTolerance offset differs from the shader");
-static_assert(offsetof(AtmosphereArgs, padAp1) == 1464, "AtmosphereArgs::padAp1 offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, cloudTemporalInCloudMinFrames) == 1464, "AtmosphereArgs::cloudTemporalInCloudMinFrames offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, padAp2) == 1468, "AtmosphereArgs::padAp2 offset differs from the shader");
 static_assert(sizeof(AtmosphereArgs) >= 1472, "AtmosphereArgs is smaller than the shader layout");
 

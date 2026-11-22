@@ -120,6 +120,11 @@ namespace {
     args.lightningEnvelopePrevious   = 0.0f;
     // Interleave words carry this frame's phase; no bake reads them.
     args.cloudScreenInterleave         = 0u;
+    // The last row: the haze's tile light cap and upsample tolerance, the screen clouds' in-cloud
+    // history floor. Read only by their own passes and the composites.
+    args.apLocalLightTileMaxCount      = 0u;
+    args.apUpsampleDepthTolerance      = 0.0f;
+    args.cloudTemporalInCloudMinFrames = 0.0f;
     args.cloudReprojectDepthTolerance  = 0.0f;
     args.cloudDomeInterleave           = 0u;
     // Detail LOD applies to the view march only; the bakes pass lod 0 themselves.
@@ -1188,7 +1193,9 @@ AtmosphereArgs Renderer::Impl::getAtmosphereArgs() const {
     // cells are 4x4 (sixteenth), bit 21 the quarter march runs in separate passes, bit 22 the
     // empty-pixel skip, bit 23 the split quarter march keeps to the one-pass tiles (schedule 2),
     // bit 24 the march's early exit, bit 25 the lighting LOD by distance (both also read by the
-    // reflection dome bake).
+    // reflection dome bake), bit 26 the smoothed lag-cap gradient, bit 27 the stable in-cloud
+    // reprojection depth, bit 28 the soft history reset after a weather jump, bit 29 the cross-tile
+    // gather of short-history pixels in the exact split quarter march.
     args.cloudScreenInterleave = (m_cloudTemporalHistoryValid ? (1u << 17u) : 0u)
       | (cloudQuarterMarchActive() ? (1u << 18u) : 0u)
       | (cloudSixteenthMarchActive() ? (1u << 19u) : 0u)
@@ -1196,7 +1203,12 @@ AtmosphereArgs Renderer::Impl::getAtmosphereArgs() const {
       | (cloudQuarterSplitValidation() ? (1u << 23u) : 0u)
       | (m_settings.cloudEmptyPixelSkip ? (1u << 22u) : 0u)
       | (m_settings.cloudMarchEarlyExit ? (1u << 24u) : 0u)
-      | (m_settings.cloudLightingLodByDistance ? (1u << 25u) : 0u);
+      | (m_settings.cloudLightingLodByDistance ? (1u << 25u) : 0u)
+      | (m_settings.cloudTemporalSmoothLagGradient ? (1u << 26u) : 0u)
+      | (m_settings.cloudTemporalStableDepth ? (1u << 27u) : 0u)
+      | (m_cloudWeatherJumpFrames > 0u ? (1u << 28u) : 0u)
+      | (m_settings.cloudCrossTileFillShortHistory ? (1u << 29u) : 0u);
+    args.cloudTemporalInCloudMinFrames = float(std::clamp(m_settings.cloudTemporalInCloudMinFrames, 0, 64));
     args.cloudTemporalHistoryWeight = std::min(std::max(m_settings.cloudTemporalHistoryWeight, 0.0f), 0.98f);
     args.cloudTemporalStillSamples = float(std::clamp(m_settings.cloudTemporalStillSamples, 1, 1024));
     args.cloudReprojectDepthTolerance = std::max(m_settings.cloudHistoryDepthTolerance, 0.0f);
@@ -2901,6 +2913,70 @@ void Renderer::Impl::setCloudShadowCameraPosition(const Vector3& cameraWorldPosY
 // The camera in the cloud frame (args.cameraWorldPosYUpKm): the resolved anchor, with its height
 // measured from the ground datum and the cloud field's vertical offset taken out. Everything placed
 // in the cloud frame (the lightning strike, numosWorldToCloudKm in the shaders) is relative to this.
+// Whether the camera is inside a cloud layer's slab and moving, held for kCloudInsideMovingHoldFrames
+// after it last was, so the march rate does not flip at every pause or slab edge.
+void Renderer::Impl::updateCloudInsideMoving() {
+  const float y = cloudFrameCameraKm().y;
+  bool inside = false;
+  if (m_settings.cloudEnabled && m_settings.cloudCoverageMean > 0.01f) {
+    const float base = m_settings.cloudBaseHeightMeters * 0.001f;
+    inside = inside || (y >= base && y <= base + std::max(m_settings.cloudDepthMeters, 0.0f) * 0.001f);
+  }
+  if (m_settings.cloudEnabled && m_settings.cloudLayer2Enable && m_settings.cloudLayer2CoverageMean > 0.01f) {
+    const float base = m_settings.cloudLayer2FollowCamera ? y + m_settings.cloudLayer2CameraOffsetMeters * 0.001f
+                                                          : m_settings.cloudLayer2BaseHeightMeters * 0.001f;
+    inside = inside || (y >= base && y <= base + std::max(m_settings.cloudLayer2DepthMeters, 1.0f) * 0.001f);
+  }
+  // A centimeter a frame (about 0.6 m/s at 60 fps) counts as moving.
+  constexpr float kMovingKmPerFrame = 1e-5f;
+  if (inside && m_cloudAnchorSpeedEmaKm > kMovingKmPerFrame) {
+    m_cloudInsideMovingFrames = kCloudInsideMovingHoldFrames;
+  } else if (m_cloudInsideMovingFrames > 0u) {
+    --m_cloudInsideMovingFrames;
+  }
+}
+
+// A weather switch with no or a very short ease changes the cloud field in a frame or two. The screen
+// filter's change test then shortens the history pixel by pixel, which leaves patches of stale cloud
+// and blocks of fresh fill for a while. A jump in any of the inputs that shape the cloud field
+// (beyond what an ease of about half a second moves in one frame) sets a soft reset for
+// cloudWeatherJumpResetFrames frames: the screen pass caps every history at a couple of samples and
+// sets no empty-pixel flags (screen pass bit 28).
+void Renderer::Impl::updateCloudWeatherJump() {
+  const Settings& s = m_settings;
+  // Unit-free per-frame changes: coverage and type in their 0-1 range, densities and sizes relative.
+  auto relative = [](float a, float b, float floor) { return std::abs(a - b) / std::max(std::max(std::abs(a), std::abs(b)), floor); };
+  const float key[kCloudWeatherKeySize] = {
+    s.cloudEnabled ? 1.0f : 0.0f, s.cloudLayer2Enable ? 1.0f : 0.0f,
+    s.cloudCoverageMean, s.cloudCoverageSpread, s.cloudTypeMean, s.cloudTypeSpread,
+    s.cloudLayer2CoverageMean, s.cloudLayer2TypeMean, s.nubis3ErosionStrength,
+    s.cloudDensity, s.cloudLayer2DensityScale, s.cloudBaseHeightMeters, s.cloudDepthMeters,
+    s.cloudLayer2BaseHeightMeters, s.cloudLayer2DepthMeters, s.cloudBodyBillowSizeKm };
+  bool jump = false;
+  if (m_cloudWeatherKeyValid) {
+    const float* p = m_cloudWeatherKey;
+    constexpr float kAbsoluteJump = 0.03f;  // a 0-1 field: an ease of 0.5 s at 60 fps moves 1 / 30
+    constexpr float kRelativeJump = 0.05f;
+    jump = key[0] != p[0] || key[1] != p[1];
+    for (int i = 2; i <= 8; ++i) {
+      jump = jump || std::abs(key[i] - p[i]) > kAbsoluteJump;
+    }
+    jump = jump || relative(key[9], p[9], 0.01f) > kRelativeJump || relative(key[10], p[10], 0.01f) > kRelativeJump
+      || std::abs(key[11] - p[11]) > kRelativeJump * std::max(key[12], 100.0f)
+      || relative(key[12], p[12], 100.0f) > kRelativeJump
+      || std::abs(key[13] - p[13]) > kRelativeJump * std::max(key[14], 50.0f)
+      || relative(key[14], p[14], 50.0f) > kRelativeJump
+      || relative(key[15], p[15], 0.05f) > kRelativeJump;
+  }
+  std::copy(key, key + kCloudWeatherKeySize, m_cloudWeatherKey);
+  m_cloudWeatherKeyValid = true;
+  if (jump) {
+    m_cloudWeatherJumpFrames = static_cast<uint32_t>(std::clamp(s.cloudWeatherJumpResetFrames, 0, 30));
+  } else if (m_cloudWeatherJumpFrames > 0u) {
+    --m_cloudWeatherJumpFrames;
+  }
+}
+
 Vector3 Renderer::Impl::cloudFrameCameraKm() const {
   Vector3 camera = m_cameraWorldPosYUpKm;
   camera.y -= m_groundLevelYUpKm + m_settings.cloudVerticalOffsetWorldUnits / worldUnitsPerKm();
@@ -3406,6 +3482,12 @@ uint32_t Renderer::Impl::cloudMarchStride() const {
   case 3: return 4u;
   default: break;
   }
+  // Inside a cloud layer and moving, every pixel's cloud is volumetric and the history is short
+  // (the motion-ambiguity cap), so a quarter march leaves about one own sample per pixel: Auto
+  // marches at full rate there (updateCloudInsideMoving).
+  if (m_settings.cloudFullRateInsideCloud && m_cloudInsideMovingFrames > 0u) {
+    return 1u;
+  }
   constexpr float kFastSamples = 4.0f;          // the change test's fast history (cloud_render.comp.slang)
   constexpr float kMaxUpscale = 3.0f;           // the coarsest host upscale the full-rate layer holds up at
   constexpr float kMinEquivalentLines = 360.0f; // that upscale at the lowest targeted output (1080 / 3)
@@ -3494,8 +3576,11 @@ void Renderer::Impl::dispatchCloudRender(PassRecorder& rec, GpuHandle linearView
   std::swap(m_cloudStateRT, m_cloudStatePrevious);
   const bool splitQuarter = cloudQuarterSplitActive();
   const bool fullPrecision = cloudQuarterSplitFullPrecision();
-  ensureCloudFreshTextures(rec, !splitQuarter ? CloudFreshLayout::Sixteenth
-                              : (fullPrecision ? CloudFreshLayout::QuarterFull : CloudFreshLayout::Quarter));
+  // The full-rate pass only declares the fresh textures, so it keeps whatever layout they have.
+  if (cloudSixteenthMarchActive() || splitQuarter || !m_cloudFreshColor.isValid()) {
+    ensureCloudFreshTextures(rec, !splitQuarter ? CloudFreshLayout::Sixteenth
+                                : (fullPrecision ? CloudFreshLayout::QuarterFull : CloudFreshLayout::Quarter));
+  }
   AtmosphereArgs args = getCloudArgs();
   traceCloudPlacement(args);
   m_cloudProfileState.samples = args.cloudViewSamples;
@@ -3915,6 +4000,11 @@ void Renderer::Impl::updateFrame(PassRecorder& rec, float deltaTimeSeconds) {
 
   // Placement uses this frame's camera position.
   placeLightning();
+
+  // Before anything reads the march rate (cloudMarchStride).
+  updateCloudInsideMoving();
+  // Before getCloudArgs sets the screen pass's soft-reset bit.
+  updateCloudWeatherJump();
 
   ensureCloudRenderRT(rec, m_inputs.renderWidth, m_inputs.renderHeight);
 

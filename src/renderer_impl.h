@@ -124,6 +124,17 @@ struct Renderer::Impl {
   float hazeWorldUnitsPerKm() const;
   float resolveUnitsPerMeter() const;
   Vector3 cloudFrameCameraKm() const;
+  void updateCloudInsideMoving();
+  void updateCloudWeatherJump();
+  // The cloud-shaping weather inputs of the last frame, and the frames left of the soft history reset
+  // a jump in them set (updateCloudWeatherJump).
+  static constexpr int kCloudWeatherKeySize = 16;
+  float    m_cloudWeatherKey[kCloudWeatherKeySize] = {};
+  bool     m_cloudWeatherKeyValid = false;
+  uint32_t m_cloudWeatherJumpFrames = 0u;
+  // Frames left in which the camera counts as inside a cloud layer and moving (cloudMarchStride).
+  uint32_t m_cloudInsideMovingFrames = 0u;
+  static constexpr uint32_t kCloudInsideMovingHoldFrames = 60u;
   Vector3 worldToCloudKm(const Vector3& renderPosition) const;
   Vector3 cloudKmToWorld(const Vector3& cloudKm) const;
   // Ground level (docs/DESIGN.md "Ground level"): manual, or measured into m_groundField.

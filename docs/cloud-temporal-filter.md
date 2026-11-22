@@ -56,8 +56,21 @@ colour and depth histories):
   - resampled (camera or wind moving: the reprojection lands off texel centres, every bilinear resample
     blurs) at about `1 / (1 - cloudTemporalHistoryWeight)` frames, converted to samples by the
     effective samples a frame (`(1 + (A - 1) * 0.25) / A` for cell area A), the old filter's time constant;
-  - inside the deck also by the motion-ambiguity lag cap (unchanged, now a length in frames
-    `1 + lag / ambiguity`).
+  - inside the deck also by the motion-ambiguity lag cap, a length in frames `1 + lag / ambiguity`
+    with `lag = 0.02 / gradient` pixels from the history's local gradient. Inside the deck the history
+    is itself short, so a raw gradient's noise would shorten it further and the cap collapsed to one or
+    two samples at speed (blotchy noise while moving through cloud or ground fog). With
+    `cloudTemporalSmoothLagGradient` (default on, screen pass bit 26) each gradient tap averages three
+    texels across its axis and the lag may reach 64 pixels instead of 16; `cloudTemporalInCloudMinFrames`
+    (default 6, 0 = off) floors the cap in frames.
+- **Reprojection depth.** The history is reprojected through the fresh transmittance-weighted mean
+  depth. Inside the deck that is the mean of a few jittered marches and wobbles by tens of percent
+  from frame to frame, so the reprojection point wobbled with it. With `cloudTemporalStableDepth`
+  (default on, screen pass bit 27) a volumetric pixel reprojects at the history's own mean depth
+  (read where the fresh depth reprojects, blended with it in log depth by how volumetric the ray is),
+  and the resolve writes the mean depth filtered with the history (log depth, weight
+  `volumetric * N / (N + c)`), so the history's depth is itself smooth. Cloud depth.y is that filtered
+  depth on volumetric pixels; seen from outside (volumetric 0) it is unchanged.
 - **A fast history** (`kCloudTemporalFastSamples` = 4) of luminance and transmittance, fed the same values
   with the same weights.
 
@@ -151,6 +164,23 @@ magnification tests, so the cost stops growing with the render resolution. At 25
 0.6M turns the quarter march into the sixteenth, which smears cloud edges in fast flight; that is
 why it is off by default.
 
+**Inside a cloud layer.** While the camera is inside either layer's slab and moving (at least 1 cm
+a frame, as the cloud anchor's speed average sees it), and for 60 frames after, Auto marches at full
+rate (`cloudFullRateInsideCloud`, default on). There every pixel is volumetric and the lag cap keeps
+the history short, so a quarter march leaves about one own sample per pixel. The cost is the
+full-rate march's: about four times the quarter march's rays (the march dominates the pass; the
+rebuild and fallback passes drop out), only while the condition holds. An explicit rate (1-3) is not
+overridden.
+
+**Weather jumps.** Only a camera jump, a skipped frame or a resize drops the history. A weather switch
+with no or a very short ease changes the cloud field within a frame or two, and the change test then
+shortens the history pixel by pixel: stale patches next to blocks of fresh fill. Each frame the
+renderer compares the inputs that shape the cloud field (coverage, type, density, heights, erosion,
+billow size, the layer switches) with the previous frame's; a step larger than an ease of about half a
+second moves in one frame (0.03 of a 0-1 field, 5 % of a density or size) sets a soft reset for
+`cloudWeatherJumpResetFrames` frames (default 4, 0 = off; screen pass bit 28): every history is capped
+at 2 samples and the empty-pixel skip and its flags pause. A gradual ease never trips it.
+
 **Switching.** A DLSS mode change changes the render resolution, which reallocates the cloud targets and starts
 a fresh history (the history is per render pixel; there is nothing valid to keep). A rate change at the same
 resolution (an option change) keeps the history: the resolve handles any lattice spacing, and N counts samples,
@@ -167,7 +197,7 @@ kernel that rebuilds every pixel:
      fresh-sample textures (bindings 25 to 27, RGBA16F / RGBA32F / RG16F, one texel per cell);
   2. rebuild pass (`cloud_render_rebuild`, one lane per pixel, no march): gathers the 3x3 cells' fresh
      samples and resolves against the history. A pixel no fresh sample sees (a silhouette) is marked
-     with state `.w = 1` instead;
+     with state `.w = 2` instead, and its 16x16-pixel tile flagged (a clear sky writes every flag 0);
   3. fallback pass (`cloud_render_fallback`, one lane per pixel): a group whose 16x16-pixel tile the
      rebuild marked nothing in exits after one read of the tile flags (binding 31, R32Uint, written once
      per rebuild group); a group with no marked pixel of its own exits after reading the state; marked pixels are marched and resolved, and their state `.w` is reset
@@ -182,7 +212,11 @@ kernel that rebuilds every pixel:
   - 2, split exact (default): full-precision fresh textures (`cloud_render_march_full`,
     `cloud_render_rebuild_full`, matching the groupshared values), and the rebuild gathers only cells
     from its pixel's tile of the one-pass schedule's shifted group grid. It gives exactly the one-pass
-    image;
+    image. A pixel whose history is short takes the wide fill, and inside one tile that fill is one
+    flat blur per 16x16-pixel tile: square blocks after a reset (seen after an instant weather switch).
+    With `cloudCrossTileFillShortHistory` (default on, screen pass bit 29) a pixel without a history,
+    during a weather jump, or whose last length at that pixel is under `kCloudTemporalFillSamples` (4)
+    gathers across tiles like schedule 1;
   - 3, diagnostic: schedule 1's cross-tile gather with schedule 2's full-precision textures, to tell
     the two differences between 1 and 2 apart.
 - **Full rate** marches every pixel in one pass.
