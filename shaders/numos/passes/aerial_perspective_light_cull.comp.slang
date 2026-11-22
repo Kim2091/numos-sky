@@ -10,7 +10,9 @@
 // the fog), and the lighting pass re-checks each light's true reach per froxel anyway.
 //
 // Thread layer z == apFroxelSlices writes the per-tile list the composite's per-pixel glow reads:
-// every light whose sphere touches the tile's frustum column (four side planes) at any depth.
+// every light whose sphere touches the tile's frustum column (four side planes) at any depth, up to
+// args.apLocalLightTileMaxCount (at most AERIAL_PERSPECTIVE_MAX_LIGHTS_PER_TILE, more than a cluster
+// holds, since the list spans the whole range).
 
 #include "numos/lib/aerial_perspective_lights.slangh"
 #include "numos/lib/aerial_perspective_binding_indices.h"
@@ -68,8 +70,10 @@ void main(uint3 threadId : SV_DispatchThreadID) {
       vec3 n = normalize(cross(rays[k], rays[(k + 1u) & 3u]));
       planes[k] = dot(n, centerRay) < 0.0f ? -n : n;
     }
+    // The CPU sorts the list by importance, so stopping at the cap keeps the brightest lights.
+    const uint tileCap = clamp(args.apLocalLightTileMaxCount, 1u, AERIAL_PERSPECTIVE_MAX_LIGHTS_PER_TILE);
     uint count = 0u;
-    for (uint lightIndex = 0u; lightIndex < lightCount && count < AERIAL_PERSPECTIVE_MAX_LIGHTS_PER_CLUSTER; ++lightIndex) {
+    for (uint lightIndex = 0u; lightIndex < lightCount && count < tileCap; ++lightIndex) {
       const AerialPerspectiveLight light = aerialPerspectiveLights[lightIndex];
       const vec3 rel = light.position - args.cameraPosition;
       bool outside = false;

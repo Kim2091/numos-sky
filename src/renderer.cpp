@@ -1256,6 +1256,8 @@ AtmosphereArgs Renderer::Impl::getAtmosphereArgs() const {
     args.apSceneShadow = m_settings.aerialPerspectiveSceneShadow ? 1u : 0u;
     args.apLocalLightShadows = m_settings.aerialPerspectiveLocalLightShadows ? 1u : 0u;
     args.apHistoryWeightMin = 1.0f / float(std::clamp(m_settings.aerialPerspectiveHistoryFrames, 1, 255));
+    args.apSkyHistoryWeightMin = 1.0f / float(std::clamp(m_settings.aerialPerspectiveSkyHistoryFrames, 1, 255));
+    args.apSkyFilterRadius = static_cast<uint32_t>(std::clamp(m_settings.aerialPerspectiveSkyFilterRadius, 0, 2));
     args.apHistoryReset = 0u;  // set per dispatch by dispatchAerialPerspective
     args.apDebugView = static_cast<uint32_t>(std::clamp(m_settings.aerialPerspectiveDebugView, 0, 10));
 
@@ -1274,6 +1276,9 @@ AtmosphereArgs Renderer::Impl::getAtmosphereArgs() const {
     args.apLocalLightTilesX = (grid.x + AERIAL_PERSPECTIVE_LIGHT_TILE_SIZE - 1u) / AERIAL_PERSPECTIVE_LIGHT_TILE_SIZE;
     args.apLocalLightTilesY = (grid.y + AERIAL_PERSPECTIVE_LIGHT_TILE_SIZE - 1u) / AERIAL_PERSPECTIVE_LIGHT_TILE_SIZE;
     args.apLocalLightIntensity = std::max(m_settings.aerialPerspectiveLocalLightIntensity, 0.0f);
+    args.apLocalLightTileMaxCount = static_cast<uint32_t>(std::clamp(m_settings.aerialPerspectiveLocalLightTileMaxCount, 1,
+      static_cast<int>(AERIAL_PERSPECTIVE_MAX_LIGHTS_PER_TILE)));
+    args.apUpsampleDepthTolerance = std::clamp(m_settings.aerialPerspectiveUpsampleDepthTolerance, 0.0f, 1.0f);
     args.apHostLightInjection = active && m_inputs.hostLocalLightInjection ? 1u : 0u;
   }
 
@@ -2052,6 +2057,20 @@ void Renderer::Impl::ensureAerialPerspectiveResources(PassRecorder& rec, const A
   }
   replaceTexture(rec, m_apLightInjection, createTexture(rec, "Atmosphere AP Light Injection", TextureType::Tex3D,
     Format::RGBA16Float, grid.x, grid.y, grid.z, 1));
+  // R32F: kApNoSurface (1e30) does not fit a half.
+  for (uint32_t i = 0; i < 2; ++i) {
+    replaceTexture(rec, m_apTileDepth[i], createTexture(rec,
+      i == 0 ? "Atmosphere AP Tile Depth 0" : "Atmosphere AP Tile Depth 1", TextureType::Tex2D,
+      Format::R32Float, grid.x, grid.y, 1, 1));
+  }
+  replaceTexture(rec, m_apHiddenDepth, createTexture(rec, "Atmosphere AP Hidden Depth", TextureType::Tex2D,
+    Format::R32Float, grid.x, grid.y, 1, 1));
+  {
+    // Read by the lighting pass with skipping off too; 0 hides nothing (no froxel's near face is past it
+    // and the skip test is off).
+    const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    rec.gpu().clearTexture(m_apHiddenDepth.handle, zero);
+  }
   const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
   rec.gpu().clearTexture(m_apLightInjection.handle, zero);
   m_apHistoryValid = false;
@@ -2071,8 +2090,7 @@ void Renderer::Impl::dispatchAerialPerspective(PassRecorder& rec) {
   AtmosphereArgs args = getCloudArgs();
 
   // History is only meaningful for the same grid over consecutive frames.
-  const ApHistoryKey key { grid.x, grid.y, grid.z, args.apFroxelRange, args.apWorldUnitsPerKm,
-                           args.fogExtinctionPerKm, args.fogScaleHeightKm, args.apSceneShadow };
+  const ApHistoryKey key { grid.x, grid.y, grid.z, args.apFroxelRange, args.apWorldUnitsPerKm, args.apSceneShadow };
   const bool historyUsable = m_apHistoryValid && !m_inputs.cameraCut
     && m_apLastFrame + 1u == m_inputs.frameIndex && std::memcmp(&key, &m_apHistoryKey, sizeof(key)) == 0;
   args.apHistoryReset = historyUsable ? 0u : 1u;
@@ -2134,8 +2152,9 @@ void Renderer::Impl::dispatchAerialPerspective(PassRecorder& rec) {
   // ---- light cull: every cluster's count is written whenever there are lights ----
   const uint32_t tilesX = args.apLocalLightTilesX;
   const uint32_t tilesY = args.apLocalLightTilesY;
-  // Per-slice clusters, then one per-tile list over the whole range (the composite's).
-  const uint32_t requiredUints = tilesX * tilesY * (grid.z + 1u) * AERIAL_PERSPECTIVE_LIGHT_CLUSTER_STRIDE;
+  // Per-slice clusters, then one longer per-tile list over the whole range (the composite's).
+  const uint32_t requiredUints = tilesX * tilesY
+    * (grid.z * AERIAL_PERSPECTIVE_LIGHT_CLUSTER_STRIDE + AERIAL_PERSPECTIVE_LIGHT_TILE_STRIDE);
   if (!m_apLightClusterBuffer.isValid() || m_apLightClusterCapacity < requiredUints) {
     replaceBuffer(rec, m_apLightClusterBuffer, createBuffer(rec, "Atmosphere AP Light Clusters",
       BufferUsage::Structured, sizeof(uint32_t) * requiredUints));
@@ -2192,8 +2211,39 @@ void Renderer::Impl::dispatchAerialPerspectiveNear(PassRecorder& rec, GpuHandle 
   // Covers the cull pass's clusters and the host's linear view Z write.
   rec.barrier();
 
-  // ---- froxel lighting: previous history -> current ----
+  // ---- tile depth: the deepest surface of every column's screen tile ----
+  // Paired with the lighting history: the spare one keeps the previous frame's.
   const uint32_t current = m_apHistoryIndex ^ 1u;
+  {
+    GpuZone inner(rec.gpu(), "Atmosphere AP Tile Depth");
+    rec.bindConstants(AP_TILE_DEPTH_ATMOSPHERE_ARGS, &args, sizeof(AtmosphereArgs));
+    rec.bindConstants(AP_TILE_DEPTH_SURFACE_ARGS, surfaceArgs, sizeof(surfaceArgs));
+    rec.bindTexture(AP_TILE_DEPTH_LINEAR_VIEW_Z, depth);
+    rec.bindTexture(AP_TILE_DEPTH_OUTPUT, m_apTileDepth[current]);
+    rec.setPass(PassId::aerial_perspective_tile_depth);
+    rec.dispatch((grid.x + 7u) / 8u, (grid.y + 7u) / 8u, 1u);
+  }
+  rec.barrier();
+
+  // ---- hidden depth: the tile depth's maximum over the columns a froxel's readers reach ----
+  // The composite's bilinear aux taps reach one column, the local-light filter (when it runs) its
+  // radius more.
+  const uint32_t localFilterRadius = static_cast<uint32_t>(std::clamp(m_settings.aerialPerspectiveLocalLightFilterRadius, 0, 2));
+  const bool localFilter = localFilterRadius > 0u && args.apLocalLightCount != 0u && args.apLocalLightShadows != 0u
+    && m_inputs.opaqueTlas != 0;
+  if (m_settings.aerialPerspectiveSkipHiddenFroxels) {
+    GpuZone inner(rec.gpu(), "Atmosphere AP Hidden Depth");
+    const float dilateArgs[4] = { surfaceArgs[0], surfaceArgs[1], float(1u + (localFilter ? localFilterRadius : 0u)), 0.0f };
+    rec.bindConstants(AP_TILE_DEPTH_ATMOSPHERE_ARGS, &args, sizeof(AtmosphereArgs));
+    rec.bindConstants(AP_TILE_DEPTH_SURFACE_ARGS, dilateArgs, sizeof(dilateArgs));
+    rec.bindTexture(AP_TILE_DEPTH_INPUT, m_apTileDepth[current]);
+    rec.bindTexture(AP_TILE_DEPTH_OUTPUT, m_apHiddenDepth);
+    rec.setPass(PassId::aerial_perspective_tile_depth_dilate);
+    rec.dispatch((grid.x + 7u) / 8u, (grid.y + 7u) / 8u, 1u);
+    rec.barrier();
+  }
+
+  // ---- froxel lighting: previous history -> current ----
   {
     GpuZone inner(rec.gpu(), "Atmosphere AP Froxel Lighting");
     const bool traced = m_inputs.opaqueTlas != 0
@@ -2213,10 +2263,47 @@ void Renderer::Impl::dispatchAerialPerspectiveNear(PassRecorder& rec, GpuHandle 
     rec.bindTexture(AP_LIGHTING_INJECTION, m_apLightInjection);
     rec.bindTexture(AP_LIGHTING_LINEAR_VIEW_Z, depth);
     rec.bindConstants(AP_LIGHTING_SURFACE_ARGS, surfaceArgs, sizeof(surfaceArgs));
+    rec.bindTexture(AP_LIGHTING_TILE_DEPTH, m_apTileDepth[current]);
+    rec.bindTexture(AP_LIGHTING_HISTORY_TILE_DEPTH, m_apTileDepth[m_apHistoryIndex]);
+    rec.bindTexture(AP_LIGHTING_HIDDEN_DEPTH, m_apHiddenDepth);
+    // ApLightingArgs (aerial_perspective_froxel_lighting.comp.slang).
+    struct {
+      uint32_t skyEveryFrameWithoutSun, penumbraEveryFrame;
+      float disagreementWeight, edgeMargin;
+      float revealAge;
+      uint32_t revealUncovered, holdMovedSamples, skipHidden;
+      uint32_t hashedTurnPhase, pad9, pad10, pad11;
+    } lightingArgs {};
+    lightingArgs.skyEveryFrameWithoutSun = m_settings.aerialPerspectiveSkyEveryFrameWithoutSun ? 1u : 0u;
+    lightingArgs.penumbraEveryFrame = m_settings.aerialPerspectivePenumbraEveryFrame ? 1u : 0u;
+    lightingArgs.disagreementWeight = std::clamp(m_settings.aerialPerspectiveDisagreementWeight, 0.0f, 1.0f);
+    lightingArgs.edgeMargin = std::clamp(m_settings.aerialPerspectiveEdgeHistoryMargin, 0.0f, 0.5f);
+    lightingArgs.revealAge = float(std::clamp(m_settings.aerialPerspectiveRevealHistoryFrames, 0, 255));
+    lightingArgs.revealUncovered = m_settings.aerialPerspectiveFastReveal ? 1u : 0u;
+    lightingArgs.holdMovedSamples = m_settings.aerialPerspectiveSilhouetteFix ? 1u : 0u;
+    lightingArgs.skipHidden = m_settings.aerialPerspectiveSkipHiddenFroxels ? 1u : 0u;
+    lightingArgs.hashedTurnPhase = m_settings.aerialPerspectiveHashedTurnPhase ? 1u : 0u;
+    rec.bindConstants(AP_LIGHTING_PARAMS, &lightingArgs, sizeof(lightingArgs));
     rec.setPass(traced ? PassId::aerial_perspective_froxel_lighting_traced : PassId::aerial_perspective_froxel_lighting);
     rec.dispatch((grid.x + 7u) / 8u, (grid.y + 7u) / 8u, grid.z);
   }
   rec.barrier();
+
+  // ---- local-light visibility filter: current aux -> the spare one ----
+  // The spare volume held the history this frame's lighting pass has just read, so it is free until
+  // the next lighting pass writes it. The outputs name the filtered copy; the next frame's history
+  // stays the unfiltered current volume.
+  m_apAuxOutputIndex = current;
+  if (localFilter) {
+    GpuZone inner(rec.gpu(), "Atmosphere AP Froxel Filter");
+    const uint32_t filterArgs[4] = { localFilterRadius, grid.x, grid.y, grid.z };
+    rec.bindConstants(AP_FILTER_ARGS, filterArgs, sizeof(filterArgs));
+    rec.bindTexture(AP_FILTER_INPUT, m_apFroxelAux[current]);
+    rec.bindTexture(AP_FILTER_OUTPUT, m_apFroxelAux[m_apHistoryIndex]);
+    rec.setPass(PassId::aerial_perspective_froxel_filter);
+    rec.dispatch((grid.x + 7u) / 8u, (grid.y + 7u) / 8u, grid.z);
+    m_apAuxOutputIndex = m_apHistoryIndex;
+  }
 
   // ---- froxel integration ----
   // The integration also counts the columns whose pixels take the far field. The next beginFrame
@@ -2233,8 +2320,7 @@ void Renderer::Impl::dispatchAerialPerspectiveNear(PassRecorder& rec, GpuHandle 
     rec.bindTexture(AP_INTEGRATE_CLOUD_SHADOW_MAP, m_cloudShadowMap);
     rec.bindSampler(AP_INTEGRATE_CLOUD_SAMPLER, cloudSampler);
     rec.bindTexture(AP_INTEGRATE_OUTPUT, m_apNearScatter);
-    rec.bindTexture(AP_INTEGRATE_LINEAR_VIEW_Z, depth);
-    rec.bindConstants(AP_INTEGRATE_SURFACE_ARGS, surfaceArgs, sizeof(surfaceArgs));
+    rec.bindTexture(AP_INTEGRATE_TILE_DEPTH, m_apTileDepth[current]);
     rec.bindBuffer(AP_INTEGRATE_FAR_USAGE, m_apFarUsage);
     rec.setPass(PassId::aerial_perspective_froxel_integrate);
     rec.dispatch((grid.x + 7u) / 8u, (grid.y + 7u) / 8u, 1u);
@@ -3852,8 +3938,9 @@ void Renderer::Impl::publishOutputs() {
   o.apFarScatter = m_apFarScatter.handle;
   o.apFarTransmittance = m_apFarTransmittance.handle;
   o.apFroxelLighting = m_apFroxelLighting[m_apHistoryIndex].handle;
-  o.apFroxelAux = m_apFroxelAux[m_apHistoryIndex].handle;
+  o.apFroxelAux = m_apFroxelAux[m_apAuxOutputIndex].handle;
   o.apLightInjection = m_apLightInjection.handle;
+  o.apTileDepth = m_apTileDepth[m_apHistoryIndex].handle;
   o.groundLevelWorldUnits = m_groundLevelWorldUnits;
   o.luxPerUnit = luxPerUnit(m_settings);
   o.nightGain = m_nightGains.night;

@@ -15,7 +15,7 @@
 
 namespace numos::detail {
 
-// AtmosphereArgs: 181 members, 1456 bytes in the shader layout
+// AtmosphereArgs: 185 members, 1472 bytes in the shader layout
 static_assert(offsetof(AtmosphereArgs, sunDirection) == 0, "AtmosphereArgs::sunDirection offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, planetRadius) == 12, "AtmosphereArgs::planetRadius offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, sunIlluminance) == 16, "AtmosphereArgs::sunIlluminance offset differs from the shader");
@@ -193,11 +193,15 @@ static_assert(offsetof(AtmosphereArgs, nightSkyGain) == 1416, "AtmosphereArgs::n
 static_assert(offsetof(AtmosphereArgs, apDebugNitsPerUnit) == 1420, "AtmosphereArgs::apDebugNitsPerUnit offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, apDebugView) == 1424, "AtmosphereArgs::apDebugView offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, apDebugRadianceScale) == 1428, "AtmosphereArgs::apDebugRadianceScale offset differs from the shader");
-static_assert(offsetof(AtmosphereArgs, padApDebug0) == 1432, "AtmosphereArgs::padApDebug0 offset differs from the shader");
-static_assert(offsetof(AtmosphereArgs, padApDebug1) == 1436, "AtmosphereArgs::padApDebug1 offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, apSkyHistoryWeightMin) == 1432, "AtmosphereArgs::apSkyHistoryWeightMin offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, apSkyFilterRadius) == 1436, "AtmosphereArgs::apSkyFilterRadius offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, nightSkyIlluminance) == 1440, "AtmosphereArgs::nightSkyIlluminance offset differs from the shader");
 static_assert(offsetof(AtmosphereArgs, padNightSky0) == 1452, "AtmosphereArgs::padNightSky0 offset differs from the shader");
-static_assert(sizeof(AtmosphereArgs) >= 1456, "AtmosphereArgs is smaller than the shader layout");
+static_assert(offsetof(AtmosphereArgs, apLocalLightTileMaxCount) == 1456, "AtmosphereArgs::apLocalLightTileMaxCount offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, apUpsampleDepthTolerance) == 1460, "AtmosphereArgs::apUpsampleDepthTolerance offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, padAp1) == 1464, "AtmosphereArgs::padAp1 offset differs from the shader");
+static_assert(offsetof(AtmosphereArgs, padAp2) == 1468, "AtmosphereArgs::padAp2 offset differs from the shader");
+static_assert(sizeof(AtmosphereArgs) >= 1472, "AtmosphereArgs is smaller than the shader layout");
 
 // MoonParams: 12 members, 96 bytes in the shader layout
 static_assert(offsetof(MoonParams, direction) == 0, "MoonParams::direction offset differs from the shader");

@@ -35,15 +35,15 @@ RTXDI submodule. Numbers are Remix defaults.)
   buffered: ~54 MB at the default grid. ReSTIR reservoirs on a coarser grid (XY / 4, 128 slices,
   RGBA32UI, double buffered).
 * **Passes.** Volume ReSTIR initial (RIS over ~32 light candidates, optional visibility ray),
-  optional visibility reuse, temporal reuse (M <= 2), spatial reuse (8 neighbours), then the
+  optional visibility reuse, temporal reuse (M <= 2), spatial reuse (8 neighbors), then the
   integrate pass: per main froxel one reservoir, **one NEE shadow ray**, radiance added to the SH.
   About 2.1 M + 0.26 M rays per frame at the default grid. Lights are the whole Remix light list
   (sun and moons included, cloud shadow folded onto the sun), each scaled by its
   `volumetricRadianceScale`; shadow rays use `OBJECT_MASK_OPAQUE | OBJECT_MASK_ALPHA_BLEND`.
-* **Temporal.** Each froxel centre is reprojected into the previous grid with the previous camera,
+* **Temporal.** Each froxel center is reprojected into the previous grid with the previous camera,
   history is read trilinearly, weight `1/(age+5)`, age capped at 128 frames. Out-of-frustum
   reprojection or a camera cut resets. Sample positions are jittered by +-0.5 froxel; no
-  neighbourhood clamping.
+  neighborhood clamping.
 * **Medium.** Homogeneous: `transmittanceColor` at `transmittanceMeasurementDistance` gives
   sigma_t, `singleScatteringAlbedo`, HG `anisotropy`. Optional fBm density noise applied only in
   the composite; optional "atmosphere" clip sphere as a crude height fog.
@@ -94,9 +94,14 @@ One participating medium, evaluated identically by both volumes:
   in haze km (`numosWorldToAirKm`; DESIGN.md "Units and scale").
 * **Height fog** (new): exponential, `sigma_t(h) = sigma0 * exp(-(h - h0) / H)` with sigma0 from a
   meteorological visibility (`fogVisibilityMeters`, Koschmieder: sigma0 = 3.912 / V, 0 = off),
-  scale height `fogHeightFalloffMeters`, base `fogBaseHeightMeters`, grey albedo `fogAlbedo`, HG
+  scale height `fogHeightFalloffMeters`, base `fogBaseHeightMeters`, gray albedo `fogAlbedo`, HG
   `fogAnisotropy`. Distances in the same haze km. This is what Remix's homogeneous fog presets map
   onto (a very large H is homogeneous fog).
+* **Clear zone** (`fogNearFadeMeters`, default 40 m): the fog's density is multiplied by a
+  smoothstep from 0 at the camera to 1 at that distance, so the player's surroundings stay
+  readable in thick fog. The in-scatter (every medium sample) and the closed-form transmittance the
+  composite applies use the same ramp; the transmittance integrates it with three Gauss-Legendre
+  taps inside the zone and in closed form past it.
 * Local-light glow also uses haze km. The haze, the fog and the glow share one scale,
   `rtx.atmosphere.hazeWorldScale` (default 1, the game's measured size); the clouds use
   `rtx.atmosphere.worldScale`. With the haze on World Scale, a World Scale below 1 hazed the game's
@@ -120,18 +125,61 @@ One participating medium, evaluated identically by both volumes:
   froxel), then pulled in front of the visible surface its ray meets (4.2.2). It runs in
   `dispatchPostDepth`, with the integration, because that needs the frame's linear view Z. Per
   froxel per frame:
-  * **one environment ray**: on even (froxel parity + frame) a sun visibility ray, on odd a sky
-    visibility ray in a cosine-distributed upper-hemisphere direction. Both against the host TLAS,
+  * **one environment ray**: on even (froxel phase + frame) a sun visibility ray, on odd a sky
+    visibility ray. The phase is one bit of a per-froxel hash (`aerialPerspectiveHashedTurnPhase`,
+    default on); a checkerboard over x + y + z would lock air that moves an odd whole number of
+    froxels a frame to one kind of turn, since its history always comes from a froxel whose turn
+    was the same. The sky ray takes a cosine-distributed upper-hemisphere direction. Both rays are traced against the host TLAS,
     `OBJECT_MASK_OPAQUE`, `FORCE_OPAQUE`, first hit (the old AP's policy). Both terms are
     accumulated temporally, so each converges at half rate but each froxel costs one ray, not twelve.
+    The sun ray is skipped while the sun is below -0.1 (it lights nothing then); with
+    `aerialPerspectiveSkyEveryFrameWithoutSun` (default on) every frame is then a sky turn, blended at
+    the single rate (`max(1 / (age + 1), 1 / aerialPerspectiveSkyHistoryFrames)`), so dark scenes get
+    one sky ray a frame instead of one every two. A term whose history lies in a penumbra
+    (between 0.05 and 0.95, where a 0/1 estimate's variance v (1 - v) is largest) is traced every
+    frame as well, at the single rate (`aerialPerspectivePenumbraEveryFrame`, default on): only
+    shaft edges, doorways and canopies pay the second ray. Outside that band the history is
+    saturated (fully lit or fully shadowed), and a contradicting ray is either a change (an occluder
+    moving through a shaft, a door, a time-of-day jump) or a rare true hit. Two more rays (the sun
+    from other jittered points of the froxel, each with its own depth clamp and guard; the sky in
+    other rotations of its R2 sequence) must agree with it; then the term blends with
+    `aerialPerspectiveDisagreementWeight` (default 0.25) instead of its slow history weight. A rare
+    hit at visibility v passes with probability v^3, so the boost adds no visible bias; a plain
+    "contradiction raises the weight" would lift a froxel at v = 0.03 several-fold on average.
+    The sky directions follow a per-froxel rotation of the R2 low-discrepancy sequence over the
+    froxel's sky turns, not independent random directions: in shaded air (a room beside a doorway)
+    the sky visibility is a few percent made of rare hits, and independent directions clump, which
+    showed as blotches in dark hazy areas. The sky term also has its own, longer history floor,
+    `aerialPerspectiveSkyHistoryFrames` (default 128), since the sky seen from a point changes only
+    when the geometry does.
   * **local lights**: weighted reservoir sampling over the froxel's light cluster (up to 16 lights
     per cluster, target = unshadowed phase-weighted luminance), one shadow ray to the chosen light
     (stops at the emitter surface), estimate `f / p`. Clusters with no lights cost nothing.
+    The pick inverts the cluster's luminance CDF with the froxel's own golden-ratio sequence over
+    frames instead of an independent random number, so successive frames pick each light in close to
+    its exact share. The lamp glow reads its shadowing (Aux.B) from a filtered copy: the
+    `aerial_perspective_froxel_filter` pass writes the aux volume into the spare history volume,
+    whose history this frame's lighting pass has already read, with B averaged under a tent of
+    `aerialPerspectiveLocalLightFilterRadius` froxels (default 1) over the same slice. The lighting
+    pass's history stays unfiltered, so the filter never feeds back. It runs only with local-light
+    shadows on and lights in view.
   * **host injection** (optional): a host volume with the same layout adds its own local-light
     in-scatter (section 4.6).
-  * **temporal**: reproject the froxel centre with the previous camera, trilinear history read,
-    weight `max(1 / (age + 1), 1 / aerialPerspectiveHistoryFrames)` (default 32 frames), reset on
-    out-of-frustum, camera cut or any setting that moves the grid.
+  * **temporal**: reproject the froxel center with the previous camera, trilinear history read,
+    weight `max(1 / (age + 1), 1 / aerialPerspectiveHistoryFrames)` (default 32 frames). A center that
+    reprojects outside the previous grid's sides by at most `aerialPerspectiveEdgeHistoryMargin`
+    (default 0.15 of the screen) is clamped onto the grid and takes that edge history as a prior, its
+    age capped at `aerialPerspectiveRevealHistoryFrames` (default 4), so it re-converges in a few
+    frames instead of starting fresh. A froxel whose history center lay behind every surface of its
+    tile last frame (past the previous tile depth's sample limit, 4.2.2) holds the air in front of
+    that surface; once it is in front of this frame's tile limit again it takes the same capped age
+    (`aerialPerspectiveFastReveal`, default on), so a door, a corner or a vehicle leaves no ghost in
+    the haze. While it stays hidden its age is untouched: only the filtered reads of neighboring
+    columns see it, and a low age would add noise there. The tile depth is double-buffered with the
+    history for this. Reset on out-of-frustum (past that margin, or in depth), camera cut, a change of Scene Shadows or any setting that moves the grid. The
+    fog settings do not reset it: the history holds lighting only. (The local light it stores is
+    weighted with the medium's phase mixture at the sample, so a fog change re-weights it over the
+    history length.)
   * **Fresh froxels** (no history: just entered the frustum, or reset). Until 2026-10-15 a fresh
     froxel started from sun and sky visibility 1 ("unoccluded") and traced only the term its
     alternation turn asked for, so the other term stayed at 1 until its next turn and then decayed
@@ -157,14 +205,20 @@ One participating medium, evaluated identically by both volumes:
   with the energy-conserving form (Hillaire 2015, Eq. 17). Writes cumulative in-scatter (RGB, and
   the mean transmittance in A) at the far edge of every slice. Slices past the deepest visible
   surface of the column's screen tile take the visibility of the last slice in front of it (4.2.2).
+  Before the integration uses the sky visibility it averages it over the neighboring columns of the
+  same slice (`aerialPerspectiveSkyFilterRadius`, default 1: 3x3), counting a neighbor's froxel only
+  in front of its own tile's surface. Sky light in the air varies slowly across the screen; the sun
+  visibility is not filtered, so shafts keep their edges.
 * **Transmittance is not stored.** Both media are exponential in height, so the optical depth of
   any segment inside the near range has a closed form (flat-earth: at 20 km the curvature drop is
   31 m, far below a scale height). The composite evaluates the RGB transmittance per pixel, exactly,
   instead of reading a filtered texture.
 * **Formats.** Lighting: RGBA16F (local RGB, sun visibility) + RGBA16F aux (sky visibility, age,
   local-light visibility, and a copy of the sun visibility for the debug view), double-buffered;
-  integrated: RGBA16F. 3.11 M froxels -> 2 x 49.8 MB + 24.9 MB = **~125 MB** (Remix's default grid:
-  ~54 MB plus its reservoirs). Until 2026-10-16 aux was RGBA8 (~100 MB in all): an 8-bit value v
+  integrated: RGBA16F; the host injection volume: RGBA16F, allocated with the grid. 3.11 M froxels
+  -> 2 x 49.8 MB + 24.9 MB + 24.9 MB = **~150 MB**, plus the far field's 6.3 MB and the tile depth
+  textures' 0.4 MB: **~156 MB** in all (Remix's default grid: ~54 MB plus its reservoirs). Until
+  2026-10-16 aux was RGBA8 (25 MB less): an 8-bit value v
   blended toward 0 with weight w rounds back to itself while 255 v w < 0.5, so at 32 history frames
   a visibility up to ~0.06 never decayed, and single froxels stayed lit for good in a dark room
   (scattered bright squares in debug view 7). In 16-bit float the blend reaches 0.
@@ -187,6 +241,17 @@ froxel steps, view 2 at 0.4-0.6 on every wall, views 6 and 7 black in the air of
   surface, and no history ever holds light from behind a wall. (Keeping the old history for the
   froxels behind it was tried on paper and rejected: their stale values would still reach the
   neighbors through the filtered history read whenever the camera moves.)
+* **Silhouettes** (`aerialPerspectiveSilhouetteFix`, default on). A sample whose pixel lands on a
+  surface nearer than its froxel is moved out of the froxel, in front of that surface. Where other
+  pixels of the tile see into or past the froxel (an object against the sky or a farther wall), the
+  froxel also stands for that open air, and a point hugging the surface sees less sky and often less
+  sun: blended in, those samples darkened the froxels along every silhouette, and the composite's
+  bilinear column reads spread the dark rim onto the fog beside the object (reported in a game's
+  fog preset; Scene Shadows off removed it). Now such a sample (its final forward distance in front
+  of the froxel's near face, the froxel in front of its tile's sample limit) leaves the froxel's
+  sun and sky visibility and its age unchanged and traces no visibility ray. A froxel the whole tile
+  hides still takes every sample in front of the surface. Air behind dense foliage cards, where
+  most samples land on the cards, updates more slowly.
 * **Camera-ray guard** (added the same day, after the first in-game test). The host's depth can lie
   behind the geometry the visibility rays see. RTX Remix writes a displaced surface's depth at the
   relief point (`rtx.displacement.enableDepthOffset`, default on: up to the full displacement depth
@@ -197,11 +262,35 @@ froxel steps, view 2 at 0.4-0.6 on every wall, views 6 and 7 black in the air of
   also traces its own camera ray to the sample point, against the same opaque TLAS and flags as its
   visibility rays. A hit moves the sample to the same offset in front of the hit. Views 9 and 10
   (4.9) show the clamp and the guard at work.
-* **Integration.** Per column, the deepest valid depth over the column's screen tile (every pixel;
-  any sky pixel means no limit). Slices that start past it (minus the same offset) carry the
+* **Tile depth** (`aerial_perspective_tile_depth`, one thread per column). Per column, the deepest
+  valid depth over the column's screen tile (every pixel; any sky pixel, or no host depth, means no
+  limit: `kApNoSurface`), written to an R32F texture the size of the grid's XY (130 KB at 1080p).
+  The integration, its sky filter and the composite read one texel per column from it.
+* **Hidden froxels** (`aerialPerspectiveSkipHiddenFroxels`, default on). The `_dilate` variant of
+  the same pass writes the tile depth's maximum over the columns within 1 + the local-light filter
+  radius (when that filter runs) of each column. A froxel whose near face lies past it is read by
+  nothing: the integration and its sky filter stop at each column's own tile surface, the
+  composite's bilinear aux reads reach one column and stop at the slice holding the pixel's surface
+  (whose near face is never past the tile's deepest depth), and the local-light filter reaches its
+  radius further. Such a froxel traces no rays and runs no light pick: it copies the history at its
+  clamped sample point (the air in front of the surface, which the froxels in front of it keep
+  current), with the age capped at the reveal age, so it starts from that air when it comes into
+  view (and the reveal test above caps it again on that frame). Indoors that is most of the grid
+  past the first walls. `numosAirSegment` reads these froxels too; they hold what they held before,
+  the air in front of other rays' surfaces.
+* **Integration.** Per column, the tile depth. Slices that start past it (minus the same offset) carry the
   visibility of the last slice in front of it, so the cumulative volume stays continuous for the
   neighboring columns' filtered reads. The integration up to a pixel never read past the slice
   holding the pixel's depth (`apCumulativeSliceCoord` blends slice k-1 with k); that is unchanged.
+* **Depth-aware upsample** (`aerialPerspectiveUpsampleDepthTolerance`, default 0.1). The composite
+  reads the integrated volume at the pixel's depth through the 8 px columns. Plain bilinear lets a
+  column on a near wall, which carries its last visible slice past the wall, lend that value to the
+  sky or far pixels beside the silhouette: a halo about one froxel wide (in the silhouette case
+  above, a dark rim). The `numosApplyAerialPerspective` overload that takes `apTileDepth`
+  (`FrameOutputs::apTileDepth`) weights each of the four bilinear column taps by how well the
+  column's tile depth covers the pixel: 1 while the column's deepest surface lies at or past the
+  pixel's depth, falling to 0 once it lies the tolerance (relative) in front of it. The pixel's own
+  column always covers it. No jitter. The old overload stays plain bilinear.
 * **Reads that stop at a surface.** The per-pixel lamp glow's local-light visibility and debug views
   1, 2, 6 and 7 read the aux volume with `apFroxelSliceCoordBefore`: the filtered read may blend
   toward the slice in front of the one holding the pixel's surface, never the one behind it.
@@ -210,26 +299,28 @@ froxel steps, view 2 at 0.4-0.6 on every wall, views 6 and 7 black in the air of
   a sample whose jittered pixel lands on the pole is moved in front of the pole; one landing on the
   sky beside it is not. The pole's own pixels integrate only up to the pole, from froxels whose
   samples were in front of it. The sky pixels beside it integrate the whole column, and the froxels
-  behind the pole in their tile hold a mix: real samples (from sky pixels) and samples moved in
-  front of the pole (from pole pixels), in proportion to how much of the 8 px tile the pole covers.
-  Outdoors the two are usually lit alike; a shaft passing just behind a pole is softened in that
-  tile by the pole's share. The integration's tile limit does nothing there (a sky pixel in the
+  behind the pole in their tile take only the samples from sky pixels: those moved in front of the
+  pole leave their visibility alone (Silhouettes, above), so they update at the share of the 8 px
+  tile the pole leaves free. With the Silhouette Fix off they hold a mix of both kinds, and the
+  moved ones, hugging the pole, darken them. The integration's tile limit does nothing there (a sky pixel in the
   tile means no limit). A first-person weapon model behaves the same way. Cloud shadows are
   analytic in the integration and are not affected at all.
 * **Not covered.** `numosAirSegment` (secondary rays) reads the lighting volume anywhere, including
   froxels behind surfaces, which now hold the air in front of other rays' surfaces rather than the
   air at their own position. A surface the primary rays see through (glass, water with PSR) limits
   the samples only if the host's linear view Z stops there.
-* **No spatial filter.** A 3x3 filter or neighborhood clamp on the visibility before the
-  integration was considered and left out: in a sealed room the visibility is now exactly 0, so
-  there is nothing left to boil, and outdoors a 3x3 filter widens every shaft and shadow edge by a
-  froxel (8 px) while a clamp against binary per-frame samples does nothing.
-* **Cost.** No new pass. The lighting pass reads one depth texel per froxel (3.1 M) and traces one
-  short first-hit guard ray for each sample near or behind a surface. Indoors that is most froxels
-  past the first walls (up to ~2-3 M rays at 1080p, each no longer than the distance to the wall);
-  outdoors, the ground and objects in the lower part of the view. The integration reads its tile's
-  pixels once per column (the render resolution, 2.1 M at 1080p).
-  The two passes move from `beginFrame` to `dispatchPostDepth`; the far LUT and the light cull stay
+* **Spatial filters.** Two, both over neighboring columns of the same slice: the integration's box
+  filter on the sky visibility (`aerialPerspectiveSkyFilterRadius`, counting a neighbor only in front
+  of its own tile's surface) and the froxel filter's tent on the local-light visibility the lamp glow
+  reads (`aerialPerspectiveLocalLightFilterRadius`). The sun visibility is not filtered: a filter
+  would widen every shaft and shadow edge by a froxel (8 px).
+* **Cost.** The lighting pass reads one depth texel per froxel (3.1 M) and traces one
+  short first-hit guard ray for each sample near or behind a surface: the froxels holding a surface
+  and those just behind it (the froxels past every nearby tile's surface are skipped and trace
+  nothing); outdoors, the ground and objects in the lower part of the view. The tile depth pass reads every
+  pixel once (the render resolution, 2.1 M at 1080p); the integration and its sky filter read one
+  texel per column and neighbor instead of the neighbors' whole tiles.
+  The tile depth, lighting, filter and integration passes run in `dispatchPostDepth`; the far LUT and the light cull stay
   in `beginFrame`. Between the two calls `FrameOutputs` still names the previous frame's near-field
   textures.
 
@@ -238,12 +329,13 @@ froxel steps, view 2 at 0.4-0.6 on every wall, views 6 and 7 black in the air of
 A lamp's glow falls off as 1/d^2, far faster than a froxel is wide, so through the grid it showed
 the 8 px cells. The glow is therefore not integrated into the grid. The composite evaluates it per
 pixel (`apLocalLightAirlight`) for every light in the pixel's 8x8-froxel screen tile (the cull pass
-writes one extra per-tile list over the whole range): equiangular quadrature along the pixel's ray
+writes one extra per-tile list over the whole range, of up to `aerialPerspectiveLocalLightTileMaxCount`
+lights, default and most 64, the brightest kept; a per-slice cluster holds 16): equiangular quadrature along the pixel's ray
 (Kulla & Fajardo 2012), 8 fixed midpoint taps in angle around the ray's closest approach, each with
 the real medium, phase, spot shaping, closed-form transmittance from the camera and the froxel
 grid's local-light visibility. In angle the 1/d^2 cancels the Jacobian, so 8 taps are near exact
 however close the ray passes the lamp, with no banding and no noise. The grid supplies only the
-shadowing, as a luminance-weighted visibility in Aux.B: RIS picks lights by unshadowed luminance, so
+shadowing, as a luminance-weighted visibility in Aux.B: the pick follows unshadowed luminance, so
 the picked light's 0/1 visibility is an unbiased sample of it. The lighting pass still stores the
 shadowed RGB estimate for `numosAirSegment`.
 
@@ -255,7 +347,7 @@ tap evaluations, ALU-bound with no rays.
 The composite must now run after the cloud composite, since the near field's air and glow lie in
 front of the clouds.
 
-### 4.3 Far field: camera-centred Hillaire LUT
+### 4.3 Far field: camera-centered Hillaire LUT
 
 `aerial_perspective_far` bakes a 3D LUT indexed like the sky-view LUT (absolute azimuth, sqrt
 latitude) x distance: **128 x 64 x 48**, RGBA16F in-scatter + RGBA16F transmittance (6.3 MB),
@@ -267,12 +359,12 @@ It depends on sun, altitude and clouds, so it is rebuilt every frame; at ~0.8 M 
 it costs a small fraction of the old volume.
 
 Only the host's composite reads it, and only for pixels that miss or lie past the froxel range. The
-integration pass counts the froxel columns whose screen tile holds such a pixel (`apTileSurfaceForward`
+integration pass counts the froxel columns whose screen tile holds such a pixel (tile depth
 beyond `apFroxelRange`) and the count comes back through a three-slot readback ring. After 30 read-back
 frames without one (an interior, or a view at the ground) the LUT is rebuilt only every 8th frame, and
 every frame again as soon as a count is non-zero. The view that next needs it therefore starts from a
 LUT at most 8 frames old, for the two or three frames the readback takes, which the far field's
-kilometre scales do not show.
+kilometer scales do not show.
 
 Height fog is not in this LUT. Its density is exponential in height, so optical depth along any
 ray has a closed form and its in-scatter, lit by the sun and Psi_ms at the fog base, is
@@ -309,7 +401,7 @@ attenuated by the water column in front of it.
 ### 4.5 Cloud-shadow hook
 
 `apCloudSunTransmittance(worldPos)` is the only place either volume asks about clouds. Today it
-reads the camera-centred D_sun grid (`sampleCloudGroundShadow_OptionB_explicit`) inside the grid's
+reads the camera-centered D_sun grid (`sampleCloudGroundShadow_OptionB_explicit`) inside the grid's
 valid half extent and fades to a coverage-based mean past it, because the grid wraps every 12 km
 while the de-tiled cloud field does not. A proper sun-space cloud shadow map (a 2D optical-depth
 map covering ~100 km) would drop in here unchanged.
@@ -325,7 +417,7 @@ map covering ~100 km) would drop in here unchanged.
 * **Host injection.** With `FrameInputs::hostLocalLightInjection`, NUMOS publishes
   `FrameOutputs::aerialPerspectiveLightInjection`, a 3D RGBA16F texture laid out exactly like the
   froxel grid. The host writes, at any point in frame N, the phase-weighted incident local-light
-  radiance per unit scattering coefficient at froxel centres (`numosFroxelCenterWorld` gives the
+  radiance per unit scattering coefficient at froxel centers (`numosFroxelCenterWorld` gives the
   position, `numosFroxelViewDirection` the direction to weight the phase for), e.g. from Remix's
   own Volume ReSTIR passes. NUMOS reads it in frame N+1 through its reprojection, so it takes the
   same temporal path as the built-in samples. Remix can therefore keep its light sampling and
@@ -333,7 +425,12 @@ map covering ~100 km) would drop in here unchanged.
 
 ### 4.7 Path tracer API (`numos_host.slangh`)
 
-* `numosApplyAerialPerspective(...)`: the composite rule above, for primary hits and misses.
+* `numosApplyAerialPerspective(...)`: the composite rule above, for primary hits and misses. It is
+  `numosEvaluateAir` (everything that depends only on the pixel's ray and distance: near field, lamp
+  glow, fog, far field, returned as a `NumosAirComposite`) followed by `numosApplyAir` (laying that
+  over a radiance, with the host's throughput, volumetrics attenuation and cloud layer), then the
+  debug view. A host that composites several layers of one pixel evaluates once and applies per
+  layer.
 * `numosAerialPerspectiveAlongRay(dirWorld, distanceWorld, ...)`: far LUT + fog for any direction
   from the camera, returning in-scatter and RGB transmittance. For reflections and other secondary
   rays whose origin is near the camera, and for clouds.
@@ -432,18 +529,23 @@ At a 1920 x 1080 render resolution with the defaults (240 x 135 x 96 near, 128 x
 | Pass | Threads | Per thread | Rays / frame |
 | --- | --- | --- | --- |
 | light cull | 30 x 17 x 96 clusters, only with lights | light list scan | 0 |
-| froxel lighting | 3.11 M | 1 depth texel, reprojection + 2 history taps, RIS over <= 16 lights | 3.11 M environment + 1 per lit froxel |
-| froxel integrate | 32.4 K columns | its tile's depth texels (64), 96 slices x (2 LUT taps + 1 D_sun tap + fog) | 0 |
+| froxel lighting | 3.11 M | 1 depth texel + 3 tile depth texels, reprojection + 2 history taps, a luminance CDF pick over <= 16 lights; hidden froxels only the depth texel and 2 history taps | 1 environment ray per visible froxel (2 in a penumbra, up to 2 more to confirm a contradiction), + 1 per lit froxel; none for hidden froxels |
+| froxel filter (lights in view, shadows on) | 3.11 M | 9 aux taps at radius 1 (25 at 2) | 0 |
+| tile depth | 32.4 K columns | its tile's depth texels (64) | 0 |
+| hidden depth (skip on) | 32.4 K columns | 9 tile depth texels (25 with the local-light filter at radius 1) | 0 |
+| froxel integrate | 32.4 K columns | 1 + 8 tile depth texels, 96 slices x (2 LUT taps + 1 D_sun tap + fog + 9 sky taps) | 0 |
 | far LUT | 8.2 K | 96 sub-steps x (2 LUT taps + 1 D_sun tap) | 0 |
-| composite | per pixel | 2 near taps + 2-4 far taps + analytic fog + 8 taps per light in the pixel's tile | 0 |
+| composite | per pixel | 2 near taps (4 near and 4 tile depth taps depth-aware) + 2-4 far taps + analytic fog + 8 taps per light in the pixel's tile | 0 |
 
-Rays per frame: ~3.1 M plus one per froxel that has a light in its cluster, against Remix's
-~2.3 M (plus its four ReSTIR passes, which this design does not have) and the old AP's up to
-~14 M. Medium evaluations: ~3.9 M against the old AP's ~7 M. Memory ~131 MB (~106 MB until the
-aux volume went from RGBA8 to RGBA16F on 2026-10-16) against Remix's ~60 MB and the old AP's
-~36 MB; the difference is the history pair the old AP did not have. The two knobs that scale all
-of it are the froxel size (cost ~ 1/size^2) and the slice count (linear). At 64 slices the grid is
-exactly Remix's default froxel count and memory drops to ~83 MB.
+Rays per frame: at most ~3.1 M outdoors plus one per froxel that has a light in its cluster,
+fewer indoors, where the froxels past the first walls are skipped, against Remix's ~2.3 M (plus its
+four ReSTIR passes, which this design does not have) and the old AP's up to ~14 M. Penumbra froxels
+add a second environment ray; silhouette froxels whose sample landed on a nearer object trace none.
+Medium evaluations: ~3.9 M against the old AP's ~7 M. Memory ~156 MB (section 4.2, "Formats")
+against Remix's ~60 MB and the old AP's ~36 MB; the difference is the history pair and the
+injection volume the old AP did not have. The two knobs that scale all of it are the froxel size
+(cost ~ 1/size^2) and the slice count (linear). At 64 slices the grid is exactly Remix's default
+froxel count and memory drops to ~106 MB.
 
 ## 6. Migration
 

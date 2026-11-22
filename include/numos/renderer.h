@@ -205,6 +205,10 @@ struct FrameOutputs {
   // and uint cluster lists whose per-tile part apLightTileOffset addresses). Always valid while the
   // aerial perspective runs; args.apLocalLightCount gates their use.
   GpuHandle apLights = 0, apLightClusters = 0;
+  // Per froxel column (Texture2D, R32F): the deepest visible surface of its screen tile, forward
+  // distance in world units, 1e30 where the tile sees the sky. The near-field composite's
+  // depth-aware upsample reads it (the numosApplyAerialPerspective overload that takes apTileDepth).
+  GpuHandle apTileDepth = 0;
   GpuHandle cloudNvdfSdf = 0, cloudDetailNoise3D = 0; // for debug views
   // Samplers.
   GpuHandle skyViewSampler = 0;     // linear, clamp

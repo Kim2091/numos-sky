@@ -24,15 +24,15 @@ NUMOS_SETTING(float, aerialPerspectiveScale, 0.0f, "rtx.atmosphere.aerialPerspec
 NUMOS_SETTING(float, cloudScale, 0.0f, "rtx.atmosphere.cloudScale", NUMOS_NO_MIN, NUMOS_NO_MAX, NUMOS_SETTING_NO_SAVE,
   "Deprecated: replaced by rtx.atmosphere.unitsPerMeter and rtx.atmosphere.worldScale. An existing value is migrated automatically. Save the config again to stop the notice.")
 NUMOS_SETTING(float, unitsPerMeter, 0.0f, "rtx.atmosphere.unitsPerMeter", 0.0f, NUMOS_NO_MAX, 0,
-  "How many game units make one real metre. This measures the game and is not a look setting: for example 100 for an engine that works in centimetres, or 39.37 for one that works in inches. 0 takes the value from rtx.sceneScale. The clouds, sky, haze, fog, local-light glow and lightning all convert with it. To make the sky smaller than the game's real scale, change World Scale and leave this at the true value.")
+  "How many game units make one real meter. This measures the game and is not a look setting: for example 100 for an engine that works in centimeters, or 39.37 for one that works in inches. 0 takes the value from rtx.sceneScale. The clouds, sky, haze, fog, local-light glow and lightning all convert with it. To make the sky smaller than the game's real scale, change World Scale and leave this at the true value.")
 NUMOS_SETTING(float, worldScale, 1.0f, "rtx.atmosphere.worldScale", 0.001f, 1000.0f, 0,
-  "The size of the sky's world relative to the game's. The planet, atmosphere, clouds, wind and lightning are all scaled by it together, so a scaled sky looks like the full-size one, only smaller. The haze, fog and local-light glow follow Haze World Scale instead. 1 is real size. Lower it for a map built much smaller than the place it depicts, where real-size clouds look too high and too large (0.1 makes the sky a tenth of the size).\nSettings given in metres or kilometres (cloud heights and depths, the lightning range) scale with it. Settings in world units (Ground Level, Cloud Vertical Offset, Camera World Override) are the game's own units and do not.")
+  "The size of the sky's world relative to the game's. The planet, atmosphere, clouds, wind and lightning are all scaled by it together, so a scaled sky looks like the full-size one, only smaller. The haze, fog and local-light glow follow Haze World Scale instead. 1 is real size. Lower it for a map built much smaller than the place it depicts, where real-size clouds look too high and too large (0.1 makes the sky a tenth of the size).\nSettings given in meters or kilometers (cloud heights and depths, the lightning range) scale with it. Settings in world units (Ground Level, Cloud Vertical Offset, Camera World Override) are the game's own units and do not.")
 NUMOS_SETTING(float, hazeWorldScale, 1.0f, "rtx.atmosphere.hazeWorldScale", 0.001f, 1000.0f, 0,
-  "The size of the haze's world relative to the game's: World Scale for the haze, height fog, sun shafts and local-light glow alone. 1 is real size, so the game's terrain is hazed at its true distance. With World Scale below 1 and this left at 1, the clouds shrink but distant land is not hazed as if it were farther away. Settings in metres that belong to the haze (fog distances and heights, the froxel range) scale with it.")
+  "The size of the haze's world relative to the game's: World Scale for the haze, height fog, sun shafts and local-light glow alone. 1 is real size, so the game's terrain is hazed at its true distance. With World Scale below 1 and this left at 1, the clouds shrink but distant land is not hazed as if it were farther away. Settings in meters that belong to the haze (fog distances and heights, the froxel range) scale with it.")
 NUMOS_SETTING(float, cloudWorldCompression, 1.0f, "rtx.atmosphere.cloudWorldCompression", 0.1f, NUMOS_NO_MAX, NUMOS_SETTING_NO_SAVE,
   "Deprecated: replaced by rtx.atmosphere.worldScale (1 divided by this value). An existing value is migrated automatically. Save the config again to stop the notice.")
 NUMOS_SETTING(float, cloudUnitsPerMeter, 0.0f, "rtx.atmosphere.cloudUnitsPerMeter", 0.0f, NUMOS_NO_MAX, NUMOS_SETTING_NO_SAVE,
-  "Deprecated: a second, clouds-only units-per-metre. Its ratio to rtx.atmosphere.unitsPerMeter is migrated into rtx.atmosphere.worldScale, which keeps the clouds where they were. Save the config again to stop the notice.")
+  "Deprecated: a second, clouds-only units-per-meter. Its ratio to rtx.atmosphere.unitsPerMeter is migrated into rtx.atmosphere.worldScale, which keeps the clouds where they were. Save the config again to stop the notice.")
 NUMOS_SETTING(float, aerialPerspectiveWorldCompression, 1.0f, "rtx.atmosphere.aerialPerspectiveWorldCompression", 0.1f, NUMOS_NO_MAX, NUMOS_SETTING_NO_SAVE,
   "Deprecated: the haze now shares rtx.atmosphere.worldScale with the clouds. A value that disagrees with the clouds' scale is reported, and the clouds' scale is kept. Save the config again to stop the notice.")
 NUMOS_SETTING(float, groundLevelWorldUnits, 0.0f, "rtx.atmosphere.groundLevelWorldUnits", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
@@ -40,31 +40,57 @@ NUMOS_SETTING(float, groundLevelWorldUnits, 0.0f, "rtx.atmosphere.groundLevelWor
 NUMOS_SETTING(bool, groundLevelAuto, true, "rtx.atmosphere.groundLevelAuto", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "Measures the ground level from the scene instead of using Ground Level. Rays cast straight down (or ground points the game supplies) build a smoothed map of the ground height around the player, and the ground level is that map under the camera. Cloud bases, the height fog and layer 2 then keep their heights above the local ground as the player travels, while climbing a building or jumping changes nothing. Needs ray-traced scene geometry or ground points from the game. Without either, Ground Level is used.")
 NUMOS_SETTING(float, groundSmoothingMeters, 4000.0f, "rtx.atmosphere.groundSmoothingMeters", 100.0f, NUMOS_NO_MAX, 0,
-  "The distance, in metres, over which Ground Level: Auto averages the measured ground. Larger values follow only the broad shape of the land and move the cloud deck less as the player travels. Smaller values follow hills and valleys more closely. Changing it starts a fresh measurement.")
+  "The distance, in meters, over which Ground Level: Auto averages the measured ground. Larger values follow only the broad shape of the land and move the cloud deck less as the player travels. Smaller values follow hills and valleys more closely. Changing it starts a fresh measurement.")
 NUMOS_SETTING(float, cloudVerticalOffsetWorldUnits, 0.0f, "rtx.atmosphere.cloudVerticalOffsetWorldUnits", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "Moves the whole cloud field up or down, in game world units along the up axis. It changes where the clouds sit without changing their size, the ground level or the haze. Center Layer at Player sets it once to place the main layer around the player. Center again after changing World Scale or the layer depth.")
 NUMOS_SETTING(float, cloudBaseHeightMeters, 1300.0f, "rtx.atmosphere.cloudBaseHeightMeters", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The height of the main cloud deck's underside above the ground level, in metres.")
+  "The height of the main cloud deck's underside above the ground level, in meters.")
 NUMOS_SETTING(float, cloudDepthMeters, 2000.0f, "rtx.atmosphere.cloudDepthMeters", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The vertical depth of the main cloud deck, in metres, measured up from its base.")
+  "The vertical depth of the main cloud deck, in meters, measured up from its base.")
 NUMOS_SETTING(float, cloudLayer2BaseHeightMeters, 5500.0f, "rtx.atmosphere.cloudLayer2BaseHeightMeters", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The height of cloud layer 2's base above the ground level, in metres. 0 or slightly below puts a fog bank on the ground. Ignored while Layer 2 Follows Camera is on.")
+  "The height of cloud layer 2's base above the ground level, in meters. 0 or slightly below puts a fog bank on the ground. Ignored while Layer 2 Follows Camera is on.")
 NUMOS_SETTING(float, cloudLayer2DepthMeters, 2000.0f, "rtx.atmosphere.cloudLayer2DepthMeters", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The vertical depth of cloud layer 2, in metres. Use 50-500 for ground fog or a dust layer, and a few hundred to 2000 for stratus or a high deck.")
+  "The vertical depth of cloud layer 2, in meters. Use 50-500 for ground fog or a dust layer, and a few hundred to 2000 for stratus or a high deck.")
 NUMOS_SETTING(bool, useCameraWorldOverride, false, "rtx.atmosphere.useCameraWorldOverride", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "Anchors the clouds to rtx.atmosphere.cameraWorldOverride instead of the camera position the renderer sees. Turn it on for games that render relative to the camera, where the camera always appears to sit at the origin and the clouds would otherwise move with the view. The game integration then has to send the real camera position every frame.")
 NUMOS_SETTING(Vector3, cameraWorldOverride, Vector3(0.0f, 0.0f, 0.0f), "rtx.atmosphere.cameraWorldOverride", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "The camera's world position in the game's own units and axis convention, used as the cloud anchor while Use Camera World Override is on. A game integration normally sends it every frame.")
 NUMOS_SETTING(float, cloudAnchorCutKm, 0.5f, "rtx.atmosphere.cloudAnchorCutKm", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "How far, in kilometres, the cloud anchor has to jump in one frame to count as a camera cut, which rebuilds the cloud reflection dome at once. Teleports and loading into a new area move it further than a player can travel in one frame. 0 turns the check off.")
+  "How far, in kilometers, the cloud anchor has to jump in one frame to count as a camera cut, which rebuilds the cloud reflection dome at once. Teleports and loading into a new area move it further than a player can travel in one frame. 0 turns the check off.")
 NUMOS_SETTING(int32_t, aerialPerspectiveFroxelSizePixels, 8, "rtx.atmosphere.aerialPerspectiveFroxelSizePixels", 2, 64, 0,
   "The screen size of one froxel of the near-field haze, in render-resolution pixels. 8 gives a 240x135 grid at 1080p. Smaller froxels sharpen sun shafts and lamp glow. GPU cost and memory grow with 1 / size squared.")
 NUMOS_SETTING(int32_t, aerialPerspectiveFroxelDepthSlices, 96, "rtx.atmosphere.aerialPerspectiveFroxelDepthSlices", 16, 256, 0,
   "The number of depth slices in the near-field haze, spread from the camera to Froxel Range. More slices give finer detail in depth. GPU cost and memory grow linearly with it.")
 NUMOS_SETTING(float, aerialPerspectiveFroxelRangeMeters, 1000.0f, "rtx.atmosphere.aerialPerspectiveFroxelRangeMeters", 10.0f, 50000.0f, 0,
-  "How far the near-field haze reaches from the camera, in metres. Inside it the air is shadowed by the scene (sun shafts, dark interiors), lit by local lights and carries the height fog. Beyond it, an unshadowed far field carries the atmosphere to the horizon. Raising it spreads the same slices over a longer distance.")
+  "How far the near-field haze reaches from the camera, in meters. Inside it the air is shadowed by the scene (sun shafts, dark interiors), lit by local lights and carries the height fog. Beyond it, an unshadowed far field carries the atmosphere to the horizon. Raising it spreads the same slices over a longer distance.")
 NUMOS_SETTING(int32_t, aerialPerspectiveHistoryFrames, 32, "rtx.atmosphere.aerialPerspectiveHistoryFrames", 1, 255, 0,
   "How many frames of history each near-field froxel averages. Each frame a froxel traces one sun-or-sky visibility ray and one local-light ray, and the history smooths them into stable shadowing. More frames look smoother, but a moving light or occluder takes longer to settle. Camera cuts reset the history.")
+NUMOS_SETTING(int32_t, aerialPerspectiveSkyHistoryFrames, 128, "rtx.atmosphere.aerialPerspectiveSkyHistoryFrames", 1, 255, 0,
+  "How many frames of history the near-field haze averages for how much sky each froxel sees. The sky light reaching shaded air through a doorway or a gap is a small share of rare ray hits, so it needs a longer average than the sun to stop blotches in dark, hazy areas. More frames look smoother, but opening a door or moving a large occluder takes longer to show in the haze.")
+NUMOS_SETTING(bool, aerialPerspectiveSkyEveryFrameWithoutSun, true, "rtx.atmosphere.aerialPerspectiveSkyEveryFrameWithoutSun", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
+  "While the sun is below the horizon, each near-field froxel traces its sky ray every frame instead of every other frame (the skipped sun ray's turn goes to the sky). The sky light in dark, hazy scenes then settles twice as fast and is less noisy, for no extra rays. Off keeps one sky ray every two frames.")
+NUMOS_SETTING(bool, aerialPerspectivePenumbraEveryFrame, true, "rtx.atmosphere.aerialPerspectivePenumbraEveryFrame", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
+  "Near-field froxels that are partly shadowed from the sun, or see part of the sky (between 5% and 95%), trace that ray every frame instead of every other frame. That is where a shadow estimate is noisiest, so shaft edges, doorways and canopies settle about twice as fast and grain less. It costs extra rays only in those froxels. Off keeps strict alternation.")
+NUMOS_SETTING(float, aerialPerspectiveDisagreementWeight, 0.25f, "rtx.atmosphere.aerialPerspectiveDisagreementWeight", 0.0f, 1.0f, 0,
+  "How fast the near-field haze lets go of a fully lit or fully shadowed history once the scene says otherwise: an occluder moving through a sun shaft, a door, or a jump in the time of day. When a froxel's ray contradicts such a history and two more rays confirm it, the new value gets this blend weight instead of the slow history one. Higher reacts faster but lets a rare stray ray show as a flicker. 0 turns it off.")
+NUMOS_SETTING(float, aerialPerspectiveEdgeHistoryMargin, 0.15f, "rtx.atmosphere.aerialPerspectiveEdgeHistoryMargin", 0.0f, 0.5f, 0,
+  "When the camera turns, the near-field froxels that come into view at the screen edge have no history. Those whose last-frame position lies within this share of the screen outside the old view start from the nearest edge froxels' history instead of from scratch, and settle within a few frames (Reveal History Frames). 0.15 is 15% of the screen. Higher covers faster turns, but the borrowed values are less likely to match. 0 makes them start fresh.")
+NUMOS_SETTING(int32_t, aerialPerspectiveRevealHistoryFrames, 4, "rtx.atmosphere.aerialPerspectiveRevealHistoryFrames", 0, 255, 0,
+  "The history length, in frames, given to near-field froxels whose history is only an approximation: froxels that came into view at the screen edge, and air that a wall or object hid last frame (Fast Reveal). They re-converge within about this many frames instead of over the full history. Lower adapts faster but is noisier for those frames. 0 gives them their full history age.")
+NUMOS_SETTING(bool, aerialPerspectiveFastReveal, true, "rtx.atmosphere.aerialPerspectiveFastReveal", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
+  "Air that a wall or object hid last frame and that is in view now (a door opening, the camera stepping past a corner, a vehicle driving off) re-converges within Reveal History Frames. While hidden, such air only holds a copy of the air in front of the surface, and without this it fades out over the full history, which shows as a lingering ghost of the object in the haze. Off keeps the full history age.")
+NUMOS_SETTING(bool, aerialPerspectiveSilhouetteFix, true, "rtx.atmosphere.aerialPerspectiveSilhouetteFix", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
+  "Stops dark halos in the haze around objects seen against the sky or a farther background. A froxel sample that lands on a nearer object is moved in front of it, where the object blocks part of the sky and sun, and blended into froxels that also stand for the open air beside and behind the object. With this on, such samples leave those froxels alone and only samples that see past the object update them. Air behind dense foliage cards updates a little more slowly. Off blends every sample.")
+NUMOS_SETTING(bool, aerialPerspectiveSkipHiddenFroxels, true, "rtx.atmosphere.aerialPerspectiveSkipHiddenFroxels", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
+  "Near-field froxels that lie behind the visible surfaces of every nearby screen tile trace no rays: nothing on screen can see them, so they copy the air in front of those surfaces from the history. Indoors this is most of the grid past the first walls, so it saves most of the haze's rays there. When such air comes into view, it re-converges within Reveal History Frames. Off traces every froxel.")
+NUMOS_SETTING(float, aerialPerspectiveUpsampleDepthTolerance, 0.1f, "rtx.atmosphere.aerialPerspectiveUpsampleDepthTolerance", 0.0f, 1.0f, 0,
+  "Stops the near-field haze of a nearby wall or object from bleeding about 8 pixels onto the sky or distant scenery beside its outline. When the haze grid is stretched to the screen, a grid column whose deepest surface lies more than this share of the pixel's depth in front of the pixel no longer counts for that pixel. 0.1 is 10%. Smaller is sharper along outlines but can show the grid's steps on steep ground. 0 turns it off. Needs a host that passes the tile depth to the haze composite.")
+NUMOS_SETTING(bool, aerialPerspectiveHashedTurnPhase, true, "rtx.atmosphere.aerialPerspectiveHashedTurnPhase", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
+  "Each near-field froxel alternates its ray between the sun and the sky. With this on, every froxel starts the alternation on its own scrambled frame instead of a fixed checkerboard. While the camera moves, air that shifts an odd whole number of froxels a frame no longer gets stuck seeing only the sun or only the sky, which showed as blotches in the haze in motion. Off keeps the checkerboard.")
+NUMOS_SETTING(int32_t, aerialPerspectiveSkyFilterRadius, 1, "rtx.atmosphere.aerialPerspectiveSkyFilterRadius", 0, 2, 0,
+  "Averages each froxel's sky visibility with its neighbors on screen, this many froxels to each side, before the haze is integrated. Sky light in the air changes slowly across the screen, so this removes blotches in shaded haze without softening sun shafts, which are not filtered. 0 turns it off.")
+NUMOS_SETTING(int32_t, aerialPerspectiveLocalLightFilterRadius, 1, "rtx.atmosphere.aerialPerspectiveLocalLightFilterRadius", 0, 2, 0,
+  "Averages how much each froxel sees of its local lights with its neighbors on screen, this many froxels to each side, before lamps glow through it. Each froxel tests one light per frame, so in dark scenes lit by lamps the shadowing of the glow is grainy without it. Larger values are smoother but soften the shadows that objects cast into a lamp's glow. 0 turns it off.")
 NUMOS_SETTING(float, aerialPerspectiveFroxelUnitsPerMeter, 0.0f, "rtx.atmosphere.aerialPerspectiveFroxelUnitsPerMeter", 0.0f, NUMOS_NO_MAX, NUMOS_SETTING_NO_SAVE,
   "Deprecated: the fog, local-light glow and froxel range now share rtx.atmosphere.worldScale with the clouds. A value that disagrees with the clouds' scale is reported, and the clouds' scale is kept. Save the config again to stop the notice.")
 NUMOS_SETTING(bool, aerialPerspectiveLocalLights, true, "rtx.atmosphere.aerialPerspectiveLocalLights", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
@@ -77,8 +103,10 @@ NUMOS_SETTING(bool, aerialPerspectiveLocalLightShadows, true, "rtx.atmosphere.ae
   "Traces a shadow ray from each froxel toward the local light it sampled. Without it, a lamp lights the fog on both sides of the wall it stands behind. With it, light through a doorway casts a real shaft. Needs ray-traced scene geometry.")
 NUMOS_SETTING(int32_t, aerialPerspectiveLocalLightMaxCount, 256, "rtx.atmosphere.aerialPerspectiveLocalLightMaxCount", 0, 4096, 0,
   "The maximum number of scene lights the near-field haze uses per frame. The lights that can glow brightest in view are kept. Lower it to save GPU time in scenes with very many lights.")
+NUMOS_SETTING(int32_t, aerialPerspectiveLocalLightTileMaxCount, 64, "rtx.atmosphere.aerialPerspectiveLocalLightTileMaxCount", 1, 64, 0,
+  "The most lights whose glow any 64x64-pixel screen tile draws (8x8 froxels at the default froxel size). The brightest lights are kept. When more lights than this reach a tile, the dimmer ones are left out there and pop at the tile's border. Each light in a tile costs every pixel of the tile a few taps, so lower it only to save GPU time in scenes packed with lamps.")
 NUMOS_SETTING(float, aerialPerspectiveLocalLightCutoff, 0.002f, "rtx.atmosphere.aerialPerspectiveLocalLightCutoff", 0.0f, NUMOS_NO_MAX, 0,
-  "The glow brightness below which a light counts as not reaching a point. Each light's reach is sized from its own power, so a torch stops after a few metres and a floodlight reaches much further. Lower it if bright lights visibly stop lighting the fog at a fixed distance. Raise it to save GPU time.")
+  "The glow brightness below which a light counts as not reaching a point. Each light's reach is sized from its own power, so a torch stops after a few meters and a floodlight reaches much further. Lower it if bright lights visibly stop lighting the fog at a fixed distance. Raise it to save GPU time.")
 NUMOS_SETTING(bool, aerialPerspectiveSceneShadow, true, "rtx.atmosphere.aerialPerspectiveSceneShadow", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "Traces the scene to find how much of the sun and the sky each near-field froxel sees. This gives sun shafts through doorways and foliage, and keeps interiors from filling with sunlit haze. Needs ray-traced scene geometry. Without it the near field is unshadowed.")
 NUMOS_SETTING(int32_t, aerialPerspectiveDebugView, 0, "rtx.atmosphere.aerialPerspectiveDebugView", 0, 10, 0,
@@ -86,11 +114,11 @@ NUMOS_SETTING(int32_t, aerialPerspectiveDebugView, 0, "rtx.atmosphere.aerialPers
 NUMOS_SETTING(float, aerialPerspectiveMieAnisotropyMax, 0.8f, "rtx.atmosphere.aerialPerspectiveMieAnisotropyMax", -1.0f, 1.0f, 0,
   "The upper limit on how strongly the haze scatters light forward, used by the haze in front of surfaces but not by the sky. A strongly forward-scattering haze is brightest looking toward the sun, where the far field cannot know that the air is in shadow. Lower it if the haze glows too much toward a sun hidden behind scenery. Values at or above Mie Anisotropy have no effect.")
 NUMOS_SETTING(float, fogVisibilityMeters, 0.0f, "rtx.atmosphere.fogVisibilityMeters", 0.0f, NUMOS_NO_MAX, 0,
-  "Height fog: the visibility at the fog's base height, in metres, which is the distance at which contrast falls to 2%. 0 means no fog. 50 is thick fog, 1000 mist and 10000 light haze.")
+  "Height fog: the visibility at the fog's base height, in meters, which is the distance at which contrast falls to 2%. 0 means no fog. 50 is thick fog, 1000 mist and 10000 light haze.")
 NUMOS_SETTING(float, fogHeightFalloffMeters, 100.0f, "rtx.atmosphere.fogHeightFalloffMeters", 1.0f, NUMOS_NO_MAX, 0,
-  "How quickly the height fog thins with height: its density falls by a factor of e every this many metres above the base. Large values give an even fog.")
+  "How quickly the height fog thins with height: its density falls by a factor of e every this many meters above the base. Large values give an even fog.")
 NUMOS_SETTING(float, fogBaseHeightMeters, 0.0f, "rtx.atmosphere.fogBaseHeightMeters", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The height fog's base, in metres above the ground level. The fog has its full visibility here and thins above it.")
+  "The height fog's base, in meters above the ground level. The fog has its full visibility here and thins above it.")
 NUMOS_SETTING(float, fogAlbedo, 0.9f, "rtx.atmosphere.fogAlbedo", 0.0f, 1.0f, 0,
   "The share of the height fog's dimming that is scattered light rather than absorbed light. Lower values give a darker, smokier fog.")
 NUMOS_SETTING(float, fogAnisotropy, 0.3f, "rtx.atmosphere.fogAnisotropy", -0.95f, 0.95f, 0,
@@ -154,31 +182,31 @@ NUMOS_SETTING(float, airDensity, 1.0f, "rtx.atmosphere.airDensity", NUMOS_NO_MIN
 NUMOS_SETTING(float, aerosolDensity, 1.1f, "rtx.atmosphere.aerosolDensity", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "A multiplier on the density of dust and haze particles. 1 is typical. Higher values give a hazier, whiter sky and a larger glow around the sun.")
 NUMOS_SETTING(float, ozoneDensity, 1.0f, "rtx.atmosphere.ozoneDensity", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "A multiplier on the density of the ozone layer. 1 is typical. Ozone gives the twilight sky its blue colour.")
+  "A multiplier on the density of the ozone layer. 1 is typical. Ozone gives the twilight sky its blue color.")
 NUMOS_SETTING(float, planetRadius, 6371.0f, "rtx.atmosphere.planetRadius", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The planet's radius, in kilometres. 6371 is Earth.")
+  "The planet's radius, in kilometers. 6371 is Earth.")
 NUMOS_SETTING(float, atmosphereThickness, 100.0f, "rtx.atmosphere.atmosphereThickness", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The thickness of the atmosphere, in kilometres. 100 is Earth.")
+  "The thickness of the atmosphere, in kilometers. 100 is Earth.")
 NUMOS_SETTING(float, mieAnisotropy, 0.8f, "rtx.atmosphere.mieAnisotropy", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "How strongly the haze scatters light forward, from -1 to 1. It sets the size and brightness of the glow around the sun. 0.8 is typical of Earth's haze. The sun's disc itself is drawn separately, at Sun Size.")
 NUMOS_SETTING(Vector3, rayleighScattering, Vector3(5.802e-3f, 13.558e-3f, 33.1e-3f), "rtx.atmosphere.rayleighScattering", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The air's base scattering coefficients per colour channel, per kilometre. They give the sky its blue colour.")
+  "The air's base scattering coefficients per color channel, per kilometer. They give the sky its blue color.")
 NUMOS_SETTING(Vector3, mieScattering, Vector3(3.996e-3f, 3.996e-3f, 3.996e-3f), "rtx.atmosphere.mieScattering", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The haze's base scattering coefficients per colour channel, per kilometre.")
+  "The haze's base scattering coefficients per color channel, per kilometer.")
 NUMOS_SETTING(Vector3, mieAbsorption, Vector3(4.4e-3f, 4.4e-3f, 4.4e-3f), "rtx.atmosphere.mieAbsorption", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The haze's base absorption coefficients per colour channel, per kilometre. Real haze absorbs about as much light as it scatters. Raising this relative to Mie Scattering darkens the haze, and making it differ between channels tints it: this is how dust becomes brown and dim, or smoke grey and dark, rather than only denser. Scaled by Aerosol Density.")
+  "The haze's base absorption coefficients per color channel, per kilometer. Real haze absorbs about as much light as it scatters. Raising this relative to Mie Scattering darkens the haze, and making it differ between channels tints it: this is how dust becomes brown and dim, or smoke gray and dark, rather than only denser. Scaled by Aerosol Density.")
 NUMOS_SETTING(Vector3, airTint, Vector3(1.0f, 1.0f, 1.0f), "rtx.atmosphere.airTint", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "A per-channel multiplier on the air's scattering. 1, 1, 1 is Earth's air. Change it for an alien or polluted sky colour. Weather can blend it.")
+  "A per-channel multiplier on the air's scattering. 1, 1, 1 is Earth's air. Change it for an alien or polluted sky color. Weather can blend it.")
 NUMOS_SETTING(Vector3, aerosolTint, Vector3(1.0f, 1.0f, 1.0f), "rtx.atmosphere.aerosolTint", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "A per-channel multiplier on the haze's scattering and absorption together. 1, 1, 1 leaves the haze as configured. Lowering a channel makes the haze affect that colour less, so 1, 0.8, 0.55 gives a warm dust storm. Weather and game integrations can set it.")
+  "A per-channel multiplier on the haze's scattering and absorption together. 1, 1, 1 leaves the haze as configured. Lowering a channel makes the haze affect that color less, so 1, 0.8, 0.55 gives a warm dust storm. Weather and game integrations can set it.")
 NUMOS_SETTING(Vector3, ozoneAbsorption, Vector3(0.650e-3f, 1.881e-3f, 0.085e-3f), "rtx.atmosphere.ozoneAbsorption", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The ozone layer's base absorption coefficients per colour channel, per kilometre.")
+  "The ozone layer's base absorption coefficients per color channel, per kilometer.")
 NUMOS_SETTING(float, ozoneLayerAltitude, 25.0f, "rtx.atmosphere.ozoneLayerAltitude", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The height of the ozone layer's densest point, in kilometres.")
+  "The height of the ozone layer's densest point, in kilometers.")
 NUMOS_SETTING(float, ozoneLayerWidth, 15.0f, "rtx.atmosphere.ozoneLayerWidth", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The half-thickness of the ozone layer, in kilometres. Together with Ozone Density it sets the total amount of ozone.")
+  "The half-thickness of the ozone layer, in kilometers. Together with Ozone Density it sets the total amount of ozone.")
 NUMOS_SETTING(Vector3, sunIlluminance, Vector3(15.0f, 15.0f, 15.0f), "rtx.atmosphere.sunIlluminance", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The sun's base colour and brightness. The night sky (moons, stars, airglow) keeps its physical light.")
+  "The sun's base color and brightness. The night sky (moons, stars, airglow) keeps its physical light.")
 NUMOS_SETTING(bool, radianceAutoScale, true, "rtx.atmosphere.radianceAutoScale", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "Scales everything the sky outputs by a power of two that follows the light level, so a night sky, which is about a hundred-millionth as bright as the day sky, keeps its precision in 16-bit render targets. Daylight always uses a scale of 1. Turn it off only for debugging: a moonless night then turns black in 16-bit targets.")
 NUMOS_SETTING(float, multiScatterPhysicalStrength, 1.0f, "rtx.atmosphere.multiScatterPhysicalStrength", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
@@ -186,15 +214,15 @@ NUMOS_SETTING(float, multiScatterPhysicalStrength, 1.0f, "rtx.atmosphere.multiSc
 NUMOS_SETTING(float, multiScatterStrength, 1.0f, "rtx.atmosphere.multiScatterStrength", NUMOS_NO_MIN, NUMOS_NO_MAX, NUMOS_SETTING_NO_SAVE,
   "Deprecated and ignored: the multiple scattering is always physical. Save the config again to stop the notice.")
 NUMOS_SETTING(float, sunsetSaturation, 1.0f, "rtx.atmosphere.sunsetSaturation", NUMOS_NO_MIN, NUMOS_NO_MAX, NUMOS_SETTING_NO_SAVE,
-  "Deprecated and ignored: colour grading belongs in the tonemapper. Save the config again to stop the notice.")
+  "Deprecated and ignored: color grading belongs in the tonemapper. Save the config again to stop the notice.")
 NUMOS_SETTING(float, skyIndirectRadianceScale, 1.0f, "rtx.atmosphere.skyIndirectRadianceScale", 0.0f, NUMOS_NO_MAX, 0,
   "A multiplier on the sky light that reaches surfaces through diffuse bounces. 1 is physical. Raise it when shaded areas look too dull next to sunlit ones. Reflections and the visible sky keep their physical brightness, so reflections still match the sky.")
 NUMOS_SETTING(bool, nightSkyStars, true, "rtx.atmosphere.nightSkyStars", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "Draws the real night sky: about 25,700 catalogue stars as points and the fainter stars as the Milky Way, at their real brightness and colour. The stars turn with the date, time and latitude, dim and redden near the horizon, twinkle, and light the clouds and the ground. Needs the night sky data files. Turn it off for a game that draws its own stars.")
+  "Draws the real night sky: about 25,700 catalogue stars as points and the fainter stars as the Milky Way, at their real brightness and color. The stars turn with the date, time and latitude, dim and redden near the horizon, twinkle, and light the clouds and the ground. Needs the night sky data files. Turn it off for a game that draws its own stars.")
 NUMOS_SETTING(bool, cloudDiskAureole, true, "rtx.atmosphere.cloudDiskAureole", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "Draws the glow (aureole) that forms around the sun and the moons behind thin cloud, where cloud droplets bend light a few degrees off its path. Behind thin cloud the disc becomes a bright glow, and behind thicker cloud only the glow remains. Off, the disc is only dimmed.")
 NUMOS_SETTING(float, cloudDropletDiameter, 20.0f, "rtx.atmosphere.cloudDropletDiameter", 5.0f, 50.0f, 0,
-  "The typical cloud droplet size, in micrometres, from 5 to 50. 20 is typical of stratocumulus. Smaller droplets, as in fresh cumulus and fog, give a wider glow around the sun and the moons.")
+  "The typical cloud droplet size, in micrometers, from 5 to 50. 20 is typical of stratocumulus. Smaller droplets, as in fresh cumulus and fog, give a wider glow around the sun and the moons.")
 NUMOS_SETTING(float, nightGainStops, 0.0f, "rtx.atmosphere.nightGainStops", 0.0f, 16.0f, 0,
   "Night Gain, in stops. 0 is physical. Brightens all natural night light together (the moons, the moonlit sky, starlight, airglow) so the sky, clouds and ground stay consistent. Star Gain, Moonlight Gain and Moon Disc Gain adjust the stars and the moons on top of it.\nSmall values, about +1 to +3, make up for the eye's dark adaptation, which a display cannot reproduce, so a physical night looks darker on screen than in reality. Large values, up to +10 and beyond, balance the night against a game whose own lights are much brighter than physical.\nThe sun, twilight and lightning are not changed, and the gain fades in through twilight so the sky never brightens after sunset.")
 NUMOS_SETTING(float, starGainStops, 0.0f, "rtx.atmosphere.starGainStops", -16.0f, 16.0f, 0,
@@ -204,7 +232,7 @@ NUMOS_SETTING(float, moonlightGainStops, 0.0f, "rtx.atmosphere.moonlightGainStop
 NUMOS_SETTING(float, moonDiscGainStops, 0.0f, "rtx.atmosphere.moonDiscGainStops", -16.0f, 16.0f, 0,
   "Moon Disc Gain, in stops, on top of Moonlight Gain. 0 adds nothing. Brightens or dims only the visible moon discs, not the light they give, so a blown-out moon can be tamed without darkening the moonlit scene.\nLike Night Gain, it does nothing by day and fades in through twilight.")
 NUMOS_SETTING(float, starScintillation, 1.0f, "rtx.atmosphere.starScintillation", 0.0f, 4.0f, 0,
-  "How strongly the stars twinkle, relative to a typical night (1). Stars near the horizon twinkle most and can flash colours, while high stars stay steady. 0 turns twinkling off.")
+  "How strongly the stars twinkle, relative to a typical night (1). Stars near the horizon twinkle most and can flash colors, while high stars stay steady. 0 turns twinkling off.")
 NUMOS_SETTING(float, directionalLightRadianceScale, 1.0f, "rtx.atmosphere.directionalLightRadianceScale", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "A multiplier on the brightness of the sun and moon lights the sky adds to the scene. Adjust it if sunlight and moonlight on surfaces read too bright or too dim overall.")
 NUMOS_SETTING(bool, realMoonEnabled, true, "rtx.atmosphere.realMoonEnabled", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
@@ -220,17 +248,17 @@ NUMOS_SETTING(float, cloudDensity, 20.0f, "rtx.atmosphere.cloudDensity", NUMOS_N
 NUMOS_SETTING(float, cloudAltitude, 1.3f, "rtx.atmosphere.cloudAltitude", NUMOS_NO_MIN, NUMOS_NO_MAX, NUMOS_SETTING_NO_SAVE,
   "Deprecated: replaced by rtx.atmosphere.cloudBaseHeightMeters. An existing value is migrated automatically. Save the config again to stop the notice.")
 NUMOS_SETTING(Vector3, cloudColor, Vector3(0.89f, 0.92f, 1.0f), "rtx.atmosphere.cloudColor", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The base colour of the clouds.")
+  "The base color of the clouds.")
 NUMOS_SETTING(float, cloudWindSpeed, 0.02f, "rtx.atmosphere.cloudWindSpeed", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "How fast the clouds drift, in kilometres per second.")
+  "How fast the clouds drift, in kilometers per second.")
 NUMOS_SETTING(float, cloudWindDirection, 45.0f, "rtx.atmosphere.cloudWindDirection", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "The direction the clouds drift toward, in degrees (0 = +X, 90 = +Z).")
 NUMOS_SETTING(float, nubis3JitterAnimateKm, 1.0e9f, "rtx.atmosphere.nubis3JitterAnimateKm", 0.0f, NUMOS_NO_MAX, 0,
-  "The distance, in kilometres, beyond which the cloud sampling noise stops changing every frame. By default it never stops. Lower values make distant cloud noise hold still on screen instead of shimmering.")
+  "The distance, in kilometers, beyond which the cloud sampling noise stops changing every frame. By default it never stops. Lower values make distant cloud noise hold still on screen instead of shimmering.")
 NUMOS_SETTING(float, cloudEvolutionSpeed, 0.002f, "rtx.atmosphere.cloudEvolutionSpeed", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "How fast cloud detail rises through each cloud, in kilometres per second, which makes cumulus look like it is building. It does not move the clouds themselves. 0 stops the rise.")
+  "How fast cloud detail rises through each cloud, in kilometers per second, which makes cumulus look like it is building. It does not move the clouds themselves. 0 stops the rise.")
 NUMOS_SETTING(float, cloudBoilSpeed, 0.002f, "rtx.atmosphere.cloudBoilSpeed", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "How fast cloud detail is sheared downwind, in kilometres per second. The tops stream downwind while the bases stay put. 0 turns the shear off.")
+  "How fast cloud detail is sheared downwind, in kilometers per second. The tops stream downwind while the bases stay put. 0 turns the shear off.")
 NUMOS_SETTING(float, cloudShadowStrength, 1.0f, "rtx.atmosphere.cloudShadowStrength", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "How strongly the clouds shade the sunlight on the ground and in the air, from 0 to 1. 1 is physical and 0 removes cloud shadows.")
 NUMOS_SETTING(bool, cloudProfilingLog, false, "rtx.atmosphere.cloudProfilingLog", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
@@ -258,11 +286,11 @@ NUMOS_SETTING(float, cloudCoverageSpread, 0.0f, "rtx.atmosphere.cloudCoverageSpr
 NUMOS_SETTING(float, cloudCoverageNoiseScale, 0.00257732f, "rtx.atmosphere.cloudCoverageNoiseScale", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "How large the regions of different coverage are. Smaller values give larger regions.")
 NUMOS_SETTING(float, cloudNoiseTileKm, 12.0f, "rtx.atmosphere.cloudNoiseTileKm", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "How far, in kilometres, the cloud detail pattern runs before it repeats. Smaller values show repetition more. Larger values give coarser detail. 6 to 24 works well.")
+  "How far, in kilometers, the cloud detail pattern runs before it repeats. Smaller values show repetition more. Larger values give coarser detail. 6 to 24 works well.")
 NUMOS_SETTING(bool, cloudHexTilingEnable, true, "rtx.atmosphere.cloudHexTilingEnable", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "Hides repetition in the cloud pattern by blending randomly offset, rotated and mirrored copies of it. Turn it off only to see the plain repeating pattern.")
 NUMOS_SETTING(float, cloudCellSizeKm, 3.65f, "rtx.atmosphere.cloudCellSizeKm", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The average size of a cloud cluster, in kilometres, from 0.5 to 6. Smaller values give many small clouds, larger values fewer and broader banks.")
+  "The average size of a cloud cluster, in kilometers, from 0.5 to 6. Smaller values give many small clouds, larger values fewer and broader banks.")
 NUMOS_SETTING(float, cloudColumnTopVariation, 0.45f, "rtx.atmosphere.cloudColumnTopVariation", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "How much cloud tops vary in height, from 0 to 1. 0 puts all tops at one height, a flat deck. Higher values give a varied skyline.")
 NUMOS_SETTING(float, cloudColumnTopShape, 0.4f, "rtx.atmosphere.cloudColumnTopShape", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
@@ -274,19 +302,19 @@ NUMOS_SETTING(float, cloudColumnFeather, 0.35f, "rtx.atmosphere.cloudColumnFeath
 NUMOS_SETTING(float, nvdfNominalCoverage, 0.0f, "rtx.atmosphere.nvdfNominalCoverage", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "The cloud coverage the cloud shape field is built for, from 0 to 1. 0 (Auto) follows the current coverage and rebuilds the field in the background when it changes. A fixed value is meant for debugging and look tuning.")
 NUMOS_SETTING(float, nvdfProfileDepthKm, 0.12f, "rtx.atmosphere.nvdfProfileDepthKm", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "How far into a cloud, in kilometres, its density takes to build up from the edge, from 0.1 to 3. Small values give dense, hard-edged clouds. Large values give soft, translucent edges.")
+  "How far into a cloud, in kilometers, its density takes to build up from the edge, from 0.1 to 3. Small values give dense, hard-edged clouds. Large values give soft, translucent edges.")
 NUMOS_SETTING(float, nvdfCoverageOffsetKm, 0.2f, "rtx.atmosphere.nvdfCoverageOffsetKm", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "How much the clouds grow or shrink, in kilometres, per unit of coverage change from the coverage the shape field was built for, from 0 to 4. Higher values make coverage changes grow clouds faster, so they merge sooner at high coverage.")
+  "How much the clouds grow or shrink, in kilometers, per unit of coverage change from the coverage the shape field was built for, from 0 to 4. Higher values make coverage changes grow clouds faster, so they merge sooner at high coverage.")
 NUMOS_SETTING(float, nubis3ErosionStrength, 0.58f, "rtx.atmosphere.nubis3ErosionStrength", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "How strongly the detail noise carves into the clouds, from 0 to 2. 0 gives smooth blobs, 1 the standard look and higher values ragged, heavily carved clouds.")
 NUMOS_SETTING(float, cloudBodyBillowStrength, 2.0f, "rtx.atmosphere.cloudBodyBillowStrength", 0.0f, 3.0f, 0,
   "How far the billows push the cloud surface in and out, as a multiple of Billow Size. 0 gives smooth towers. Changing it rebuilds the cloud shape field.")
 NUMOS_SETTING(float, cloudBodyBillowSizeKm, 1.2f, "rtx.atmosphere.cloudBodyBillowSizeKm", 0.2f, 4.0f, 0,
-  "The size of the largest billows, in kilometres. Three finer sizes follow at a half, a quarter and an eighth of it. Keep the finest above about 0.1 km. Changing it rebuilds the cloud shape field.")
+  "The size of the largest billows, in kilometers. Three finer sizes follow at a half, a quarter and an eighth of it. Keep the finest above about 0.1 km. Changing it rebuilds the cloud shape field.")
 NUMOS_SETTING(float, cloudCurlStrengthKm, 0.12f, "rtx.atmosphere.cloudCurlStrengthKm", 0.0f, 1.0f, 0,
-  "How far, in kilometres, the detail is swirled sideways at the cloud base. It tears the base into wind-torn wisps and keeps the detail from looking stamped on. 0 turns it off.")
+  "How far, in kilometers, the detail is swirled sideways at the cloud base. It tears the base into wind-torn wisps and keeps the detail from looking stamped on. 0 turns it off.")
 NUMOS_SETTING(float, cloudDiffuseSunStrength, 0.0f, "rtx.atmosphere.cloudDiffuseSunStrength", 0.0f, 1.0f, 0,
-  "How much sunlight reaches the shaded parts of clouds after passing through the cloud above them, from 0 to 1. 0 keeps deep shadows under and between clouds. 1 lights grey, overcast or stormy skies the way thick cloud passes light, neutral grey rather than blue. The overcast, drizzle and storm weather presets set 1.")
+  "How much sunlight reaches the shaded parts of clouds after passing through the cloud above them, from 0 to 1. 0 keeps deep shadows under and between clouds. 1 lights gray, overcast or stormy skies the way thick cloud passes light, neutral gray rather than blue. The overcast, drizzle and storm weather presets set 1.")
 NUMOS_SETTING(float, cloudBodyBillowGain, 0.65f, "rtx.atmosphere.cloudBodyBillowGain", 0.0f, 1.0f, 0,
   "The strength of each finer billow size relative to the one above it. 0.5 lets the large billows dominate, for smooth lobes. Toward 0.8, small billows are nearly as strong as large ones, for a cauliflower look. Changing it rebuilds the cloud shape field.")
 NUMOS_SETTING(float, cloudLightingLodThreshold, 0.05f, "rtx.atmosphere.cloudLightingLodThreshold", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
@@ -294,9 +322,9 @@ NUMOS_SETTING(float, cloudLightingLodThreshold, 0.05f, "rtx.atmosphere.cloudLigh
 NUMOS_SETTING(float, nvdfStepScale, 0.95f, "rtx.atmosphere.nvdfStepScale", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "How far the cloud march jumps through empty air, as a share of the distance to the nearest cloud, from 0 to 0.95. Higher values save GPU time, especially toward the horizon. 0 steps evenly. Lower it if cloud outlines show onion-like banding.")
 NUMOS_SETTING(float, nubis3AdaptiveStepKm, 0.025f, "rtx.atmosphere.nubis3AdaptiveStepKm", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The smallest cloud march step, in kilometres, from 0 to 0.2. Steps start this fine near the camera to resolve close detail and grow with distance. 0 uses an even step length everywhere.")
+  "The smallest cloud march step, in kilometers, from 0 to 0.2. Steps start this fine near the camera to resolve close detail and grow with distance. 0 uses an even step length everywhere.")
 NUMOS_SETTING(float, cloudViewStepKm, 0.25f, "rtx.atmosphere.cloudViewStepKm", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The target spacing of cloud samples, in kilometres, from 0 to 4. Larger spacing saves GPU time but can lose detail or miss thin clouds. Max Cloud Samples separately limits the steps per ray. 0 uses the fixed step count of Cloud View Samples.")
+  "The target spacing of cloud samples, in kilometers, from 0 to 4. Larger spacing saves GPU time but can lose detail or miss thin clouds. Max Cloud Samples separately limits the steps per ray. 0 uses the fixed step count of Cloud View Samples.")
 NUMOS_SETTING(uint32_t, cloudViewSamplesMax, 128, "rtx.atmosphere.cloudViewSamplesMax", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "The maximum number of march steps per ray through the main cloud layer, from 2 to 256. Rays that leave the clouds or become opaque stop earlier. Lower it to limit the worst-case GPU cost. It has no effect while Cloud Step Spacing is 0.")
 NUMOS_SETTING(bool, lightningEnable, true, "rtx.atmosphere.lightningEnable", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
@@ -304,7 +332,7 @@ NUMOS_SETTING(bool, lightningEnable, true, "rtx.atmosphere.lightningEnable", NUM
 NUMOS_SETTING(float, lightningStrikesPerMinute, 0.0f, "rtx.atmosphere.lightningStrikesPerMinute", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "The average number of lightning strikes per minute, from 0 to 60. The gaps between strikes are random, so strikes cluster and pause naturally. 0 means no automatic strikes. Test Strike still works.")
 NUMOS_SETTING(float, lightningLuminousIntensity, 2e8f, "rtx.atmosphere.lightningLuminousIntensity", 0.0f, NUMOS_NO_MAX, 0,
-  "The peak brightness of a lightning flash, in candela. It drives the glow in the clouds, the glow in the haze and the light on the scene. The default is realistic: a flash lights the ground a few kilometres away like a dim overcast day, outshines everything at night, and is barely visible against a daylit cloud. Raise it for a dramatic daytime storm.")
+  "The peak brightness of a lightning flash, in candela. It drives the glow in the clouds, the glow in the haze and the light on the scene. The default is realistic: a flash lights the ground a few kilometers away like a dim overcast day, outshines everything at night, and is barely visible against a daylit cloud. Raise it for a dramatic daytime storm.")
 NUMOS_SETTING(bool, lightningSceneLight, true, "rtx.atmosphere.lightningSceneLight", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "Adds each flash to the scene as a light at the strike. Off, the flash lights only the clouds and the air.")
 NUMOS_SETTING(float, lightningFlashIntensity, 50.0f, "rtx.atmosphere.lightningFlashIntensity", NUMOS_NO_MIN, NUMOS_NO_MAX, NUMOS_SETTING_NO_SAVE,
@@ -312,9 +340,9 @@ NUMOS_SETTING(float, lightningFlashIntensity, 50.0f, "rtx.atmosphere.lightningFl
 NUMOS_SETTING(float, lightningSceneLightIntensity, 2000.0f, "rtx.atmosphere.lightningSceneLightIntensity", NUMOS_NO_MIN, NUMOS_NO_MAX, NUMOS_SETTING_NO_SAVE,
   "Deprecated: replaced by rtx.atmosphere.lightningLuminousIntensity (its strength) and rtx.atmosphere.lightningSceneLight (on or off). Ignored. Save the config again to stop the notice.")
 NUMOS_SETTING(float, lightningRangeKm, 15.0f, "rtx.atmosphere.lightningRangeKm", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The farthest distance from the camera a strike can land, in kilometres, from 1.5 to 30. Strikes spread evenly over the area between 1 km and this distance.")
+  "The farthest distance from the camera a strike can land, in kilometers, from 1.5 to 30. Strikes spread evenly over the area between 1 km and this distance.")
 NUMOS_SETTING(Vector3, lightningColor, Vector3(0.72f, 0.78f, 1.0f), "rtx.atmosphere.lightningColor", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The colour of a lightning flash, in linear RGB, for both the cloud glow and the scene light. Only the hue counts. The brightness is set by Lightning Luminous Intensity.")
+  "The color of a lightning flash, in linear RGB, for both the cloud glow and the scene light. Only the hue counts. The brightness is set by Lightning Luminous Intensity.")
 NUMOS_SETTING(float, cloudPhaseG1, 0.8f, "rtx.atmosphere.cloudPhaseG1", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "How strongly clouds scatter light forward. It creates the bright silver lining at the edges of clouds in front of the sun.")
 NUMOS_SETTING(uint32_t, cloudSunOctaveCount, 6, "rtx.atmosphere.cloudSunOctaveCount", 1, 8, 0,
@@ -360,7 +388,7 @@ NUMOS_SETTING(float, cloudSpatialDenoise, 0.1f, "rtx.atmosphere.cloudSpatialDeno
 NUMOS_SETTING(bool, cloudShadowMapEnable, true, "rtx.atmosphere.cloudShadowMapEnable", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "Stores the clouds' shading toward the sun in a shadow map, rebuilt as the sun moves, instead of marching toward the sun for every cloud sample. It is much faster. Turn it off only to compare against the slow reference.")
 NUMOS_SETTING(float, cloudShadowMapWindowKm, 6.0f, "rtx.atmosphere.cloudShadowMapWindowKm", 1.0f, 50.0f, 0,
-  "The half-width, in kilometres, of the most detailed cloud shadow map level around the camera. Each further level is about 3.3 times wider, and the last reaches the horizon.")
+  "The half-width, in kilometers, of the most detailed cloud shadow map level around the camera. Each further level is about 3.3 times wider, and the last reaches the horizon.")
 NUMOS_SETTING(float, cloudShadowMapRebakeDegrees, 0.1f, "rtx.atmosphere.cloudShadowMapRebakeDegrees", 0.0f, 10.0f, 0,
   "How many degrees the sun has to move before the cloud shadow map is rebuilt. The map is also rebuilt when the camera moves a quarter of its width or the clouds change. 0 rebuilds it continuously.")
 NUMOS_SETTING(int32_t, cloudShadowMapBakeRowsPerFrame, 32, "rtx.atmosphere.cloudShadowMapBakeRowsPerFrame", 8, 256, 0,
@@ -378,7 +406,7 @@ NUMOS_SETTING(int32_t, cloudDetailLodMode, 2, "rtx.atmosphere.cloudDetailLodMode
 NUMOS_SETTING(float, cloudDetailLodBias, -3.0f, "rtx.atmosphere.cloudDetailLodBias", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "The blur bias used while Cloud Detail LOD Mode is on. Negative values keep more detail, positive values blur further. It has no effect while the mode is off.")
 NUMOS_SETTING(float, cloudVoxelGridRebakeGranularityKm, 0.1f, "rtx.atmosphere.cloudVoxelGridRebakeGranularityKm", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "How far, in kilometres, the clouds or the camera have to move before the clouds count as changed. A change restarts the gradual updates of the reflection dome and the cloud history. 0 counts any movement.")
+  "How far, in kilometers, the clouds or the camera have to move before the clouds count as changed. A change restarts the gradual updates of the reflection dome and the cloud history. 0 counts any movement.")
 NUMOS_SETTING(bool, debugDispatchCloudRender, true, "rtx.atmosphere.debugDispatchCloudRender", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "Diagnostic: runs the on-screen cloud pass. It is skipped anyway while the clouds or Cloud Render are off and no debug view is shown. Turn it off to measure the pass's cost. The clouds then freeze in place.")
 NUMOS_SETTING(bool, debugDispatchCloudSkyTransmittance, true, "rtx.atmosphere.debugDispatchCloudSkyTransmittance", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
@@ -386,11 +414,11 @@ NUMOS_SETTING(bool, debugDispatchCloudSkyTransmittance, true, "rtx.atmosphere.de
 NUMOS_SETTING(bool, debugDispatchSkyLuts, true, "rtx.atmosphere.debugDispatchSkyLuts", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "Diagnostic: rebuilds the sky's lookup tables when the sun or the atmosphere changes. Turn it off to freeze them and measure their cost. The sky then stops following the sun.")
 NUMOS_SETTING(bool, debugEnableSkyMissShading, true, "rtx.atmosphere.debugEnableSkyMissShading", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "Diagnostic: shades rays that reach the sky. Turn it off to draw a flat grey sky and measure the cost of sky shading.")
+  "Diagnostic: shades rays that reach the sky. Turn it off to draw a flat gray sky and measure the cost of sky shading.")
 NUMOS_SETTING(float, skyViewRebakeGranularityDeg, 0.1f, "rtx.atmosphere.skyViewRebakeGranularityDeg", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "How many degrees the sun or a moon has to move before the sky is recalculated. 0.1 follows the sun smoothly at a small cost. 0 recalculates every frame while the sun moves. Other sky changes always recalculate at once.")
 NUMOS_SETTING(float, skyViewAltitudeRebakeGranularityKm, 0.05f, "rtx.atmosphere.skyViewAltitudeRebakeGranularityKm", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "How far, in kilometres, the camera has to climb or descend before the sky is recalculated for the new height. The default is 0.05 (50 m). 0 never recalculates for height, so the sky stays as seen from where it was last calculated.")
+  "How far, in kilometers, the camera has to climb or descend before the sky is recalculated for the new height. The default is 0.05 (50 m). 0 never recalculates for height, so the sky stays as seen from where it was last calculated.")
 NUMOS_SETTING(bool, skyLutCacheKeySplitEnable, true, "rtx.atmosphere.skyLutCacheKeySplitEnable", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "Recalculates each part of the sky only when its own inputs change, so a moving sun updates only the small sky view table. The image is unchanged. Turn it off only to compare against recalculating everything together.")
 NUMOS_SETTING(bool, cloudRenderRTEnable, true, "rtx.atmosphere.cloudRenderRTEnable", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
@@ -410,7 +438,7 @@ NUMOS_SETTING(float, cloudLayer2Thickness, 2.0f, "rtx.atmosphere.cloudLayer2Thic
 NUMOS_SETTING(float, cloudLayer2TypeMean, 0.6f, "rtx.atmosphere.cloudLayer2TypeMean", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "How layer 2's density changes with height, from 0 to 1. 0 is stratus or fog, densest at the base and thinning toward a ragged top. 1 is cumulus-like, thin at the base and full by mid-height, with billowy rather than wispy detail.")
 NUMOS_SETTING(float, cloudLayer2CoverageMean, 0.85f, "rtx.atmosphere.cloudLayer2CoverageMean", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The share of the area layer 2 covers, from 0 to 1. The layer is a sheet broken into patches a few kilometres across. Near 1 they merge into a closed sheet with a few holes. Independent of the main deck's coverage.")
+  "The share of the area layer 2 covers, from 0 to 1. The layer is a sheet broken into patches a few kilometers across. Near 1 they merge into a closed sheet with a few holes. Independent of the main deck's coverage.")
 NUMOS_SETTING(float, cloudLayer2TypeSpread, 1.0f, "rtx.atmosphere.cloudLayer2TypeSpread", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "How much layer 2's cloud type varies across the sky, from 0 to 1. Independent of the main deck.")
 NUMOS_SETTING(float, cloudLayer2NoiseSeed, 1000.0f, "rtx.atmosphere.cloudLayer2NoiseSeed", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
@@ -418,11 +446,11 @@ NUMOS_SETTING(float, cloudLayer2NoiseSeed, 1000.0f, "rtx.atmosphere.cloudLayer2N
 NUMOS_SETTING(float, cloudLayer2DensityScale, 0.65f, "rtx.atmosphere.cloudLayer2DensityScale", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "Layer 2's density as a multiple of Cloud Density. At the default cloud density, 1 gives about 200 m of visibility inside a fog bank and 0.25 about 800 m.")
 NUMOS_SETTING(Vector3, cloudLayer2Albedo, Vector3(1.0f, 1.0f, 1.0f), "rtx.atmosphere.cloudLayer2Albedo", 0.0f, 1.0f, 0,
-  "The share of light layer 2's particles scatter rather than absorb, per colour channel. 1, 1, 1 is water droplets, which absorb nothing. Lower values absorb, and because light scatters many times the colour shifts far more than the value suggests. Dust is about 0.95, 0.9, 0.8. Smoke and soot are lower.")
+  "The share of light layer 2's particles scatter rather than absorb, per color channel. 1, 1, 1 is water droplets, which absorb nothing. Lower values absorb, and because light scatters many times the color shifts far more than the value suggests. Dust is about 0.95, 0.9, 0.8. Smoke and soot are lower.")
 NUMOS_SETTING(bool, cloudLayer2FollowCamera, false, "rtx.atmosphere.cloudLayer2FollowCamera", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "Keeps layer 2's base at the camera's height plus Layer 2 Camera Offset instead of at Layer 2 Base Height, for a dust or fog layer the player always stands in, whatever the terrain height. Only the height follows the camera.")
 NUMOS_SETTING(float, cloudLayer2CameraOffsetMeters, -30.0f, "rtx.atmosphere.cloudLayer2CameraOffsetMeters", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "Layer 2's base relative to the camera while Layer 2 Follows Camera is on, in metres. Negative values put the base below the eye: -30 with a depth of 60 puts the camera in the middle of the layer.")
+  "Layer 2's base relative to the camera while Layer 2 Follows Camera is on, in meters. Negative values put the base below the eye: -30 with a depth of 60 puts the camera in the middle of the layer.")
 NUMOS_SETTING(uint32_t, cloudLayer2StepFloor, 8, "rtx.atmosphere.cloudLayer2StepFloor", NUMOS_NO_MIN, NUMOS_NO_MAX, NUMOS_SETTING_NO_SAVE,
   "Deprecated and ignored: layer 2 uses the main deck's step settings. Save the config again to stop the notice.")
 NUMOS_SETTING(uint32_t, cloudLayer2StepMax, 32, "rtx.atmosphere.cloudLayer2StepMax", NUMOS_NO_MIN, NUMOS_NO_MAX, NUMOS_SETTING_NO_SAVE,
@@ -437,7 +465,7 @@ NUMOS_MOON_SETTING(float, angularDiameter, 0.518f, "angularDiameter", NUMOS_NO_M
 NUMOS_MOON_SETTING(float, angularRadius, 0.518f, "angularRadius", NUMOS_NO_MIN, NUMOS_NO_MAX, NUMOS_SETTING_NO_SAVE,
   "Deprecated: renamed angularDiameter, which takes the same value. An existing value is migrated. Save the config again to stop the notice.")
 NUMOS_MOON_SETTING(Vector3, color, Vector3(1.0f, 1.0f, 1.0f), "color", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
-  "The moon's surface brightness and colour relative to Earth's Moon. 1, 1, 1 is lunar. It scales the moon's light and its disc alike.")
+  "The moon's surface brightness and color relative to Earth's Moon. 1, 1, 1 is lunar. It scales the moon's light and its disc alike.")
 NUMOS_MOON_SETTING(float, elevation, 45.0f, "elevation", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,
   "The moon's height above the horizon, in degrees. A game integration can set it every frame, which overrides the saved value.")
 NUMOS_MOON_SETTING(float, rotation, 90.0f, "rotation", NUMOS_NO_MIN, NUMOS_NO_MAX, 0,

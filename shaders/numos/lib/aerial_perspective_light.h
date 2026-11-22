@@ -46,4 +46,12 @@ struct AerialPerspectiveLight {
 // Stride of one cluster's record in the cull buffer: a count followed by that many light indices.
 #define AERIAL_PERSPECTIVE_LIGHT_CLUSTER_STRIDE (AERIAL_PERSPECTIVE_MAX_LIGHTS_PER_CLUSTER + 1u)
 
+// Lights one screen tile's list (the composite's per-pixel glow, over the whole range) may hold. A
+// tile spans the whole depth range, so it meets many more lights than one cluster; a light past the
+// cap pops at the tile's border. args.apLocalLightTileMaxCount lowers it at run time.
+#define AERIAL_PERSPECTIVE_MAX_LIGHTS_PER_TILE 64u
+
+// Stride of one tile list's record, stored after all the per-slice clusters.
+#define AERIAL_PERSPECTIVE_LIGHT_TILE_STRIDE (AERIAL_PERSPECTIVE_MAX_LIGHTS_PER_TILE + 1u)
+
 NUMOS_SHARED_END

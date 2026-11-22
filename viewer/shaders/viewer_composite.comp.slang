@@ -39,6 +39,7 @@ layout(binding = VIEWER_AP_FAR_TRANSMITTANCE) Texture3D<float4> apFarTransmittan
 layout(binding = VIEWER_AP_FROXEL_AUX)        Texture3D<float4> apFroxelAux;
 layout(binding = VIEWER_AP_LIGHTS)            StructuredBuffer<AerialPerspectiveLight> apLights;
 layout(binding = VIEWER_AP_LIGHT_CLUSTERS)    StructuredBuffer<uint> apLightClusters;
+layout(binding = VIEWER_AP_TILE_DEPTH)        Texture2D<float> apTileDepth;
 layout(binding = VIEWER_AP_SAMPLER)           SamplerState apSampler;
 layout(binding = VIEWER_CLOUD_RENDER)    Texture2D<float4> cloudRender;
 layout(binding = VIEWER_CLOUD_DEPTH)     Texture2D<float4> cloudDepth;
@@ -222,7 +223,7 @@ void main(uint2 pixel : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
                            foreground, 0.0f, false, cloudOverPixel);
 
   // After the clouds: the near field (lamp glow, shadowed air) is in front of them.
-  numosApplyAerialPerspective(camera, args, false, apNearScatter, apFarScatter, apFarTransmittance, apFroxelAux,
+  numosApplyAerialPerspective(camera, args, false, apNearScatter, apTileDepth, apFarScatter, apFarTransmittance, apFroxelAux,
                               apLights, apLightClusters, apSampler,
                               pixel, miss, viewDistance, vec3(1.0f), vec3(1.0f), cloudOverPixel, radiance);
 

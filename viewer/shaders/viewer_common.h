@@ -71,3 +71,4 @@ NUMOS_SHARED_END
 #define VIEWER_AP_FROXEL_AUX              27
 #define VIEWER_AP_LIGHTS                  28
 #define VIEWER_AP_LIGHT_CLUSTERS          29
+#define VIEWER_AP_TILE_DEPTH              30

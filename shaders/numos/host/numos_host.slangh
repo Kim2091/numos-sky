@@ -162,9 +162,199 @@ vec3 numosAerialPerspectiveAlongRay(
 // the host's own volumetrics transmittance in front of the handoff (1 without), `radianceThroughput`
 // the primary path's throughput.
 //
-// apCompositeAir is the composite itself; airInScatter and airTransmittance report what it laid over
-// the pixel (the in-scatter it added and the transmittance it applied to the surface or the sky
-// beyond the near field), for the debug view.
+// The composite comes in two steps. numosEvaluateAir looks up everything that depends only on the
+// pixel's ray and distance (the near field, the lamp glow, the fog and the far field); numosApplyAir
+// lays it over a radiance. A host that composites several layers of one pixel (the same ray and
+// distance, different radiance, throughput or cloud) evaluates once and applies per layer.
+// apCompositeAir does both.
+static const uint kNumosAirNear = 0u;     // the surface lies inside the near range
+static const uint kNumosAirMiss = 1u;     // the ray sees the sky
+static const uint kNumosAirBeyond = 2u;   // the surface lies past the near range
+
+struct NumosAirComposite
+{
+  uint  mode;           // kNumosAir*
+  vec3  nearS;          // near-field in-scatter plus the lamp glow, to the surface or the range
+  vec3  nearT;          // near-field RGB transmittance over the same span
+  vec3  farSRange;      // far-field in-scatter to the range (miss, beyond)
+  vec3  invFarTRange;   // 1 / far-field transmittance to the range (miss, beyond)
+  vec3  fogS;           // fog in-scatter beyond the range (miss, beyond)
+  float fogT;           // fog transmittance beyond the range (miss, beyond)
+  vec3  airS;           // far-field in-scatter from the range to the surface, per unit at the range (beyond)
+  vec3  airT;           // far-field transmittance over the same span (beyond)
+};
+
+// The screen UV and forward distance the near field is read at.
+vec2 numosAirNearCoord(Camera camera, uint2 pixelCoordinate, bool primaryMiss, float viewDistance, out float forward)
+{
+  const vec2 screenUV = cameraPixelCoordinateToScreenUV(camera, ivec2(pixelCoordinate));
+  const CameraDirections ray = cameraScreenUVToDirection(camera, screenUV, false);
+  forward = primaryMiss ? 1e30f : viewDistance * max(abs(ray.viewDirection.z), 1e-6f);
+  return screenUV;
+}
+
+// `nearScatterAtPixel` is the near field's in-scatter at the pixel (apSampleNear, depth-aware or not).
+NumosAirComposite numosEvaluateAirImpl(
+  Camera camera,
+  AtmosphereArgs args,
+  vec3 nearScatterAtPixel,
+  Texture3D<float4> apFarScatter,
+  Texture3D<float4> apFarTransmittance,
+  Texture3D<float4> apFroxelAux,
+  StructuredBuffer<AerialPerspectiveLight> apLights,
+  StructuredBuffer<uint> apLightClusters,
+  SamplerState apSampler,
+  uint2 pixelCoordinate,
+  bool primaryMiss,
+  float viewDistance)
+{
+  const vec2 screenUV = cameraPixelCoordinateToScreenUV(camera, ivec2(pixelCoordinate));
+  const CameraDirections ray = cameraScreenUVToDirection(camera, screenUV, false);
+  const float forwardPerDistance = max(abs(ray.viewDirection.z), 1e-6f);
+  const vec3 dirYUp = normalize(worldToAtmosphereYUp(ray.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0u));
+
+  const float forward = primaryMiss ? 1e30f : viewDistance * forwardPerDistance;
+  const float rangeDistance = args.apFroxelRange / forwardPerDistance;
+  NumosAirComposite c;
+  c.nearS = nearScatterAtPixel
+    + apLocalLightAirlight(apLights, apLightClusters, apFroxelAux, apSampler, args, screenUV, ray.worldDirection,
+                           forwardPerDistance, args.apStartDistance,
+                           primaryMiss ? rangeDistance : min(viewDistance, rangeDistance));
+  c.farSRange = vec3(0.0f);
+  c.invFarTRange = vec3(1.0f);
+  c.fogS = vec3(0.0f);
+  c.fogT = 1.0f;
+  c.airS = vec3(0.0f);
+  c.airT = vec3(1.0f);
+
+  if (!primaryMiss && forward <= args.apFroxelRange)
+  {
+    c.mode = kNumosAirNear;
+    c.nearT = apNearTransmittance(dirYUp, viewDistance, args);
+    return c;
+  }
+
+  c.mode = primaryMiss ? kNumosAirMiss : kNumosAirBeyond;
+  c.nearT = apNearTransmittance(dirYUp, rangeDistance, args);
+  vec3 farTRange;
+  c.farSRange = evalAerialPerspectiveFar(dirYUp, numosWorldToAirKm(rangeDistance, args), args,
+                                         apFarScatter, apFarTransmittance, apSampler, farTRange);
+  c.invFarTRange = 1.0f / max(farTRange, vec3(1e-4f));
+  c.fogT = exp(-apFogOpticalDepth(dirYUp, rangeDistance, primaryMiss ? 1e30f : viewDistance, args));
+  c.fogS = numosFarFogRadiance(dirYUp, args) * (1.0f - c.fogT);
+  if (!primaryMiss)
+  {
+    vec3 farT;
+    const vec3 farS = evalAerialPerspectiveFar(dirYUp, numosWorldToAirKm(viewDistance, args), args,
+                                               apFarScatter, apFarTransmittance, apSampler, farT);
+    c.airS = max(farS - c.farSRange, vec3(0.0f)) * c.invFarTRange;
+    c.airT = saturate(farT * c.invFarTRange);
+  }
+  return c;
+}
+
+// With the tile depth: the depth-aware near-field upsample (aerialPerspectiveUpsampleDepthTolerance).
+NumosAirComposite numosEvaluateAir(
+  Camera camera,
+  AtmosphereArgs args,
+  Texture3D<float4> apNearScatter,
+  Texture2D<float> apTileDepth,
+  Texture3D<float4> apFarScatter,
+  Texture3D<float4> apFarTransmittance,
+  Texture3D<float4> apFroxelAux,
+  StructuredBuffer<AerialPerspectiveLight> apLights,
+  StructuredBuffer<uint> apLightClusters,
+  SamplerState apSampler,
+  uint2 pixelCoordinate,
+  bool primaryMiss,
+  float viewDistance)
+{
+  float forward;
+  const vec2 screenUV = numosAirNearCoord(camera, pixelCoordinate, primaryMiss, viewDistance, forward);
+  const vec3 nearS = apSampleNear(apNearScatter, apTileDepth, apSampler, screenUV, forward, args).rgb;
+  return numosEvaluateAirImpl(camera, args, nearS, apFarScatter, apFarTransmittance,
+                              apFroxelAux, apLights, apLightClusters, apSampler, pixelCoordinate, primaryMiss,
+                              viewDistance);
+}
+
+// Without the tile depth: plain bilinear near field.
+NumosAirComposite numosEvaluateAir(
+  Camera camera,
+  AtmosphereArgs args,
+  Texture3D<float4> apNearScatter,
+  Texture3D<float4> apFarScatter,
+  Texture3D<float4> apFarTransmittance,
+  Texture3D<float4> apFroxelAux,
+  StructuredBuffer<AerialPerspectiveLight> apLights,
+  StructuredBuffer<uint> apLightClusters,
+  SamplerState apSampler,
+  uint2 pixelCoordinate,
+  bool primaryMiss,
+  float viewDistance)
+{
+  float forward;
+  const vec2 screenUV = numosAirNearCoord(camera, pixelCoordinate, primaryMiss, viewDistance, forward);
+  const vec3 nearS = apSampleNear(apNearScatter, apSampler, screenUV, forward, args).rgb;
+  return numosEvaluateAirImpl(camera, args, nearS, apFarScatter, apFarTransmittance,
+                              apFroxelAux, apLights, apLightClusters, apSampler, pixelCoordinate, primaryMiss,
+                              viewDistance);
+}
+
+// Lays an evaluated composite over `radianceOutput`. airInScatter and airTransmittance report what it
+// laid over the pixel (the in-scatter it added and the transmittance it applied to the surface or the
+// sky beyond the near field), for the debug view.
+void numosApplyAir(
+  NumosAirComposite c,
+  vec3 volumeAttenuation,
+  vec3 radianceThroughput,
+  vec4 cloudOverPixel,
+  inout vec3 radianceOutput,
+  out vec3 airInScatter,
+  out vec3 airTransmittance)
+{
+  const vec3 inScatterWeight = volumeAttenuation * radianceThroughput;
+  if (c.mode == kNumosAirNear)
+  {
+    airInScatter = c.nearS * inScatterWeight;
+    airTransmittance = c.nearT;
+    radianceOutput = radianceOutput * airTransmittance + airInScatter;
+    return;
+  }
+
+  if (c.mode == kNumosAirMiss)
+  {
+    // Clamped: the sky may be darker than the far field's column where evalSkyRadiance fades the
+    // atmosphere out at night.
+    // The cloud (cloudOverPixel) carries its own air and the fog in front of it (the cloud
+    // composite); only the sky's share, 1 - opacity, sees the fog beyond the near field.
+    const float missCloudOpacity = saturate(cloudOverPixel.a);
+    const vec3 sky = radianceOutput - cloudOverPixel.rgb;
+    const vec3 skyBeyond = max(sky - (1.0f - missCloudOpacity) * c.farSRange * radianceThroughput, vec3(0.0f))
+                         * c.invFarTRange;
+    const vec3 cloudBeyondMiss = max(cloudOverPixel.rgb - missCloudOpacity * c.farSRange * radianceThroughput, vec3(0.0f))
+                               * c.invFarTRange;
+    airInScatter = (c.nearS + c.nearT * c.fogS * (1.0f - missCloudOpacity)) * inScatterWeight;
+    airTransmittance = c.nearT * c.fogT;
+    radianceOutput = airInScatter + c.nearT * (c.fogT * skyBeyond + cloudBeyondMiss);
+    return;
+  }
+
+  // The cloud over the surface is lit and hazed by its own march from the camera out: like the sky
+  // on a miss, it gives up its first `range` of air to the near field, and it hides the air behind
+  // it from the surface's share only.
+  const float cloudOpacity = saturate(cloudOverPixel.a);
+  const vec3 surface = radianceOutput - cloudOverPixel.rgb;
+  const vec3 cloudBeyond = max(cloudOverPixel.rgb - cloudOpacity * c.farSRange * radianceThroughput, vec3(0.0f))
+                         * c.invFarTRange;
+  // The fog beyond the near field (fogS, fogT) reaches the surface's share only: the cloud composite
+  // already applied the fog between the near field and the cloud, and the fog behind the cloud is
+  // hidden by it.
+  airInScatter = (c.nearS + c.nearT * (1.0f - cloudOpacity) * (c.fogS + c.fogT * c.airS)) * inScatterWeight;
+  airTransmittance = c.nearT * c.fogT * c.airT;
+  radianceOutput = surface * airTransmittance + c.nearT * cloudBeyond + airInScatter;
+}
+
+// The composite itself (numosEvaluateAir, then numosApplyAir).
 void apCompositeAir(
   Camera camera,
   AtmosphereArgs args,
@@ -185,71 +375,10 @@ void apCompositeAir(
   out vec3 airInScatter,
   out vec3 airTransmittance)
 {
-  const vec2 screenUV = cameraPixelCoordinateToScreenUV(camera, ivec2(pixelCoordinate));
-  const CameraDirections ray = cameraScreenUVToDirection(camera, screenUV, false);
-  const float forwardPerDistance = max(abs(ray.viewDirection.z), 1e-6f);
-  const vec3 dirYUp = normalize(worldToAtmosphereYUp(ray.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0u));
-  const vec3 inScatterWeight = volumeAttenuation * radianceThroughput;
-
-  const float forward = primaryMiss ? 1e30f : viewDistance * forwardPerDistance;
-  const float rangeDistance = args.apFroxelRange / forwardPerDistance;
-  const vec3 nearS = apSampleNear(apNearScatter, apSampler, screenUV, forward, args).rgb
-    + apLocalLightAirlight(apLights, apLightClusters, apFroxelAux, apSampler, args, screenUV, ray.worldDirection,
-                           forwardPerDistance, args.apStartDistance,
-                           primaryMiss ? rangeDistance : min(viewDistance, rangeDistance));
-
-  if (!primaryMiss && forward <= args.apFroxelRange)
-  {
-    airInScatter = nearS * inScatterWeight;
-    airTransmittance = apNearTransmittance(dirYUp, viewDistance, args);
-    radianceOutput = radianceOutput * airTransmittance + airInScatter;
-    return;
-  }
-
-  const vec3 nearT = apNearTransmittance(dirYUp, rangeDistance, args);
-  vec3 farTRange;
-  const vec3 farSRange = evalAerialPerspectiveFar(dirYUp, numosWorldToAirKm(rangeDistance, args), args,
-                                                  apFarScatter, apFarTransmittance, apSampler, farTRange);
-  const float fogT = exp(-apFogOpticalDepth(dirYUp, rangeDistance, primaryMiss ? 1e30f : viewDistance, args));
-  const vec3 fogS = numosFarFogRadiance(dirYUp, args) * (1.0f - fogT);
-
-  if (primaryMiss)
-  {
-    // Clamped: the sky may be darker than the far field's column where evalSkyRadiance fades the
-    // atmosphere out at night.
-    // The cloud (cloudOverPixel) carries its own air and the fog in front of it (the cloud
-    // composite); only the sky's share, 1 - opacity, sees the fog beyond the near field.
-    const float missCloudOpacity = saturate(cloudOverPixel.a);
-    const vec3 sky = radianceOutput - cloudOverPixel.rgb;
-    const vec3 invRange = 1.0f / max(farTRange, vec3(1e-4f));
-    const vec3 skyBeyond = max(sky - (1.0f - missCloudOpacity) * farSRange * radianceThroughput, vec3(0.0f)) * invRange;
-    const vec3 cloudBeyondMiss = max(cloudOverPixel.rgb - missCloudOpacity * farSRange * radianceThroughput, vec3(0.0f))
-                               * invRange;
-    airInScatter = (nearS + nearT * fogS * (1.0f - missCloudOpacity)) * inScatterWeight;
-    airTransmittance = nearT * fogT;
-    radianceOutput = airInScatter + nearT * (fogT * skyBeyond + cloudBeyondMiss);
-    return;
-  }
-
-  vec3 farT;
-  const vec3 farS = evalAerialPerspectiveFar(dirYUp, numosWorldToAirKm(viewDistance, args), args,
-                                             apFarScatter, apFarTransmittance, apSampler, farT);
-  const vec3 invFarTRange = 1.0f / max(farTRange, vec3(1e-4f));
-  const vec3 airS = max(farS - farSRange, vec3(0.0f)) * invFarTRange;
-  const vec3 airT = saturate(farT * invFarTRange);
-  // The cloud over the surface is lit and hazed by its own march from the camera out: like the sky
-  // on a miss, it gives up its first `range` of air to the near field, and it hides the air behind
-  // it from the surface's share only.
-  const float cloudOpacity = saturate(cloudOverPixel.a);
-  const vec3 surface = radianceOutput - cloudOverPixel.rgb;
-  const vec3 cloudBeyond = max(cloudOverPixel.rgb - cloudOpacity * farSRange * radianceThroughput, vec3(0.0f))
-                         * invFarTRange;
-  // The fog beyond the near field (fogS, fogT) reaches the surface's share only: the cloud composite
-  // already applied the fog between the near field and the cloud, and the fog behind the cloud is
-  // hidden by it.
-  airInScatter = (nearS + nearT * (1.0f - cloudOpacity) * (fogS + fogT * airS)) * inScatterWeight;
-  airTransmittance = nearT * fogT * airT;
-  radianceOutput = surface * airTransmittance + nearT * cloudBeyond + airInScatter;
+  const NumosAirComposite c = numosEvaluateAir(camera, args, apNearScatter, apFarScatter, apFarTransmittance,
+                                               apFroxelAux, apLights, apLightClusters, apSampler, pixelCoordinate,
+                                               primaryMiss, viewDistance);
+  numosApplyAir(c, volumeAttenuation, radianceThroughput, cloudOverPixel, radianceOutput, airInScatter, airTransmittance);
 }
 
 // The debug view's color (kApDebugView*, lib/aerial_perspective.slangh), as physical radiance:
@@ -296,7 +425,47 @@ vec3 apDebugViewColor(
   return apDebugVisibilityColor(saturate(sun ? aux.a : aux.r));
 }
 
-// apCompositeAir, then the debug view (rtx.atmosphere.aerialPerspectiveDebugView) over its result.
+// The composite with the depth-aware near-field upsample (FrameOutputs::apTileDepth), then the debug
+// view (rtx.atmosphere.aerialPerspectiveDebugView) over its result.
+void numosApplyAerialPerspective(
+  Camera camera,
+  AtmosphereArgs args,
+  bool hostSkyOverride,
+  Texture3D<float4> apNearScatter,
+  Texture2D<float> apTileDepth,
+  Texture3D<float4> apFarScatter,
+  Texture3D<float4> apFarTransmittance,
+  Texture3D<float4> apFroxelAux,
+  StructuredBuffer<AerialPerspectiveLight> apLights,
+  StructuredBuffer<uint> apLightClusters,
+  SamplerState apSampler,
+  uint2 pixelCoordinate,
+  bool primaryMiss,
+  float viewDistance,
+  vec3 volumeAttenuation,
+  vec3 radianceThroughput,
+  vec4 cloudOverPixel,
+  inout vec3 radianceOutput)
+{
+  if (args.apFroxelSizeX == 0u || hostSkyOverride)
+  {
+    return;
+  }
+  vec3 airInScatter;
+  vec3 airTransmittance;
+  const NumosAirComposite c = numosEvaluateAir(camera, args, apNearScatter, apTileDepth, apFarScatter,
+                                               apFarTransmittance, apFroxelAux, apLights, apLightClusters, apSampler,
+                                               pixelCoordinate, primaryMiss, viewDistance);
+  numosApplyAir(c, volumeAttenuation, radianceThroughput, cloudOverPixel, radianceOutput, airInScatter, airTransmittance);
+  if (args.apDebugView != kApDebugViewOff && args.apDebugView != kApDebugViewNoSunOrSky)
+  {
+    radianceOutput = apDebugViewColor(camera, args, apFroxelAux, apSampler, pixelCoordinate, primaryMiss,
+                                      viewDistance, airInScatter, airTransmittance)
+                   * args.apDebugRadianceScale;
+  }
+}
+
+// apCompositeAir (plain bilinear near field), then the debug view over its result.
 void numosApplyAerialPerspective(
   Camera camera,
   AtmosphereArgs args,

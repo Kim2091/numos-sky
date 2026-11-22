@@ -305,6 +305,7 @@ void dispatchViewerComposite(vulkan::VulkanGpu& gpu, const ViewerPasses& passes,
   tex(VIEWER_AP_FROXEL_AUX, outs.apFroxelAux);
   tex(VIEWER_AP_LIGHTS, outs.apLights);
   tex(VIEWER_AP_LIGHT_CLUSTERS, outs.apLightClusters);
+  tex(VIEWER_AP_TILE_DEPTH, outs.apTileDepth);
   tex(VIEWER_AP_SAMPLER, outs.linearClampSampler);
   tex(VIEWER_CLOUD_RENDER, outs.cloudRender);
   tex(VIEWER_CLOUD_DEPTH, outs.cloudDepth);

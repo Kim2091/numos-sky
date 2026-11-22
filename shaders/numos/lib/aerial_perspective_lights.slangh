@@ -22,10 +22,12 @@ uint aerialPerspectiveLightClusterOffset(uint2 tile, uint slice, AtmosphereArgs 
   return cluster * AERIAL_PERSPECTIVE_LIGHT_CLUSTER_STRIDE;
 }
 
-// Per-screen-tile list over the whole froxel range, stored after the per-slice clusters.
+// Per-screen-tile list over the whole froxel range, stored after the per-slice clusters with its own,
+// longer stride.
 uint apLightTileOffset(uint2 tile, AtmosphereArgs args) {
   const uint perSlice = args.apLocalLightTilesX * args.apLocalLightTilesY;
-  return (perSlice * args.apFroxelSlices + tile.y * args.apLocalLightTilesX + tile.x) * AERIAL_PERSPECTIVE_LIGHT_CLUSTER_STRIDE;
+  return perSlice * args.apFroxelSlices * AERIAL_PERSPECTIVE_LIGHT_CLUSTER_STRIDE
+       + (tile.y * args.apLocalLightTilesX + tile.x) * AERIAL_PERSPECTIVE_LIGHT_TILE_STRIDE;
 }
 
 // Fraction of this light's radiance that leaves it toward `lightToPointDirection`.
@@ -53,7 +55,7 @@ float aerialPerspectiveLightShaping(AerialPerspectiveLight light, vec3 lightToPo
   return lerp(softened, 1.0f, focused * softened);
 }
 
-// Phase weights of the medium's components at a point, normalised by its total scattering
+// Phase weights of the medium's components at a point, normalized by its total scattering
 // coefficient. The froxel grid stores local-light in-scatter per unit scattering coefficient, so the
 // phase it is weighted with must be the mixture the integration's sigma_s multiplies back in.
 struct ApPhaseMix {
@@ -140,7 +142,7 @@ vec3 apLocalLightAirlight(StructuredBuffer<AerialPerspectiveLight> lights, Struc
   const uint2 tile = min(uint2(screenUv * vec2(args.apFroxelSizeX, args.apFroxelSizeY)) / AERIAL_PERSPECTIVE_LIGHT_TILE_SIZE,
                          uint2(args.apLocalLightTilesX, args.apLocalLightTilesY) - 1u);
   const uint offset = apLightTileOffset(tile, args);
-  const uint count = min(clusters[offset], AERIAL_PERSPECTIVE_MAX_LIGHTS_PER_CLUSTER);
+  const uint count = min(clusters[offset], AERIAL_PERSPECTIVE_MAX_LIGHTS_PER_TILE);
   const vec3 dirYUp = normalize(worldToAtmosphereYUp(dirWorld, args.isZUp != 0u, args.flipUpAxis != 0u));
 
   for (uint slot = 0u; slot < count; ++slot) {

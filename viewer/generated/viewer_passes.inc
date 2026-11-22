@@ -5,8 +5,8 @@
 // NUMOS_PASS_BINDING(slot, set, kind, dim, spirvImageFormat, "shader variable")
 
 #ifdef NUMOS_PASS
-NUMOS_PASS(viewer_composite, "viewer_composite.comp.spv", 0xdc6755c1e8733785ull, 8, 8, 1, 0, 0, 28)
-NUMOS_PASS(viewer_depth, "viewer_depth.comp.spv", 0xf9b423164baa5affull, 8, 8, 1, 0, 28, 3)
+NUMOS_PASS(viewer_composite, "viewer_composite.comp.spv", 0x3e4e8311ee73b115ull, 8, 8, 1, 0, 0, 29)
+NUMOS_PASS(viewer_depth, "viewer_depth.comp.spv", 0xf9b423164baa5affull, 8, 8, 1, 0, 29, 3)
 #undef NUMOS_PASS
 #endif
 
@@ -39,6 +39,7 @@ NUMOS_PASS_BINDING(26, 0, SampledTexture, Tex3D, 0, "apFarTransmittance")
 NUMOS_PASS_BINDING(27, 0, SampledTexture, Tex3D, 0, "apFroxelAux")
 NUMOS_PASS_BINDING(28, 0, StructuredBuffer, None, 0, "apLights")
 NUMOS_PASS_BINDING(29, 0, StructuredBuffer, None, 0, "apLightClusters")
+NUMOS_PASS_BINDING(30, 0, SampledTexture, Tex2D, 0, "apTileDepth")
 NUMOS_PASS_BINDING(0, 0, ConstantBuffer, None, 0, "viewer")
 NUMOS_PASS_BINDING(1, 0, ConstantBuffer, None, 0, "camera")
 NUMOS_PASS_BINDING(2, 0, StorageTexture, Tex2D, 3, "linearViewZ")

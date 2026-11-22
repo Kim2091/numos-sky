@@ -4,7 +4,7 @@
 // Aerial perspective near field, integration (docs/aerial-perspective-v2.md, section 4.2).
 //
 // One thread per froxel column, front to back, so every slice is exactly its predecessor plus the
-// segment between them and the composite can interpolate between neighbours without overshoot.
+// segment between them and the composite can interpolate between neighbors without overshoot.
 // Each slice is one segment lit by what the lighting pass accumulated (scene visibility of sun and
 // sky) and by what is analytic and therefore fresh every frame (sun transmittance, planet shadow,
 // the cloud-shadow hook, Psi_ms, phase, density). Local lights are not integrated here: their glow
@@ -52,17 +52,20 @@ SamplerState cloudSampler;
 layout(binding = AP_INTEGRATE_OUTPUT, rgba16f)
 RWTexture3D<float4> nearScatterOutput;
 
-layout(binding = AP_INTEGRATE_LINEAR_VIEW_Z)
-Texture2D<float> sceneLinearViewZ;
-
-layout(binding = AP_INTEGRATE_SURFACE_ARGS)
-ConstantBuffer<ApSurfaceArgs> surfaceArgs;
+// The deepest visible surface of each column's screen tile (aerial_perspective_tile_depth).
+layout(binding = AP_INTEGRATE_TILE_DEPTH)
+Texture2D<float> tileDepth;
 
 // [0]: the number of columns whose screen tile shows the sky or a surface past the froxel range, the
 // pixels the composite takes the far field for. The renderer reads it back to skip far-field updates
 // nothing reads.
 layout(binding = AP_INTEGRATE_FAR_USAGE)
 RWStructuredBuffer<uint> farUsage;
+
+// The sky visibility filter's largest radius in froxels, and the taps of its square at that radius.
+static const int kApSkyFilterMaxRadius = 2;
+static const int kApSkyFilterWidth = 2 * kApSkyFilterMaxRadius + 1;
+static const int kApSkyFilterTaps = kApSkyFilterWidth * kApSkyFilterWidth;
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -83,18 +86,50 @@ void main(uint2 column : SV_DispatchThreadID) {
   const uint slices = max(args.apFroxelSlices, 1u);
   float startWorld = 0.0f;
   const float debugVisibility = apDebugZeroesSunAndSky(args) ? 0.0f : 1.0f;
-  const float tileForward = apTileSurfaceForward(sceneLinearViewZ, surfaceArgs, column, args);
+  const float tileForward = tileDepth.Load(int3(column, 0));
   if (tileForward > args.apFroxelRange) {
     InterlockedAdd(farUsage[0], 1u);
   }
   const float tileLimit = apSurfaceSampleLimit(tileForward, args);
+
+  // The sky visibility is box-filtered over the neighboring columns (rtx.atmosphere.aerialPerspectiveSkyFilterRadius).
+  // Sky light in the air varies slowly across the screen, while its per-froxel estimate in shaded air
+  // is a small share of rare hits, so the filter removes blotches there. A neighbor's froxel counts
+  // only in front of its own tile's surface, the same rule this column follows, so the air in front
+  // of a wall beside a doorway does not darken the air seen through it. Sun visibility is not
+  // filtered: that would widen every shaft and shadow edge.
+  const int skyRadius = int(min(args.apSkyFilterRadius, uint(kApSkyFilterMaxRadius)));
+  const int2 grid = int2(args.apFroxelSizeX, args.apFroxelSizeY);
+  float neighborLimit[kApSkyFilterTaps];
+  [unroll]
+  for (int tap = 0; tap < kApSkyFilterTaps; ++tap) {
+    const int2 offset = int2(tap % kApSkyFilterWidth, tap / kApSkyFilterWidth) - kApSkyFilterMaxRadius;
+    const int2 neighbor = int2(column) + offset;
+    neighborLimit[tap] = -1.0f;
+    if (all(abs(offset) <= skyRadius) && all(neighbor >= 0) && all(neighbor < grid)) {
+      neighborLimit[tap] = all(offset == 0) ? tileLimit
+        : apSurfaceSampleLimit(tileDepth.Load(int3(neighbor, 0)), args);
+    }
+  }
+
   float sunVisibility = 1.0f;
   float skyVisibility = 1.0f;
   for (uint slice = 0u; slice < slices; ++slice) {
     const float endWorld = apFroxelSliceToDepth(float(slice + 1u) / float(slices), args) * forwardToRay;
-    if (slice == 0u || apFroxelSliceToDepth(float(slice) / float(slices), args) < tileLimit) {
+    const float sliceStart = apFroxelSliceToDepth(float(slice) / float(slices), args);
+    if (slice == 0u || sliceStart < tileLimit) {
       sunVisibility = froxelLighting.Load(int4(column, slice, 0)).a;
-      skyVisibility = froxelAux.Load(int4(column, slice, 0)).r;
+      float skySum = 0.0f;
+      float skyCount = 0.0f;
+      [unroll]
+      for (int tap = 0; tap < kApSkyFilterTaps; ++tap) {
+        if (neighborLimit[tap] >= 0.0f && (slice == 0u || sliceStart < neighborLimit[tap])) {
+          const int2 neighbor = int2(column) + int2(tap % kApSkyFilterWidth, tap / kApSkyFilterWidth) - kApSkyFilterMaxRadius;
+          skySum += froxelAux.Load(int4(neighbor, slice, 0)).r;
+          skyCount += 1.0f;
+        }
+      }
+      skyVisibility = skyCount > 0.0f ? skySum / skyCount : froxelAux.Load(int4(column, slice, 0)).r;
     }
     // The host's own volumetrics own everything nearer than the handoff.
     const float segmentStart = max(startWorld, args.apStartDistance);

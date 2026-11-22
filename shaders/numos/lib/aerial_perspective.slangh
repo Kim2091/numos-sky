@@ -25,7 +25,7 @@
 // ============================================================================
 // Both fields put slice w at d * ((1 + range / d)^w - 1): linear for distances below d, exponential
 // past it, so slices are thin at the camera and each later one is a fixed fraction deeper than the
-// last. A pure exponential would spend most of its slices in the first metre; a pure linear one
+// last. A pure exponential would spend most of its slices in the first meter; a pure linear one
 // would leave the near field with a single slice.
 
 float apFroxelSliceToDepth(float w, AtmosphereArgs args) {
@@ -65,7 +65,7 @@ vec3 apFroxelRayVector(vec2 screenUv, Camera camera) {
   return ray.worldDirection / max(abs(ray.viewDirection.z), 1e-6f);
 }
 
-// Centre of a froxel in world space. The host uses this (and numosFroxelViewDirection) to write the
+// Center of a froxel in world space. The host uses this (and numosFroxelViewDirection) to write the
 // local-light injection volume; the passes use it for reprojection.
 vec3 apFroxelCenterWorld(uint3 froxel, Camera camera, AtmosphereArgs args) {
   const vec2 uv = (vec2(froxel.xy) + 0.5f) / vec2(args.apFroxelSizeX, args.apFroxelSizeY);
@@ -77,10 +77,10 @@ float apForwardDistance(vec3 viewPosition, Camera camera) {
   return (camera.flags & rightHandedFlag) != 0u ? -viewPosition.z : viewPosition.z;
 }
 
-// World position -> froxel UVW through the given view and projection. False behind the camera or
-// outside the grid.
-bool apWorldToFroxelUvw(vec3 worldPos, mat4 worldToView, mat4 worldToProjection, Camera camera,
-                        AtmosphereArgs args, out vec3 uvw) {
+// World position -> froxel UVW through the given view and projection, unbounded: UVW may lie
+// outside [0, 1]. False only behind the camera.
+bool apWorldToFroxelUvwUnbounded(vec3 worldPos, mat4 worldToView, mat4 worldToProjection, Camera camera,
+                                 AtmosphereArgs args, out vec3 uvw) {
   uvw = vec3(0.0f);
   const vec3 viewPosition = mul(worldToView, vec4(worldPos, 1.0f)).xyz;
   const float forward = apForwardDistance(viewPosition, camera);
@@ -89,7 +89,15 @@ bool apWorldToFroxelUvw(vec3 worldPos, mat4 worldToView, mat4 worldToProjection,
     return false;
   }
   uvw = vec3(cameraNDCToScreenUV(camera, clip.xy / clip.w), apFroxelDepthToSlice(forward, args));
-  return all(uvw >= vec3(0.0f)) && all(uvw <= vec3(1.0f));
+  return true;
+}
+
+// World position -> froxel UVW through the given view and projection. False behind the camera or
+// outside the grid.
+bool apWorldToFroxelUvw(vec3 worldPos, mat4 worldToView, mat4 worldToProjection, Camera camera,
+                        AtmosphereArgs args, out vec3 uvw) {
+  return apWorldToFroxelUvwUnbounded(worldPos, worldToView, worldToProjection, camera, args, uvw)
+      && all(uvw >= vec3(0.0f)) && all(uvw <= vec3(1.0f));
 }
 
 bool apWorldToCurrentFroxelUvw(vec3 worldPos, Camera camera, AtmosphereArgs args, out vec3 uvw) {
@@ -191,7 +199,8 @@ float apFogExtinctionAt(float altitudePhysKm, AtmosphereArgs args) {
   return args.fogExtinctionPerKm * exp(-x / max(args.fogScaleHeightKm, 1e-4f));
 }
 
-// The ground-fog clear zone (fogNearFadeKm): 0 at the camera, 1 from fogNearFadeKm on.
+// The ground-fog clear zone (fogNearFadeKm): 0 at the camera, 1 from fogNearFadeKm on. The
+// in-scatter (apSampleMedium) and the closed-form transmittance (apFogOpticalDepth) both use it.
 float apFogNearFade(float distanceKm, AtmosphereArgs args) {
   return args.fogNearFadeKm > 0.0f ? smoothstep(0.0f, args.fogNearFadeKm, distanceKm) : 1.0f;
 }
@@ -212,7 +221,7 @@ ApMediumSample apSampleMedium(vec3 worldPos, AtmosphereArgs args) {
   m.altitudeKm = clamp(length(m.hazePosition - getAirPlanetCenter(args)) - args.planetRadius,
                        0.0f, args.atmosphereThickness);
   m.atmosphere = sampleAtmosphereMedium(m.altitudeKm, args);
-  // Flat-earth fog height: within the froxel range the curvature drop is metres.
+  // Flat-earth fog height: within the froxel range the curvature drop is meters.
   const float fogAltitude = args.apCameraAltitudeKm + rel.y;
   m.fogExtinction = apFogExtinctionAt(fogAltitude, args) * apFogNearFade(length(rel), args);
   m.fogScattering = m.fogExtinction * args.fogAlbedo;
@@ -341,20 +350,40 @@ float apExponentialColumn(float h0, float mu, float length, float scaleHeight) {
 
 // Fog optical depth between two distances along a camera ray (world units). Infinite distances are
 // clamped to 2000 km, past which no fog layer is anything but opaque or empty.
+//
+// The density is the one apSampleMedium gives the in-scatter, clear zone included: inside
+// fogNearFadeKm it is the exponential layer times the smoothstep of apFogNearFade, integrated with
+// three Gauss-Legendre taps (exact for the cubic ramp over a flat layer, and the layer's exponential
+// varies little over a clear zone of tens of meters); past it the column has its closed form.
 float apFogOpticalDepth(vec3 viewDirYUp, float startWorld, float endWorld, AtmosphereArgs args) {
   if (!(args.fogExtinctionPerKm > 0.0f) || !(endWorld > startWorld)) {
     return 0.0f;
   }
-  const float endKm = numosWorldToAirKm(endWorld, args);
-  // The clear zone (apFogNearFade) as a later start: a smoothstep ramp over [0, R] holds the fog of
-  // a full-density run starting at R / 2.
-  const float startKm = max(numosWorldToAirKm(startWorld, args), min(0.5f * args.fogNearFadeKm, endKm));
-  const float lengthKm = min(endKm, 2000.0f) - startKm;
-  if (!(lengthKm > 0.0f)) {
-    return 0.0f;
+  const float endKm = min(numosWorldToAirKm(endWorld, args), 2000.0f);
+  float startKm = numosWorldToAirKm(startWorld, args);
+  float tau = 0.0f;
+  const float fadeKm = args.fogNearFadeKm;
+  if (fadeKm > 0.0f && startKm < fadeKm) {
+    const float rampEnd = min(endKm, fadeKm);
+    if (rampEnd > startKm) {
+      const float halfLength = 0.5f * (rampEnd - startKm);
+      const float mid = startKm + halfLength;
+      static const float kNode = 0.7745966692f;  // sqrt(3 / 5)
+      const float x0 = mid - kNode * halfLength;
+      const float x2 = mid + kNode * halfLength;
+      const float mu = viewDirYUp.y;
+      tau += halfLength * ((5.0f / 9.0f) * apFogExtinctionAt(args.apCameraAltitudeKm + mu * x0, args) * apFogNearFade(x0, args)
+                   + (8.0f / 9.0f) * apFogExtinctionAt(args.apCameraAltitudeKm + mu * mid, args) * apFogNearFade(mid, args)
+                   + (5.0f / 9.0f) * apFogExtinctionAt(args.apCameraAltitudeKm + mu * x2, args) * apFogNearFade(x2, args));
+    }
+    startKm = fadeKm;
   }
-  const float h0 = args.apCameraAltitudeKm + viewDirYUp.y * startKm - args.fogBaseAltitudeKm;
-  return args.fogExtinctionPerKm * apExponentialColumn(h0, viewDirYUp.y, lengthKm, args.fogScaleHeightKm);
+  const float lengthKm = endKm - startKm;
+  if (lengthKm > 0.0f) {
+    const float h0 = args.apCameraAltitudeKm + viewDirYUp.y * startKm - args.fogBaseAltitudeKm;
+    tau += args.fogExtinctionPerKm * apExponentialColumn(h0, viewDirYUp.y, lengthKm, args.fogScaleHeightKm);
+  }
+  return tau;
 }
 
 // RGB transmittance of the near-field media along a camera ray from the volumetrics handoff out to
@@ -452,6 +481,46 @@ vec4 apSampleNear(Texture3D<float4> nearScatter, SamplerState volumeSampler, vec
   const vec2 slice = apCumulativeSliceCoord(apFroxelDepthToSlice(min(forwardDistance, args.apFroxelRange), args),
                                             args.apFroxelSlices);
   const vec4 v = nearScatter.SampleLevel(volumeSampler, vec3(screenUv, slice.x), 0);
+  return vec4(max(v.rgb, vec3(0.0f)) * slice.y, lerp(1.0f, v.a, slice.y));
+}
+
+// As apSampleNear, with the four bilinear column taps also weighted by how well each column's tile
+// depth (aerial_perspective_tile_depth) covers the pixel's: a column whose deepest surface lies in
+// front of the pixel carried its last visible slice past that surface (4.2.2), so its value there
+// is not the air in front of this pixel. Its weight falls to 0 as its deepest surface comes
+// args.apUpsampleDepthTolerance (relative) in front of the pixel's depth. The pixel's own column
+// always covers it, so the weights never all vanish. A tolerance of 0 is plain bilinear.
+vec4 apSampleNear(Texture3D<float4> nearScatter, Texture2D<float> tileDepth, SamplerState volumeSampler,
+                  vec2 screenUv, float forwardDistance, AtmosphereArgs args) {
+  const float tolerance = args.apUpsampleDepthTolerance;
+  if (!(tolerance > 0.0f)) {
+    return apSampleNear(nearScatter, volumeSampler, screenUv, forwardDistance, args);
+  }
+  const vec2 slice = apCumulativeSliceCoord(apFroxelDepthToSlice(min(forwardDistance, args.apFroxelRange), args),
+                                            args.apFroxelSlices);
+  const vec2 grid = vec2(max(args.apFroxelSizeX, 1u), max(args.apFroxelSizeY, 1u));
+  const vec2 g = screenUv * grid - 0.5f;
+  const vec2 base = floor(g);
+  const vec2 f = g - base;
+  vec4 sum = vec4(0.0f);
+  float weightSum = 0.0f;
+  [unroll]
+  for (uint k = 0u; k < 4u; ++k) {
+    const vec2 offset = vec2(float(k & 1u), float(k >> 1u));
+    const vec2 column = clamp(base + offset, vec2(0.0f), grid - 1.0f);
+    const vec2 bilinear = lerp(1.0f - f, f, offset);
+    const float deepest = tileDepth.Load(int3(int2(column), 0));
+    const float shortfall = max(forwardDistance - deepest, 0.0f) / max(forwardDistance, 1e-6f);
+    const float w = bilinear.x * bilinear.y * saturate(1.0f - shortfall / tolerance);
+    if (w > 0.0f) {
+      sum += w * nearScatter.SampleLevel(volumeSampler, vec3((column + 0.5f) / grid, slice.x), 0);
+      weightSum += w;
+    }
+  }
+  if (!(weightSum > 1e-6f)) {
+    return apSampleNear(nearScatter, volumeSampler, screenUv, forwardDistance, args);
+  }
+  const vec4 v = sum / weightSum;
   return vec4(max(v.rgb, vec3(0.0f)) * slice.y, lerp(1.0f, v.a, slice.y));
 }
 

@@ -163,10 +163,11 @@ struct Renderer::Impl {
     uint32_t x = 0, y = 0, z = 0;
     float range = 0.0f;  // world units, forward distance
   };
-  // Everything the froxel history depends on besides the camera.
+  // Everything the froxel history depends on besides the camera. The history holds lighting only
+  // (visibilities and local light per unit scattering coefficient), so the medium is not part of it.
   struct ApHistoryKey {
     uint32_t x, y, z;
-    float range, unitsPerKm, fogExtinction, fogScaleHeight;
+    float range, unitsPerKm;
     // Traced and untraced visibility mean different things; neither may inherit the other's.
     uint32_t sceneShadow;
   };
@@ -294,8 +295,12 @@ struct Renderer::Impl {
   Texture  m_apFroxelLighting[2];  // history ping-pong: RGB local light, A sun visibility
   Texture  m_apFroxelAux[2];       // R sky visibility, G age, B local-light visibility, A sun visibility
   Texture  m_apLightInjection;     // host-written local light, same grid
+  Texture  m_apHiddenDepth;         // the tile depth's maximum over the columns a froxel's readers reach
+  Texture  m_apTileDepth[2];       // per froxel column: the deepest surface of its screen tile (paired with the history)
   Texture  m_apNoDepth;            // 1x1 stand-in for linear view Z when the host passes none
   uint32_t m_apHistoryIndex = 0u;  // the pair holding the latest result
+  // The aux volume the outputs name: the latest result, or the spare one holding its filtered copy.
+  uint32_t m_apAuxOutputIndex = 0u;
   bool     m_apHistoryValid = false;
   uint32_t m_apLastFrame = UINT32_MAX - 1u;  // frame index of the last froxel lighting dispatch
   // Set up by beginFrame, dispatched by dispatchPostDepth once linear view Z exists.

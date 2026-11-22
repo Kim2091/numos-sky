@@ -383,15 +383,25 @@ struct AtmosphereArgs {
   // and the radiance scale (pre-exposure R) the composite writes its debug color back in.
   uint  apDebugView;
   float apDebugRadianceScale;
-  // Pads the struct to a whole 16-byte row.
-  float padApDebug0;
-  float padApDebug1;
+  // 1 / sky history frames: the floor of the sky visibility's temporal blend weight.
+  float apSkyHistoryWeightMin;
+  // Screen radius, in froxels, of the box filter the integration applies to the sky visibility (0 = off).
+  uint  apSkyFilterRadius;
 
   // The sunlight the night sky's assets and glow are fractions of (stars, Milky Way, zodiacal light),
   // x radianceScale: the reference sun, the default sunIlluminance x sunIntensity, whatever the sun's
   // settings, so the night sky keeps its physical light.
   vec3 nightSkyIlluminance;
   float padNightSky0;
+
+  // Lights one screen tile's glow list may hold (rtx.atmosphere.aerialPerspectiveLocalLightTileMaxCount,
+  // clamped to AERIAL_PERSPECTIVE_MAX_LIGHTS_PER_TILE by the cull pass).
+  uint  apLocalLightTileMaxCount;
+  // Relative depth tolerance of the composite's depth-aware near-field upsample
+  // (rtx.atmosphere.aerialPerspectiveUpsampleDepthTolerance; 0 = plain bilinear).
+  float apUpsampleDepthTolerance;
+  uint  padAp1;
+  uint  padAp2;
 };
 
 NUMOS_SHARED_END
