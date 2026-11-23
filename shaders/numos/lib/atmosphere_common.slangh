@@ -1525,17 +1525,19 @@ static const float kCloudVoxelGridResolutionXZ = 256.0f;
 // space position in engine units; numosWorldToCloudKm carries it into the cloud frame (the axes
 // come from args, which also hold the engine's up axis; `isZUp` is kept for host compatibility and
 // must equal args.isZUp). cloudShadowStrength fades it toward 1; nothing else scales it. 1 with
-// clouds off or the map not baked.
+// clouds off or the map not baked. The cirrus's shadow is included, from its own layer of the map.
 float sampleCloudGroundShadowFromMap(vec3 worldPos, vec3 sunDir, AtmosphereArgs args, bool isZUp,
                                      Texture3D<float2> shadowMap, SamplerState linearSampler) {
-  if (args.cloudEnabled < 0.5f || args.cloudCoverageMean < 0.01f || args.cloudShadowLive == 0u) {
-    return 1.0f;
-  }
   const vec3 worldPosKm = numosWorldToCloudKm(worldPos, args);
+  const vec3 planetCenterWorldKm = getCloudPlanetCenterWorldKm(args);
+  const float cirrusT = exp(-cirrusShadowMapSunOpticalDepth(shadowMap, linearSampler, worldPosKm, planetCenterWorldKm, args));
+  if (args.cloudEnabled < 0.5f || args.cloudCoverageMean < 0.01f || args.cloudShadowLive == 0u) {
+    return mix(1.0f, cirrusT, args.cloudShadowStrength);
+  }
   const float opticalDepth = cloudShadowMapSunOpticalDepth(shadowMap, linearSampler, worldPosKm,
-                                                           getCloudPlanetCenterWorldKm(args), args);
+                                                           planetCenterWorldKm, args);
   const float transmittance = exp(-opticalDepth * args.cloudDensity);
-  return mix(1.0f, transmittance, args.cloudShadowStrength);
+  return mix(1.0f, transmittance * cirrusT, args.cloudShadowStrength);
 }
 
 // sampleCloudGroundShadowFromMap on the AtmosphereCloudShadowMap global through
